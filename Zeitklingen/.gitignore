@@ -1,0 +1,61 @@
+# Unity-spezifische Dateien
+/[Ll]ibrary/
+/[Tt]emp/
+/[Oo]bj/
+/[Bb]uild/
+/[Bb]uilds/
+/[Ll]ogs/
+/[Uu]ser[Ss]ettings/
+
+# MemoryCaptures kann sehr groß werden
+/[Mm]emoryCaptures/
+
+# Asset meta data sollte nur ignoriert werden, wenn die zugehörige Asset-Datei selbst ignoriert wird
+!/[Aa]ssets/**/*.meta
+
+# Visual Studio Cache-Verzeichnis
+.vs/
+
+# Gradle cache-Verzeichnis
+.gradle/
+
+# Autogenerierte VS/MD/Consulo Lösungs- und Projektdateien
+ExportedObj/
+.consulo/
+*.csproj
+*.unityproj
+*.sln
+*.suo
+*.tmp
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+
+# Unity3D generierte meta-Dateien
+*.pidb.meta
+*.pdb.meta
+*.mdb.meta
+
+# Unity3D generierte Crash Reports
+sysinfo.txt
+
+# Builds
+*.apk
+*.aab
+*.unitypackage
+*.app
+
+# Crashlytics generierte Dateien
+crashlytics-build.properties
+
+# MacOS spezifische Dateien
+.DS_Store
+
+# Windsurf spezifische Dateien
+.windsurfrules
