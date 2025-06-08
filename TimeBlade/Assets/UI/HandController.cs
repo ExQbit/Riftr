@@ -32,6 +32,15 @@ public class HandController : MonoBehaviour
     [SerializeField] private Canvas parentCanvas; // Canvas für korrekte Touch-Umrechnung
     [SerializeField] private Camera uiCamera; // UI-Kamera (optional, abhängig vom Canvas-Modus)
     
+    [Header("Karten-Vorschau")]
+    [SerializeField] private float previewScale = 2.5f; // Skalierung der Vorschau-Karte
+    [SerializeField] private Vector2 previewOffset = new Vector2(0, 100); // Offset vom Bildschirm-Zentrum
+    [SerializeField] private float previewFadeInTime = 0.15f; // Einblend-Zeit
+    [SerializeField] private float previewFadeOutTime = 0.1f; // Ausblend-Zeit
+    
+    [Header("Hover-Hysterese")]
+    [SerializeField] private float hoverHysteresisDistance = 20f; // Pixel-Abstand für stabilen Kartenwechsel
+    
     // Aktive Karten-UI-Elemente
     private List<GameObject> activeCardUIs = new List<GameObject>();
     private bool isFanned = false;
@@ -66,6 +75,15 @@ public class HandController : MonoBehaviour
     
     // Canvas-Kamera für Touch-Umrechnung
     private Camera canvasCamera;
+    
+    // Card Preview System
+    private GameObject cardPreview = null; // Vorschau-GameObject
+    private CardUI cardPreviewUI = null; // UI-Component der Vorschau
+    private CanvasGroup previewCanvasGroup = null; // Für Fade-In/Out
+    
+    // Hover Hysteresis System
+    private Vector2 lastHoverPosition; // Letzte Position beim Hover-Wechsel
+    private bool isHysteresisActive = false; // Ist Hysterese aktiv?
     
     void Start()
     {
@@ -328,6 +346,10 @@ public class HandController : MonoBehaviour
                 hasChangedCards = false;
                 initialHoveredCard = null;
                 
+                // Reset Hover-Hysterese
+                isHysteresisActive = false;
+                lastHoverPosition = position;
+                
                 // Bestimme welche Karte unter dem Touch ist
                 UpdateCardSelectionAtPosition(position);
                 
@@ -494,6 +516,9 @@ public class HandController : MonoBehaviour
                 Debug.Log($"[HandController] Clearing lastHoveredCard reference: {lastHoveredCard.GetCardData()?.cardName}");
                 lastHoveredCard = null; // Just clear reference, UpdateCardLayout already handled hover reset
             }
+            
+            // Hide card preview
+            HideCardPreview();
         }
         else if (isPlayingCard)
         {
@@ -1341,9 +1366,59 @@ public class HandController : MonoBehaviour
             }
         }
         
-        // NUR ÄNDERN wenn sich die Karte tatsächlich geändert hat
+        // HYSTERESE-LOGIK: Verhindere Flackern an Kartengrenzen
+        bool shouldChangeHover = false;
+        
         if (newHoveredCard != previousHovered)
         {
+            // Wenn keine vorherige Karte gehovert war, wechsle sofort
+            if (previousHovered == null)
+            {
+                shouldChangeHover = true;
+                isHysteresisActive = false;
+            }
+            // Wenn neue Karte null ist (Finger außerhalb aller Karten), wechsle sofort
+            else if (newHoveredCard == null)
+            {
+                shouldChangeHover = true;
+                isHysteresisActive = false;
+            }
+            // Ansonsten prüfe Hysterese
+            else
+            {
+                // Berechne Distanz seit letztem Hover-Wechsel
+                float distanceFromLastHover = Vector2.Distance(screenPosition, lastHoverPosition);
+                
+                // Wenn Hysterese aktiv ist, prüfe ob Schwellenwert überschritten
+                if (isHysteresisActive)
+                {
+                    if (distanceFromLastHover >= hoverHysteresisDistance)
+                    {
+                        shouldChangeHover = true;
+                        isHysteresisActive = false;
+                        Debug.Log($"[HandController] Hysteresis threshold reached: {distanceFromLastHover:F1}px >= {hoverHysteresisDistance}px");
+                    }
+                    else
+                    {
+                        // Bleibe bei aktueller Karte
+                        Debug.Log($"[HandController] Hysteresis active: {distanceFromLastHover:F1}px < {hoverHysteresisDistance}px - staying on {previousHovered.GetCardData()?.cardName}");
+                    }
+                }
+                else
+                {
+                    // Erste Bewegung zu neuer Karte - aktiviere Hysterese
+                    shouldChangeHover = true;
+                    isHysteresisActive = true;
+                }
+            }
+        }
+        
+        // Führe Hover-Wechsel nur aus wenn erlaubt
+        if (shouldChangeHover && newHoveredCard != previousHovered)
+        {
+            // Speichere Position für nächste Hysterese-Berechnung
+            lastHoverPosition = screenPosition;
+            
             // Alte Karte dehovern
             if (previousHovered != null)
             {
@@ -1369,6 +1444,9 @@ public class HandController : MonoBehaviour
                     Debug.Log($"[HandController] *** LAST HOVERED BLOCKED *** Not updating lastHoveredCard to '{hoveredCard.GetCardData()?.cardName}' - touching:{isTouching}, playing:{isPlayingCard}");
                 }
             }
+            
+            // Update Card Preview
+            UpdateCardPreview();
             
             string previousName = previousHovered != null ? previousHovered.GetCardData()?.cardName ?? "NULL" : "none";
             string newName = hoveredCard != null ? hoveredCard.GetCardData()?.cardName ?? "NULL" : "none";
@@ -1500,6 +1578,9 @@ public class HandController : MonoBehaviour
         // Entferne Karte aus Layout
         RemoveCardForDrag(cardToDrag.gameObject);
         DisableAllHoverEffects();
+        
+        // Hide card preview when dragging starts
+        HideCardPreview();
         
         // Visuelle Anpassungen
         cardToDrag.transform.SetAsLastSibling();
@@ -1679,12 +1760,150 @@ public class HandController : MonoBehaviour
         Debug.Log($"[HandController] Notifying all cards about lastHoveredCard change");
     }
     
+    /// <summary>
+    /// Aktualisiert die Karten-Vorschau basierend auf der aktuell gehoverten Karte
+    /// </summary>
+    private void UpdateCardPreview()
+    {
+        if (hoveredCard != null && isTouching && !isDraggingActive)
+        {
+            // Show or update preview
+            ShowCardPreview(hoveredCard);
+        }
+        else
+        {
+            // Hide preview
+            HideCardPreview();
+        }
+    }
+    
+    /// <summary>
+    /// Zeigt die Karten-Vorschau für die angegebene Karte
+    /// </summary>
+    private void ShowCardPreview(CardUI card)
+    {
+        if (card == null || card.GetCardData() == null) return;
+        
+        // Create preview if it doesn't exist
+        if (cardPreview == null)
+        {
+            CreateCardPreview();
+        }
+        
+        if (cardPreview == null) return;
+        
+        // Update preview content
+        if (cardPreviewUI != null)
+        {
+            cardPreviewUI.SetCardData(card.GetCardData());
+        }
+        
+        // Position preview in center of screen with offset
+        RectTransform previewRect = cardPreview.GetComponent<RectTransform>();
+        if (previewRect != null)
+        {
+            previewRect.anchoredPosition = previewOffset;
+        }
+        
+        // Show with fade in
+        if (previewCanvasGroup != null)
+        {
+            cardPreview.SetActive(true);
+            LeanTween.cancel(cardPreview);
+            LeanTween.alphaCanvas(previewCanvasGroup, 1f, previewFadeInTime).setEase(LeanTweenType.easeOutQuad);
+        }
+        
+        Debug.Log($"[HandController] Showing card preview for: {card.GetCardData().cardName}");
+    }
+    
+    /// <summary>
+    /// Versteckt die Karten-Vorschau
+    /// </summary>
+    private void HideCardPreview()
+    {
+        if (cardPreview == null || !cardPreview.activeSelf) return;
+        
+        if (previewCanvasGroup != null)
+        {
+            LeanTween.cancel(cardPreview);
+            LeanTween.alphaCanvas(previewCanvasGroup, 0f, previewFadeOutTime)
+                .setEase(LeanTweenType.easeOutQuad)
+                .setOnComplete(() => {
+                    cardPreview.SetActive(false);
+                });
+        }
+        else
+        {
+            cardPreview.SetActive(false);
+        }
+        
+        Debug.Log("[HandController] Hiding card preview");
+    }
+    
+    /// <summary>
+    /// Erstellt das Vorschau-GameObject
+    /// </summary>
+    private void CreateCardPreview()
+    {
+        if (cardUIPrefab == null || parentCanvas == null) return;
+        
+        // Create preview as child of canvas (not handContainer)
+        Transform canvasTransform = parentCanvas.transform;
+        cardPreview = Instantiate(cardUIPrefab, canvasTransform);
+        cardPreview.name = "CardPreview";
+        
+        // Setup RectTransform
+        RectTransform previewRect = cardPreview.GetComponent<RectTransform>();
+        if (previewRect != null)
+        {
+            // Center anchors
+            previewRect.anchorMin = Vector2.one * 0.5f;
+            previewRect.anchorMax = Vector2.one * 0.5f;
+            previewRect.pivot = Vector2.one * 0.5f;
+            
+            // Apply scale
+            previewRect.localScale = Vector3.one * previewScale;
+            
+            // Ensure it's on top
+            cardPreview.transform.SetAsLastSibling();
+        }
+        
+        // Get CardUI component
+        cardPreviewUI = cardPreview.GetComponent<CardUI>();
+        if (cardPreviewUI != null)
+        {
+            // Disable interactions on preview
+            cardPreviewUI.enabled = false; // Disable all hover/click functionality
+        }
+        
+        // Add CanvasGroup for fading
+        previewCanvasGroup = cardPreview.GetComponent<CanvasGroup>();
+        if (previewCanvasGroup == null)
+        {
+            previewCanvasGroup = cardPreview.AddComponent<CanvasGroup>();
+        }
+        previewCanvasGroup.alpha = 0f;
+        previewCanvasGroup.interactable = false;
+        previewCanvasGroup.blocksRaycasts = false;
+        
+        // Start hidden
+        cardPreview.SetActive(false);
+        
+        Debug.Log("[HandController] Created card preview GameObject");
+    }
+    
     void OnDestroy()
     {
         if (player != null)
         {
             // Instanz-Event abmelden
             player.OnHandChanged -= UpdateHandDisplay;
+        }
+        
+        // Clean up card preview
+        if (cardPreview != null)
+        {
+            Destroy(cardPreview);
         }
         
         // NO LEGACY EVENTS to unsubscribe
