@@ -480,7 +480,20 @@ public class HandController : MonoBehaviour
             
             // CRITICAL: Force unfanning and immediate layout to prevent hanging
             isFanned = false;
-            UpdateCardLayout(true); // true = force immediate
+            UpdateCardLayout(true); // true = force immediate (already calls ForceDisableHover on all cards)
+            
+            // CRITICAL: Reset hover references after touch end (but no explicit ForceExitHover to avoid race condition)
+            if (hoveredCard != null)
+            {
+                Debug.Log($"[HandController] Clearing hoveredCard reference: {hoveredCard.GetCardData()?.cardName}");
+                hoveredCard = null; // Just clear reference, UpdateCardLayout already handled hover reset
+            }
+            
+            if (lastHoveredCard != null)
+            {
+                Debug.Log($"[HandController] Clearing lastHoveredCard reference: {lastHoveredCard.GetCardData()?.cardName}");
+                lastHoveredCard = null; // Just clear reference, UpdateCardLayout already handled hover reset
+            }
         }
         else if (isPlayingCard)
         {
@@ -1091,11 +1104,9 @@ public class HandController : MonoBehaviour
             // CRITICAL: Ensure all cards have correct SiblingIndex after layout
             EnsureCorrectSiblingOrder();
             
-            // CRITICAL: Extra Card 3 protection - force fix if it's stuck
-            if (activeCardUIs.Count == 5)
-            {
-                StartCoroutine(FixCard3IfStuckInHover());
-            }
+            // REMOVED: FixCard3IfStuckInHover was causing incorrect position resets
+            // The coroutine had hardcoded Y=12.5f which is only correct for non-fanned state
+            // This was overriding correct fanned positions (Y=38.89f for Card 3)
         }
     }
     
