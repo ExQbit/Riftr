@@ -41,6 +41,17 @@ public class HandController : MonoBehaviour
     [Header("Hover-Hysterese")]
     [SerializeField] private float hoverHysteresisDistance = 20f; // Pixel-Abstand für stabilen Kartenwechsel
     
+    [Header("Parallax Hand-Verschiebung")]
+    [SerializeField] private float maxHorizontalShift = 150f; // Maximale horizontale Verschiebung
+    [SerializeField] private float parallaxSensitivity = 0.5f; // Wie stark die Hand reagiert (0.5 = 50% der Fingerbewegung)
+    [SerializeField] private float returnAnimationDuration = 0.3f; // Dauer der Rückkehr-Animation
+    [SerializeField] private LeanTweenType returnEaseType = LeanTweenType.easeOutExpo; // Easing für Rückkehr
+    
+    [Header("Drag-Schwellenwerte")]
+    [SerializeField] public float minVerticalSwipeForDrag = 30f; // Minimale Aufwärtsbewegung für Drag (in Pixel)
+    [SerializeField] public float strongUpwardMovementThreshold = 50f; // Schwellenwert für sofortigen Drag
+    [SerializeField] public float maxHorizontalMovementForDrag = 100f; // Maximale horizontale Bewegung für Drag
+    
     // Aktive Karten-UI-Elemente
     private List<GameObject> activeCardUIs = new List<GameObject>();
     private bool isFanned = false;
@@ -62,9 +73,7 @@ public class HandController : MonoBehaviour
     private Vector2 lastDragPosition;         // Letzte Finger-Position (für Bewegungs-Tracking)  
     private CardUI draggedCardUI = null;      // Die Karte die AKTUELL gedraggt wird (nicht Start-Karte!)
     
-    // Drag-Schwellenwerte (NUR Aufwärtsbewegung löst Drag aus!)
-    private float minVerticalSwipe = 30f;     // Erhöht auf 30f - verhindert zu leichtes Auslösen
-    private float maxHorizontalForDrag = 100f; // Erhöht auf 100f - erlaubt diagonale Bewegung
+    // Drag-Schwellenwerte werden jetzt über öffentliche SerializeField-Variablen gesteuert
     
     // NEU: Horizontale Drift-Erkennung (verhindert Drag während Kartengliding)
     private bool hasChangedCards = false;     // Flag: Hat der Finger zwischen verschiedenen Karten gewechselt?
@@ -84,6 +93,10 @@ public class HandController : MonoBehaviour
     // Hover Hysteresis System
     private Vector2 lastHoverPosition; // Letzte Position beim Hover-Wechsel
     private bool isHysteresisActive = false; // Ist Hysterese aktiv?
+    
+    // Parallax Hand Shift System
+    private float currentHandOffset = 0f; // Aktuelle horizontale Verschiebung
+    private bool isParallaxActive = false; // Ist Parallax-Tracking aktiv?
     
     void Start()
     {
@@ -350,6 +363,12 @@ public class HandController : MonoBehaviour
                 isHysteresisActive = false;
                 lastHoverPosition = position;
                 
+                // Initialize Parallax System
+                // WICHTIG: Setze lastDragPosition für frame-basierte Bewegung
+                lastDragPosition = position;
+                isParallaxActive = true;
+                // currentHandOffset behält seinen Wert - keine Rücksetzung!
+                
                 // Bestimme welche Karte unter dem Touch ist
                 UpdateCardSelectionAtPosition(position);
                 
@@ -379,6 +398,12 @@ public class HandController : MonoBehaviour
     /// </summary>
     private void HandleTouchMove(Vector2 position)
     {
+        // Update Parallax Hand Shift (nur wenn gefächert und nicht draggend)
+        if (isParallaxActive && isFanned && !isDraggingActive)
+        {
+            UpdateParallaxHandShift(position);
+        }
+        
         // Update der Kartenauswahl unter dem Finger
         UpdateCardSelectionAtPosition(position);
         
@@ -390,11 +415,11 @@ public class HandController : MonoBehaviour
             // DEBUG: Log every frame to understand why drag isn't triggering
             if (Mathf.Abs(dragDelta.y) > 10f || Mathf.Abs(dragDelta.x) > 10f)
             {
-                Debug.Log($"[HandController] Drag detection: delta=({dragDelta.x:F1}, {dragDelta.y:F1}), vertical needed: {minVerticalSwipe}, horizontal max: {maxHorizontalForDrag}");
+                Debug.Log($"[HandController] Drag detection: delta=({dragDelta.x:F1}, {dragDelta.y:F1}), vertical needed: {minVerticalSwipeForDrag}, horizontal max: {maxHorizontalMovementForDrag}");
             }
             
             // INTELLIGENTE DRAG-ERKENNUNG: Verhindert versehentliches Draggen beim Durchgleiten
-            bool hasUpwardMovement = dragDelta.y > minVerticalSwipe; // Positives Y = Aufwärts
+            bool hasUpwardMovement = dragDelta.y > minVerticalSwipeForDrag; // Positives Y = Aufwärts
             
             // NEU: Winkel-basierte Erkennung
             // Berechne den Winkel der Bewegung (0° = horizontal, 90° = vertikal)
@@ -423,7 +448,7 @@ public class HandController : MonoBehaviour
             bool shouldStartDrag = false;
             
             // VEREINFACHTER MODUS für Testing: Wenn große Aufwärtsbewegung, ignoriere andere Checks
-            bool isStrongUpwardMovement = dragDelta.y > 50f; // Starke Aufwärtsbewegung
+            bool isStrongUpwardMovement = dragDelta.y > strongUpwardMovementThreshold; // Starke Aufwärtsbewegung
             
             if (isStrongUpwardMovement)
             {
@@ -519,6 +544,13 @@ public class HandController : MonoBehaviour
             
             // Hide card preview
             HideCardPreview();
+            
+            // Reset Parallax to center
+            if (isParallaxActive)
+            {
+                isParallaxActive = false;
+                AnimateHandToCenter();
+            }
         }
         else if (isPlayingCard)
         {
@@ -1582,6 +1614,12 @@ public class HandController : MonoBehaviour
         // Hide card preview when dragging starts
         HideCardPreview();
         
+        // Stop parallax when dragging starts
+        isParallaxActive = false;
+        
+        // Center hand when drag starts
+        CenterHandAfterDragStart();
+        
         // Visuelle Anpassungen
         cardToDrag.transform.SetAsLastSibling();
         LeanTween.rotateLocal(cardToDrag.gameObject, Vector3.zero, 0.08f).setEase(LeanTweenType.easeOutExpo);
@@ -1890,6 +1928,92 @@ public class HandController : MonoBehaviour
         cardPreview.SetActive(false);
         
         Debug.Log("[HandController] Created card preview GameObject");
+    }
+    
+    /// <summary>
+    /// Aktualisiert die Parallax-Verschiebung basierend auf der Fingerbewegung
+    /// </summary>
+    private void UpdateParallaxHandShift(Vector2 currentPosition)
+    {
+        // WICHTIG: Berechne die Bewegung relativ zur vorherigen Position für kontinuierliche Updates
+        float horizontalDelta = currentPosition.x - lastDragPosition.x;
+        
+        // Akkumuliere die Verschiebung (mit Parallax-Sensitivität und Inversion)
+        float newOffset = currentHandOffset - (horizontalDelta * parallaxSensitivity);
+        
+        // Begrenze auf maxHorizontalShift
+        newOffset = Mathf.Clamp(newOffset, -maxHorizontalShift, maxHorizontalShift);
+        
+        // Direkte Anwendung für responsive Bewegung (kein Lerp für bessere Reaktion)
+        currentHandOffset = newOffset;
+        
+        // Wende Verschiebung auf handContainer an
+        RectTransform containerRect = handContainer.GetComponent<RectTransform>();
+        if (containerRect != null)
+        {
+            Vector3 pos = containerRect.localPosition;
+            pos.x = currentHandOffset;
+            containerRect.localPosition = pos;
+            
+            // Debug-Log
+            if (Mathf.Abs(horizontalDelta) > 5f)
+            {
+                Debug.Log($"[HandController] Parallax: Frame delta={horizontalDelta:F1}, Total offset={currentHandOffset:F1}");
+            }
+        }
+        
+        // Update lastDragPosition für nächsten Frame
+        lastDragPosition = currentPosition;
+    }
+    
+    /// <summary>
+    /// Animiert die Hand zurück zur zentrierten Position
+    /// </summary>
+    private void AnimateHandToCenter()
+    {
+        RectTransform containerRect = handContainer.GetComponent<RectTransform>();
+        if (containerRect != null && Mathf.Abs(currentHandOffset) > 0.1f)
+        {
+            Debug.Log($"[HandController] Animating hand back to center from offset: {currentHandOffset:F1}");
+            
+            // Cancel any existing animation
+            LeanTween.cancel(handContainer.gameObject);
+            
+            // Animate back to center
+            LeanTween.moveLocalX(handContainer.gameObject, 0f, returnAnimationDuration)
+                .setEase(returnEaseType)
+                .setOnComplete(() => {
+                    currentHandOffset = 0f;
+                    Debug.Log("[HandController] Hand returned to center");
+                });
+        }
+        else
+        {
+            currentHandOffset = 0f;
+        }
+    }
+    
+    /// <summary>
+    /// Centers the hand immediately when drag starts (without animation for responsive feel)
+    /// </summary>
+    private void CenterHandAfterDragStart()
+    {
+        RectTransform containerRect = handContainer.GetComponent<RectTransform>();
+        if (containerRect != null && Mathf.Abs(currentHandOffset) > 0.1f)
+        {
+            Debug.Log($"[HandController] Centering hand after drag start from offset: {currentHandOffset:F1}");
+            
+            // Cancel any existing parallax animations
+            LeanTween.cancel(handContainer.gameObject);
+            
+            // Immediate centering (no animation for drag responsiveness)
+            Vector3 pos = containerRect.localPosition;
+            pos.x = 0f;
+            containerRect.localPosition = pos;
+            
+            // Reset offset tracking
+            currentHandOffset = 0f;
+        }
     }
     
     void OnDestroy()
