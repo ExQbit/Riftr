@@ -1,0 +1,98 @@
+# Unity-spezifische Dateien
+/[Ll]ibrary/
+/[Tt]emp/
+/[Oo]bj/
+/[Bb]uild/
+/[Bb]uilds/
+/[Ll]ogs/
+/[Uu]ser[Ss]ettings/
+
+# MemoryCaptures kann sehr groß werden
+/[Mm]emoryCaptures/
+
+# Asset meta data sollte nur ignoriert werden, wenn die zugehörige Asset-Datei selbst ignoriert wird
+!/[Aa]ssets/**/*.meta
+
+# Visual Studio Cache-Verzeichnis
+.vs/
+
+# Gradle cache-Verzeichnis
+.gradle/
+
+# Autogenerierte VS/MD/Consulo Lösungs- und Projektdateien
+ExportedObj/
+.consulo/
+*.csproj
+*.unityproj
+*.sln
+*.suo
+*.tmp
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+
+# Unity3D generierte meta-Dateien
+*.pidb.meta
+*.pdb.meta
+*.mdb.meta
+
+# Unity3D generierte Crash Reports
+sysinfo.txt
+
+# Builds
+*.apk
+*.aab
+*.unitypackage
+*.app
+
+# Crashlytics generierte Dateien
+crashlytics-build.properties
+
+# MacOS spezifische Dateien
+.DS_Store
+
+# Windsurf spezifische Dateien
+# .windsurfrules wurde entfernt, damit KI-Assistenten die Regeln lesen können
+
+# iCloud-spezifische Dateien
+*.icloud
+
+# Python-Umgebungen & Caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Umgebungsvariablen und sensible Daten
+.env
+.env.*
+*.env
+!.env.example
+!.env.template
+
+# Dateien mit hardcodierten Schlüsseln
+fixed_supabase_client.py
+override_env_test.py
+secrets.json
+env_exact.txt
+env_working_reference.txt
+env_reference.txt
+check_env_fixed.py
+
+# Ausnahmen für MCP-Entwicklung
+!venv/lib/python3.10/site-packages/mcp/server/fastmcp/server.py
+!venv/lib/python3.10/site-packages/mcp/server/fastmcp/__init__.py
+!venv/lib/python3.10/site-packages/mcp/server/fastmcp/tools/*.py
+
+# Backup-Dateien
+*.swp
+*.tmp
+*.bak
+*.orig

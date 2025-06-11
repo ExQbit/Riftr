@@ -1,0 +1,45 @@
+{
+    "version": "2.0",
+    "sync": {
+      "provider": "icloud",
+      "container": "TimeBlade"
+    },
+    "mcpServers": {
+      "supabase": {
+        "command": "/Users/exqbitmac/TimeBlade/venv/bin/python",
+        "args": [
+          "/Users/exqbitmac/TimeBlade/mcp_servers/mcp_supabase_server.py"
+        ],
+        "description": "Supabase MCP Zugriff für TimeBlade",
+        "workingDirectory": "/Users/exqbitmac/TimeBlade"
+      },
+      "filesystem": {
+        "command": "npx",
+        "args": [
+          "-y",
+          "@modelcontextprotocol/server-filesystem",
+          "/Users/exqbitmac/TimeBlade"
+        ],
+        "workingDirectory": "/Users/exqbitmac/TimeBlade",
+        "description": "Lokaler Zugriff auf das TimeBlade-Dateisystem"
+      },
+      "brave-search": {
+        "command": "npx",
+        "args": [
+          "-y",
+          "@modelcontextprotocol/server-brave-search"
+        ],
+        "description": "Brave Search Tool für Web- und lokale Suche",
+        "workingDirectory": "/Users/exqbitmac/TimeBlade"
+      },
+      "memory": {
+        "command": "npx",
+        "args": [
+          "-y",
+          "@modelcontextprotocol/server-memory"
+        ],
+        "description": "Persistentes Gedächtnis für den AI-Assistenten",
+        "workingDirectory": "/Users/exqbitmac/TimeBlade"
+      }
+    }
+}

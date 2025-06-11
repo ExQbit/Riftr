@@ -1,0 +1,120 @@
+# Zeitklingen Entwicklungs-Framework
+
+## 1. 🔑 Goldene Regeln
+
+Diese Prinzipien leiten die effiziente und effektive Entwicklung des "TimeBlade" Kartenspiels:
+
+* **Single Source of Truth:** Orientiere dich strikt an den Konzepten aus den **Core Docs** (`CoreDocs/`, z.B. `ZK-TIME-.md`, `ZK-KARTENPROGRESSION-v1.5-.md`, Klassen, Gegner-DB) und dem definierten **Zielmodell**.
+* **Fail Loud and Clear:** Keine Fallbacks. Klare Fehler bei Problemen.
+* **Code-Qualität:** Sauberer Code, klare Namen, **erklärende Kommentare** für alle Fixes.
+* **Markdown-Dateien zur Projektverwaltung nutzen** (README.md, PLANNING.md, TASK.md).
+* **Codedateien unter 500 Zeilen halten.** Bei Bedarf in Module aufteilen.
+* **Häufig neue Gespräche beginnen.** Lange Threads verschlechtern die Antwortqualität.
+* **Das Modell nicht überlasten.** Eine Aufgabe pro Nachricht ist ideal.
+* **Früh und oft testen.** Jede neue Funktion sollte Unit-Tests haben.
+* **Präzise Anfragen stellen.** Je mehr Kontext, desto besser. Beispiele sind sehr hilfreich.
+* **Dokumentation und Kommentare kontinuierlich schreiben.** Dokumentation nicht aufschieben.
+
+## 2. 📂 Projektorganisation
+
+### Dateistruktur
+- **README.md** - Projektübersicht, Einrichtungsanleitung und Nutzungsbeispiele
+- **PLANNING.md** - Projekt-Roadmap, Architekturentscheidungen und Designmuster
+- **TASK.md** - Aktuelle Aufgaben, Probleme und Fortschrittsverfolgung
+
+### Unity-Projektorganisation
+- **Assets/Scripts** - C#-Skripte, nach Modulen organisiert
+  - **Core/** - Grundlegende Spielmechaniken und -logik
+  - **Cards/** - Kartendefinitionen, -effekte und -interaktionen
+  - **UI/** - Benutzeroberfläche und Visualisierungen
+  - **AI/** - KI-Gegner und Entscheidungsfindung
+  - **TimeManipulation/** - Spezielle Zeitmanipulationsmechaniken
+  - **Audio/** - Soundeffekte und Musik
+- **Assets/Prefabs** - Wiederverwendbare Unity-Objekte
+- **Assets/ScriptableObjects** - Datendefinitionen für Karten und Konfigurationen
+- **Assets/Resources** - Laufzeit-geladene Ressourcen
+- **Assets/Tests** - Unit- und Integrationstests
+
+## 3. 🔄 Arbeitsablauf
+
+### Gesprächsmanagement
+1. Für jedes Feature oder jede Komponente ein neues Gespräch starten
+2. Referenzmaterialien in Projektdateien, nicht im Chat speichern
+3. Wichtige Entscheidungen am Ende jeder Sitzung zusammenfassen
+
+### Aufgabenaufteilung
+1. Klare, spezifische Aufgaben in TASK.md definieren
+2. Für beste Ergebnisse eine Aufgabe pro Anfrage fokussieren
+3. Fortschritt aktualisieren und erledigte Elemente markieren
+4. **Implementierungsreferenz nutzen:** Konsultiere `Implementierungsreferenz.md` **vor** jeder Aufgabe für Kontext. Überprüfe das Dokument **nach** Abschluss der Aufgabe zur Selbstkontrolle gegen den Plan. Aktualisiere den Status von Elementen *nur nach expliziter Anweisung* des Users am Ende einer Aufgabe.
+5. **Implementierungsplan befolgen:** Halte dich strikt an den Plan in `Zeitklingen: Unity Implementation Plan.md`. Überprüfe dieses Dokument **nach** jeder Anfrage, um die Einhaltung sicherzustellen.
+
+## 4. 🧪 Teststrategie
+
+### Testgetriebene Entwicklung
+- Testfälle vor der Implementierung von Features schreiben
+- Sicherstellen, dass jede Funktion entsprechende Unit-Tests hat
+- Grenzfälle und Fehlerbehandlung testen
+
+### Qualitätssicherung
+- Regelmäßige Code-Reviews
+- Integrationstests für verbundene Komponenten
+- Performance-Tests für kritische Pfade
+
+## 5. 📝 Dokumentationspraktiken
+
+### Code-Dokumentation
+- Klare Funktions-Docstrings
+- Inline-Kommentare für komplexe Logik
+- Architekturdiagramme für komplexe Systeme
+
+### Benutzer-Dokumentation
+- Spielanleitung
+- Kartenreferenz
+- Tipps zur Fehlerbehebung
+
+## 6. 🚀 Implementierungstipps
+
+### Unity-spezifische Praktiken
+- **Scriptable Objects** für Kartendaten und Konfigurationen verwenden
+- **Event-basiertes System** für Karteninteraktionen nutzen
+- **Command Pattern** für reversible Aktionen (Zeitmanipulation) implementieren
+- **MVC-Muster** für saubere Trennung von Spiellogik und Darstellung
+
+### Zeitmanipulationsmechaniken
+- Zustandshistorie mit Command Pattern implementieren
+- Effiziente Serialisierung für Spielzustände gewährleisten
+- Klare Visualisierung von Zeitänderungen für Spieler entwickeln
+
+### Iterative Entwicklung
+- Mit minimalen funktionsfähigen Implementierungen beginnen
+- Basierend auf Tests und Feedback verfeinern
+- Änderungen und Begründungen dokumentieren
+
+## 7. 🎮 Spielbalance und -design
+
+### Kartenbalance
+- Datendaten für verschiedene Kartentypen sammeln
+- A/B-Tests für verschiedene Karteneffekte durchführen
+- Balancing-Änderungen basierend auf Spieltests vornehmen
+
+### KI-Entwicklung
+- Verschiedene Schwierigkeitsgrade implementieren
+- KI-Strategien für unterschiedliche Spielstile entwickeln
+- KI-Verhalten gegen Zeitmanipulationstaktiken testen
+
+## 8. 🔍 Überwachung und Wartung
+
+### Performance-Tracking
+- Systemleistung überwachen
+- Engpässe identifizieren
+- Kritische Pfade optimieren
+
+### Kontinuierliche Verbesserung
+- Regelmäßige Refactoring-Sitzungen
+- Abhängigkeiten aktualisieren
+- Feedback von Spieltestern und Stakeholdern umsetzen
+
+---
+
+*Dieses Framework ist darauf ausgelegt, die Produktivität bei der Entwicklung des "Zeitklingen" Kartenspiels zu maximieren. Nach Bedarf an projektspezifische Anforderungen anpassen.*

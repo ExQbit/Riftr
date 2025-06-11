@@ -435,14 +435,14 @@ public class HandController : MonoBehaviour
             // 2. Bewegung ist einigermaßen vertikal (Winkel > 30° ODER Verhältnis > 0.5)
             bool isPrimarilyVertical = angle > 30f || movementRatio > 0.5f;
             
-            // Card-Drift prüfen - ABER NUR wenn zu einer ANDEREN Karte gewechselt wird
-            // Drift zu NULL (Finger außerhalb Karten) wird IGNORIERT
-            bool hasCardDrift = hasChangedCards && hoveredCard != null;
+            // Card-Drift prüfen - DEAKTIVIERT für bessere UX
+            // Das System war zu restriktiv und blockierte legitime Drags
+            bool hasCardDrift = false; // DEAKTIVIERT
             
-            // Debug Info
-            if (hasUpwardMovement && Mathf.Abs(dragDelta.x) > 10f)
+            // Debug Info - ERWEITERT für besseres Debugging
+            if (Mathf.Abs(dragDelta.y) > 10f || Mathf.Abs(dragDelta.x) > 10f)
             {
-                Debug.Log($"[HandController] Movement analysis: angle={angle:F1}°, ratio={movementRatio:F2}, drift={hasCardDrift}, vertical={isPrimarilyVertical}");
+                Debug.Log($"[HandController] Movement: delta=({dragDelta.x:F1}, {dragDelta.y:F1}), needed Y={minVerticalSwipeForDrag}, hasUpward={hasUpwardMovement}, isVertical={isPrimarilyVertical}, drift={hasCardDrift}");
             }
             
             bool shouldStartDrag = false;
@@ -700,7 +700,7 @@ public class HandController : MonoBehaviour
     /// </summary>
     private void CreateCardUI(TimeCardData cardData)
     {
-        Debug.Log($"[HandController] Attempting to create CardUI for card data: {cardData?.cardName ?? "NULL"}");
+        // Debug.Log($"[HandController] Attempting to create CardUI for card data: {cardData?.cardName ?? "NULL"}"); // REDUCED LOGGING
         
         if (cardUIPrefab == null)
         {
@@ -719,7 +719,7 @@ public class HandController : MonoBehaviour
         int targetSiblingIndex = activeCardUIs.Count; // Neue Karte sollte hinten stehen
         cardUI.transform.SetSiblingIndex(targetSiblingIndex);
         
-        Debug.Log($"[HandController] Created CardUI GameObject: {cardUI.name}, Active: {cardUI.activeInHierarchy}, Parent: {cardUI.transform.parent?.name ?? "NONE"}, SiblingIndex: {cardUI.transform.GetSiblingIndex()}");
+        // Debug.Log($"[HandController] Created CardUI GameObject: {cardUI.name}, Active: {cardUI.activeInHierarchy}, Parent: {cardUI.transform.parent?.name ?? "NONE"}, SiblingIndex: {cardUI.transform.GetSiblingIndex()}"); // REDUCED LOGGING
         
         // Check RectTransform immediately
         RectTransform cardRect = cardUI.GetComponent<RectTransform>();
@@ -754,7 +754,7 @@ public class HandController : MonoBehaviour
             // ROBUSTE LÖSUNG: Verwende InitializeCard() für direkte HandController-Referenz
             cardUIComponent.InitializeCard(this, cardData, canvasCamera);
             cardUIComponent.OnCardClicked += HandleCardClick;
-            Debug.Log($"[HandController] CardUI component initialized with direct controller reference and canvas camera for {cardData.cardName}");
+            // Debug.Log($"[HandController] CardUI component initialized with direct controller reference and canvas camera for {cardData.cardName}"); // REDUCED LOGGING
         }
         else
         {
@@ -762,28 +762,28 @@ public class HandController : MonoBehaviour
         }
         
         activeCardUIs.Add(cardUI);
-        Debug.Log($"[HandController] Added {cardUI.name} to activeCardUIs. Total cards: {activeCardUIs.Count}");
+        // Debug.Log($"[HandController] Added {cardUI.name} to activeCardUIs. Total cards: {activeCardUIs.Count}"); // REDUCED LOGGING
         
         // SCALING FIX: Set layout animation flag BEFORE layout to prevent hover during layout
         if (cardUIComponent != null)
         {
             cardUIComponent.SetInLayoutAnimation(true); // Prevent hover during initial layout
-            Debug.Log($"[HandController] Set layout animation flag for Card {activeCardUIs.Count-1} during creation");
+            // Debug.Log($"[HandController] Set layout animation flag for Card {activeCardUIs.Count-1} during creation"); // REDUCED LOGGING
         }
         
         // Layout mit sofortiger Positionierung aktualisieren (verhindert initiale Überlappung)
-        Debug.Log($"[HandController] Calling UpdateCardLayout. Card count: {activeCardUIs.Count}. Force immediate: true");
+        // Debug.Log($"[HandController] Calling UpdateCardLayout. Card count: {activeCardUIs.Count}. Force immediate: true"); // REDUCED LOGGING
         UpdateCardLayout(true, true);
         
         // CRITICAL FIX: ForceDisableHover AFTER layout so basePosition is set correctly
         if (cardUIComponent != null)
         {
             cardUIComponent.ForceDisableHover();
-            Debug.LogError($"[HandController] FORCED Card {activeCardUIs.Count-1} to disable hover AFTER layout");
+            // Debug.LogError($"[HandController] FORCED Card {activeCardUIs.Count-1} to disable hover AFTER layout"); // REDUCED LOGGING
             
             // CRITICAL: Re-enable hover only AFTER ForceDisableHover to prevent race condition
             cardUIComponent.SetInLayoutAnimation(false);
-            Debug.Log($"[HandController] Re-enabled hover for Card {activeCardUIs.Count-1} AFTER ForceDisableHover");
+            // Debug.Log($"[HandController] Re-enabled hover for Card {activeCardUIs.Count-1} AFTER ForceDisableHover"); // REDUCED LOGGING
         }
         
         // CRITICAL: Check the position immediately after layout
@@ -843,12 +843,12 @@ public class HandController : MonoBehaviour
     /// </summary>
     public void UpdateCardLayout(bool forceImmediate = false, bool isFromCardCreation = false)
     {
-        Debug.Log($"[HandController] Layout update - card count: {activeCardUIs.Count}, is fanned: {isFanned}, is touching: {isTouching}, force immediate: {forceImmediate}");
+        // Debug.Log($"[HandController] Layout update - card count: {activeCardUIs.Count}, is fanned: {isFanned}, is touching: {isTouching}, force immediate: {forceImmediate}"); // REDUCED LOGGING
         
         int cardCount = activeCardUIs.Count;
         if (cardCount == 0)
         {
-            Debug.Log("[HandController] UpdateCardLayout - No cards to layout, returning");
+            // Debug.Log("[HandController] UpdateCardLayout - No cards to layout, returning"); // REDUCED LOGGING
             return;
         }
         
@@ -1003,7 +1003,7 @@ public class HandController : MonoBehaviour
             // DEBUG: Log curve calculation for all cards when fanned
             if (isFanned && i <= 4)
             {
-                Debug.Log($"[HandController] CURVE DEBUG Card {i}: normalizedPos={normalizedPos:F3}, curveT={curveT:F3}, absT={absT:F3}, angle={angle:F3}, curveValue={curveValue:F3}, final Y={y:F3}");
+                // Debug.Log($"[HandController] CURVE DEBUG Card {i}: normalizedPos={normalizedPos:F3}, curveT={curveT:F3}, absT={absT:F3}, angle={angle:F3}, curveValue={curveValue:F3}, final Y={y:F3}"); // REDUCED LOGGING
             }
             
             // Rotation (Fächer-Effekt)
@@ -1048,7 +1048,7 @@ public class HandController : MonoBehaviour
             card.transform.SetSiblingIndex(i);
             
             // DEBUG: Log the sibling index assignment
-            Debug.Log($"[HandController] Card {i} ({cardName}) set to SiblingIndex {i} (total cards: {cardCount})");
+            // Debug.Log($"[HandController] Card {i} ({cardName}) set to SiblingIndex {i} (total cards: {cardCount})"); // REDUCED LOGGING
             
             // SCALING FIX: Ensure correct scale before positioning
             if (cardUI != null && !cardUI.IsDragging() && !cardUI.IsBeingDraggedCentrally())
@@ -1098,7 +1098,7 @@ public class HandController : MonoBehaviour
                     if (cardUI != null)
                     {
                         cardUI.ForceDisableHover();
-                        Debug.LogError($"[HandController] Force disabled hover on Card {i} after positioning");
+                        // Debug.LogError($"[HandController] Force disabled hover on Card {i} after positioning"); // REDUCED LOGGING
                     }
                     
                     // Schedule monitoring for this card
@@ -1502,20 +1502,14 @@ public class HandController : MonoBehaviour
                 
                 if (isDifferentCard)
                 {
-                    // Drift erkannt - Finger hat von initialHoveredCard zu einer anderen Karte gewechselt
-                    hasChangedCards = true;
+                    // DEAKTIVIERT: Card-Drift-System war zu restriktiv
+                    // hasChangedCards = true; // AUSKOMMENTIERT
                     string initialCardName = initialHoveredCard.GetCardData()?.cardName ?? "NULL";
                     
-                    // DEBUG: Zusätzliche Informationen für Fehlersuche
+                    // DEBUG: Info über Kartenwechsel (aber kein Blocking mehr)
                     int initialIndex = activeCardUIs.IndexOf(initialHoveredCard.gameObject);
                     int currentIndex = activeCardUIs.IndexOf(hoveredCard.gameObject);
-                    Debug.Log($"[HandController] *** CARD DRIFT DETECTED *** Finger moved away from initial card '{initialCardName}' (index: {initialIndex}) to '{newName}' (index: {currentIndex}) - DRAG WILL BE BLOCKED");
-                    
-                    // Extra debug for same-name cards
-                    if (initialCardName == newName)
-                    {
-                        Debug.LogError($"[HandController] WARNING: Drift detected between cards with same name! Initial obj: {initialHoveredCard.gameObject.GetInstanceID()}, Current obj: {hoveredCard.gameObject.GetInstanceID()}");
-                    }
+                    Debug.Log($"[HandController] Card drift detected '{initialCardName}' → '{newName}' (but NOT blocking drag anymore)");
                 }
             }
         }
@@ -1684,20 +1678,35 @@ public class HandController : MonoBehaviour
             return;
         }
         
-        float screenHeight = Screen.height;
-        float playZoneY = screenHeight * 0.5f;
+        // Prüfe ob Karte auf Gegner gedroppt wurde
+        RiftEnemy targetEnemy = GetEnemyUnderDragPosition();
+        TimeCardData cardData = draggedCardUI.GetCardData();
         
-        if (lastDragPosition.y > playZoneY)
+        Debug.Log($"[HandController] EndDragOperation - targetEnemy: {(targetEnemy != null ? targetEnemy.name : "NULL")}, lastDragPosition: {lastDragPosition}");
+        
+        if (targetEnemy != null)
         {
-            // Karte in Spielzone gedraggt - spiele sie
-            Debug.Log($"[HandController] Playing dragged card: {draggedCardUI.GetCardData()?.cardName}");
-            PlayDraggedCard();
+            // Karte direkt auf Gegner gedroppt - spiele mit Ziel
+            Debug.Log($"[HandController] *** DRAG-AND-DROP *** Card {cardData.cardName} dropped on enemy: {targetEnemy.name}");
+            PlayDraggedCardOnTarget(targetEnemy);
         }
         else
         {
-            // Karte zurück zur Hand
-            Debug.Log($"[HandController] Returning dragged card to hand: {draggedCardUI.GetCardData()?.cardName}");
-            ReturnDraggedCardToHand();
+            float screenHeight = Screen.height;
+            float playZoneY = screenHeight * 0.5f;
+            
+            if (lastDragPosition.y > playZoneY)
+            {
+                // Karte in Spielzone gedraggt - spiele sie (ohne Ziel)
+                Debug.Log($"[HandController] Playing dragged card in play zone: {draggedCardUI.GetCardData()?.cardName}");
+                PlayDraggedCard();
+            }
+            else
+            {
+                // Karte zurück zur Hand
+                Debug.Log($"[HandController] Returning dragged card to hand: {draggedCardUI.GetCardData()?.cardName}");
+                ReturnDraggedCardToHand();
+            }
         }
         
         // Reset Drag-State
@@ -1719,21 +1728,90 @@ public class HandController : MonoBehaviour
         TimeCardData cardData = draggedCardUI.GetCardData();
         
         Debug.Log($"[HandController] *** CENTRALIZED CARD PLAY *** Playing: {cardData?.cardName}");
+        Debug.Log($"[HandController] Card requiresTarget: {cardData.requiresTarget}, cardType: {cardData.cardType}");
         
-        // Spiele die Karte über das Combat-System
-        if (RiftCombatManager.Instance != null && ZeitwaechterPlayer.Instance != null)
+        // SIMPLIFIED APPROACH: For attack cards, always try to find a target
+        if (cardData.cardType == TimeCardType.Attack && RiftCombatManager.Instance != null)
         {
-            RiftCombatManager.Instance.PlayerWantsToPlayCard(cardData, ZeitwaechterPlayer.Instance);
+            // Get the first available enemy
+            var activeEnemies = RiftCombatManager.Instance.GetActiveEnemies();
+            RiftEnemy target = null;
+            
+            foreach (var enemy in activeEnemies)
+            {
+                if (enemy != null && !enemy.IsDead())
+                {
+                    target = enemy;
+                    break;
+                }
+            }
+            
+            Debug.Log($"[HandController] Attack card - found target: {(target != null ? target.name : "NULL")} (from {activeEnemies.Count} active enemies)");
+            
+            if (target != null)
+            {
+                // Execute attack on target
+                if (ZeitwaechterPlayer.Instance != null)
+                {
+                    if (RiftTimeSystem.Instance.TryPlayCard(cardData.GetScaledTimeCost()))
+                    {
+                        Debug.Log($"[HandController] *** DIRECT ATTACK *** {cardData.cardName} → {target.name}");
+                        
+                        // Entferne die Karte über das Spieler-System (löst DrawCard aus)
+                        bool cardRemoved = ZeitwaechterPlayer.Instance.PlayCardFromCombat(cardData);
+                        if (cardRemoved)
+                        {
+                            // Führe den Effekt aus
+                            RiftCombatManager.Instance.ExecuteCardEffectDirect(cardData, ZeitwaechterPlayer.Instance, target);
+                            
+                            // WICHTIG: Zerstöre das UI-GameObject NACH dem erfolgreichen Spielen
+                            if (activeCardUIs.Contains(draggedCardUI.gameObject))
+                            {
+                                activeCardUIs.Remove(draggedCardUI.gameObject);
+                            }
+                            Destroy(draggedCardUI.gameObject);
+                        }
+                        else
+                        {
+                            Debug.LogError("[HandController] Konnte Karte nicht aus der Hand entfernen!");
+                            // Zeit zurückgeben
+                            RiftTimeSystem.Instance.AddTime(cardData.GetScaledTimeCost());
+                            ReturnDraggedCardToHand();
+                            return;
+                        }
+                    }
+                    else
+                    {
+                        Debug.Log("[HandController] Nicht genug Zeit für diese Karte!");
+                        ReturnDraggedCardToHand();
+                        return;
+                    }
+                }
+            }
+            else
+            {
+                Debug.Log("[HandController] No valid target for attack card!");
+                ReturnDraggedCardToHand();
+                return;
+            }
         }
-        
-        // Entferne die Karte aus der Hand
-        if (activeCardUIs.Contains(draggedCardUI.gameObject))
+        else
         {
-            activeCardUIs.Remove(draggedCardUI.gameObject);
+            // Non-attack cards or fallback: use the standard system
+            Debug.Log("[HandController] Using standard card play system");
+            if (RiftCombatManager.Instance != null && ZeitwaechterPlayer.Instance != null)
+            {
+                RiftCombatManager.Instance.PlayerWantsToPlayCard(cardData, ZeitwaechterPlayer.Instance);
+                
+                // Bei nicht-Angriffskarten müssen wir das GameObject auch zerstören
+                // Da PlayerWantsToPlayCard die Karte intern entfernt
+                if (activeCardUIs.Contains(draggedCardUI.gameObject))
+                {
+                    activeCardUIs.Remove(draggedCardUI.gameObject);
+                }
+                Destroy(draggedCardUI.gameObject);
+            }
         }
-        
-        // Zerstöre das GameObject
-        Destroy(draggedCardUI.gameObject);
         
         // Reset Referenzen
         hoveredCard = null;
@@ -1741,6 +1819,109 @@ public class HandController : MonoBehaviour
         
         // Reset Guard nach Delay
         StartCoroutine(ResetPlayingCardFlag());
+    }
+    
+    /// <summary>
+    /// NEUE METHODE: Spielt die gedraggte Karte mit spezifischem Ziel
+    /// </summary>
+    private void PlayDraggedCardOnTarget(RiftEnemy target)
+    {
+        if (draggedCardUI == null || target == null) return;
+        
+        isPlayingCard = true;
+        TimeCardData cardData = draggedCardUI.GetCardData();
+        
+        Debug.Log($"[HandController] *** DRAG-AND-DROP CARD PLAY *** Playing: {cardData?.cardName} on {target.name}");
+        
+        // Prüfe ob genug Zeit vorhanden
+        if (!RiftTimeSystem.Instance.TryPlayCard(cardData.GetScaledTimeCost()))
+        {
+            Debug.Log("[HandController] Nicht genug Zeit für diese Karte!");
+            ReturnDraggedCardToHand();
+            return;
+        }
+        
+        // Führe Karteneffekt direkt mit Ziel aus (bypass Targeting-Mode)
+        if (RiftCombatManager.Instance != null && ZeitwaechterPlayer.Instance != null)
+        {
+            // Direkte Ausführung mit Ziel
+            RiftCombatManager.Instance.ExecuteCardEffectDirect(cardData, ZeitwaechterPlayer.Instance, target);
+        }
+        
+        // WICHTIG: Karte wird NICHT hier entfernt!
+        // Die Karte wird über ZeitwaechterPlayer.PlayCardFromCombat() entfernt,
+        // was automatisch UpdateHandDisplay() auslöst und eine neue Karte zieht
+        
+        // Reset Referenzen
+        hoveredCard = null;
+        lastHoveredCard = null;
+        
+        // Reset Guard nach Delay
+        StartCoroutine(ResetPlayingCardFlag());
+    }
+    
+    /// <summary>
+    /// NEUE METHODE: Findet Gegner unter der aktuellen Drag-Position
+    /// </summary>
+    private RiftEnemy GetEnemyUnderDragPosition()
+    {
+        if (!isDraggingActive) return null;
+        
+        // Raycast von der Kamera zur Drag-Position
+        Camera cam = canvasCamera != null ? canvasCamera : Camera.main;
+        if (cam == null) 
+        {
+            Debug.LogWarning("[HandController] No camera found for enemy raycast");
+            return null;
+        }
+        
+        Ray ray = cam.ScreenPointToRay(lastDragPosition);
+        Debug.Log($"[HandController] Raycast from screen position {lastDragPosition} with ray {ray}");
+        
+        RaycastHit2D hit = Physics2D.Raycast(ray.origin, ray.direction, Mathf.Infinity);
+        
+        if (hit.collider != null)
+        {
+            Debug.Log($"[HandController] 2D Raycast hit: {hit.collider.name}");
+            RiftEnemy enemy = hit.collider.GetComponent<RiftEnemy>();
+            if (enemy != null && !enemy.IsDead())
+            {
+                Debug.Log($"[HandController] Found 2D enemy under drag position: {enemy.name}");
+                return enemy;
+            }
+            else
+            {
+                Debug.Log($"[HandController] 2D Hit object has no RiftEnemy component or is dead");
+            }
+        }
+        else
+        {
+            Debug.Log("[HandController] 2D Raycast hit nothing");
+        }
+        
+        // Fallback: 3D Raycast für 3D Gegner
+        RaycastHit hit3D;
+        if (Physics.Raycast(ray, out hit3D))
+        {
+            Debug.Log($"[HandController] 3D Raycast hit: {hit3D.collider.name}");
+            RiftEnemy enemy = hit3D.collider.GetComponent<RiftEnemy>();
+            if (enemy != null && !enemy.IsDead())
+            {
+                Debug.Log($"[HandController] Found 3D enemy under drag position: {enemy.name}");
+                return enemy;
+            }
+            else
+            {
+                Debug.Log($"[HandController] 3D Hit object has no RiftEnemy component or is dead");
+            }
+        }
+        else
+        {
+            Debug.Log("[HandController] 3D Raycast also hit nothing");
+        }
+        
+        Debug.Log("[HandController] No enemy found under drag position - likely missing colliders on enemy GameObjects");
+        return null;
     }
     
     /// <summary>
@@ -1769,6 +1950,41 @@ public class HandController : MonoBehaviour
         AddCardBackToHand(draggedCardUI.gameObject);
         
         Debug.Log($"[HandController] ReturnDraggedCardToHand - Completed return process");
+    }
+    
+    /// <summary>
+    /// Entfernt eine Karte aus der Hand (für direktes Click-to-Play)
+    /// </summary>
+    public void RemoveCardFromHand(CardUI cardUI)
+    {
+        if (cardUI == null) return;
+        
+        Debug.Log($"[HandController] Removing {cardUI.GetCardData()?.cardName} from hand via click");
+        
+        // Entferne aus aktiven Karten
+        if (activeCardUIs.Contains(cardUI.gameObject))
+        {
+            activeCardUIs.Remove(cardUI.gameObject);
+        }
+        
+        // Reset Referenzen
+        if (hoveredCard == cardUI) hoveredCard = null;
+        if (lastHoveredCard == cardUI) lastHoveredCard = null;
+        
+        // Zerstöre GameObject
+        Destroy(cardUI.gameObject);
+        
+        // Update Layout nach kurzer Verzögerung
+        StartCoroutine(DelayedLayoutUpdate());
+    }
+    
+    /// <summary>
+    /// Verzögertes Layout-Update nach Kartenentfernung
+    /// </summary>
+    private System.Collections.IEnumerator DelayedLayoutUpdate()
+    {
+        yield return new WaitForSeconds(0.1f);
+        UpdateCardLayout(forceImmediate: true);
     }
     
     /// <summary>

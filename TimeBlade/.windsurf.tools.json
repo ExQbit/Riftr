@@ -1,0 +1,83 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "node",
+      "args": ["dist/index.js", "/Users/exqbitmac/TimeBlade"],
+      "workingDirectory": "/Users/exqbitmac/Tools/mcp-servers/src/filesystem",
+      "description": "Ermöglicht Lese- und Schreibzugriff auf das TimeBlade-Dateisystem"
+    },
+    "brave-search": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-brave-search"
+      ],
+      "env": {
+        "BRAVE_API_KEY": "BSAVpktSdXY7zXxdgZ3fcEquXUZ4E1G"
+      },
+      "description": "Integriert die Brave-API für Web- und lokale Suche für TimeBlade"
+    },
+    "git": {
+      "command": "/Users/exqbitmac/TimeBlade/venv/bin/python",
+      "args": [
+        "/Users/exqbitmac/TimeBlade/mcp_servers/git/main.py",
+        "/Users/exqbitmac/TimeBlade"
+      ],
+      "workingDirectory": "/Users/exqbitmac/TimeBlade/mcp_servers/git",
+      "description": "Verwaltet die Git-Versionskontrolle für das TimeBlade-Repository"
+    },
+    "memory": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-memory"
+      ],
+      "description": "Speichert und verwaltet das Langzeitgedächtnis für KI-Assistenten für TimeBlade"
+    },
+    "Zeitklingen Supabase": {
+      "command": "/Users/exqbitmac/TimeBlade/venv/bin/python",
+      "args": [
+        "/Users/exqbitmac/TimeBlade/mcp_servers/mcp_supabase_server.py"
+      ],
+      "workingDirectory": "/Users/exqbitmac/TimeBlade",
+      "description": "Stellt Supabase-Funktionen für TimeBlade bereit"
+    },
+    "card-data": {
+      "command": "/Users/exqbitmac/TimeBlade/venv/bin/python",
+      "args": [
+        "/Users/exqbitmac/TimeBlade/zk-commands/mcp_balance_server.py"
+      ],
+      "description": "Analysiert und balanciert Kartendaten, berechnet Statistiken und erstellt Visualisierungen zur Spielmechanik-Optimierung"
+    },
+    "test-runner": {
+      "command": "/Users/exqbitmac/TimeBlade/venv/bin/python",
+      "args": [
+        "-m",
+        "pytest",
+        "/Users/exqbitmac/TimeBlade/tests/"
+      ],
+      "description": "Führt automatisierte Tests für Spielmechaniken, Karteneffekte und Balancing aus und generiert Testberichte zur Qualitätssicherung"
+    },
+    "progression-simulator": {
+      "command": "/Users/exqbitmac/TimeBlade/venv/bin/python",
+      "args": [
+        "/Users/exqbitmac/TimeBlade/progression_simulator.py"
+      ],
+      "description": "Simuliert den Spielerfortschritt durch verschiedene Welten, testet die Balance zwischen Klassen und generiert Vergleichsvisualisierungen"
+    },
+    "card-analyzer": {
+      "command": "/Users/exqbitmac/TimeBlade/venv/bin/python",
+      "args": [
+        "/Users/exqbitmac/TimeBlade/zk-commands/analyze_card_formats.py"
+      ],
+      "description": "Analysiert Kartenformate, -effekte und deren Interaktionen, identifiziert Muster und potenzielle Balancing-Probleme in verschiedenen Spielsituationen"
+    },
+    "card-downloader": {
+      "command": "/Users/exqbitmac/TimeBlade/venv/bin/python",
+      "args": [
+        "/Users/exqbitmac/TimeBlade/zk-commands/download_cards_from_supabase.py"
+      ],
+      "description": "Lädt alle Karten aus der Supabase-Datenbank herunter, speichert sie in JSON-Dateien und aktualisiert das lokale Kartenverzeichnis"
+    }
+  }
+}

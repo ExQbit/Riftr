@@ -47,6 +47,7 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
     [SerializeField] private Image cardBackground;
     [SerializeField] private Image cardArt;
     [SerializeField] private GameObject highlightEffect;
+    [SerializeField] private Image playableBorderFrame; // Separater pulsierender Rahmen für Spielbarkeit
     
     [Header("Farben")]
     [SerializeField] private Color attackColor = new Color(1f, 0.3f, 0.3f);
@@ -91,6 +92,17 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
     [SerializeField] public LeanTweenType dragEaseType = LeanTweenType.easeOutExpo;
     [SerializeField] public LeanTweenType returnEaseType = LeanTweenType.easeOutBack;
     
+    [Header("🔮 Magischer Border-Glow")]
+    [SerializeField] public float borderPulseDuration = 0.8f; // Magische Pulsation
+    [SerializeField] public float borderMinAlpha = 0.6f; // Immer gut sichtbar
+    [SerializeField] public float borderMaxAlpha = 1.0f; // Voll leuchtend
+    [SerializeField] public Color borderColorPrimary = new Color(0.2f, 0.8f, 2.0f, 1.0f); // Helles Cyan
+    [SerializeField] public Color borderColorSecondary = new Color(1.0f, 0.4f, 2.0f, 1.0f); // Magenta für Farbwechsel
+    [SerializeField] public LeanTweenType borderEaseType = LeanTweenType.easeInOutSine; // Smooth magische Bewegung
+    [SerializeField] public float glowIntensity = 4.0f; // Starker magischer Glow
+    [SerializeField] public float glowSize = 30f; // Größe des Glow-Effekts
+    [SerializeField] public bool useColorCycling = true; // Farbwechsel-Effekt
+    
     // Hover-State
     private bool isHovered = false;
     private static bool touchStartedInHandArea = false;
@@ -102,6 +114,10 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
     // CRITICAL: Store base position for hover calculations
     private Vector3 basePosition = Vector3.zero; // Position without any hover lift
     private bool hasBasePosition = false;
+    
+    // Border-Pulsation tracking (getrennt von Hover-System)
+    private int borderTweenId = -1; // Track active border animation
+    private bool isBorderPulseActive = false; // Is border pulse animation running?
     
     void Awake()
     {
@@ -126,6 +142,25 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
         
         // Get CanvasGroup if it exists
         canvasGroup = GetComponent<CanvasGroup>();
+        
+        // Initialize playable border frame (create if not assigned)
+        if (playableBorderFrame == null)
+        {
+            CreatePlayableBorderFrame();
+        }
+        
+        if (playableBorderFrame != null)
+        {
+            // Set border color and hide initially
+            playableBorderFrame.color = new Color(borderColorPrimary.r, borderColorPrimary.g, borderColorPrimary.b, 0f);
+            playableBorderFrame.gameObject.SetActive(false);
+        }
+        
+        // Initialize hover effect (separate from border system)
+        if (highlightEffect != null)
+        {
+            highlightEffect.SetActive(false);
+        }
     }
     
     void Start()
@@ -148,6 +183,10 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
         {
             LeanTween.cancel(activeTweenId);
         }
+        
+        // Stop border pulsation before destruction
+        StopBorderPulsation();
+        
         LeanTween.cancel(gameObject);
     }
     
@@ -173,6 +212,9 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
         isDragging = false;
         isBeingDraggedCentrally = false;
         activeTweenId = -1;
+        
+        // Stop border pulsation
+        StopBorderPulsation();
         
         // Ensure highlight is off
         if (highlightEffect != null)
@@ -311,6 +353,16 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
                     baseColor : 
                     new Color(baseColor.r * 0.5f, baseColor.g * 0.5f, baseColor.b * 0.5f, 0.7f);
             }
+            
+            // Border-Pulsation für spielbare Karten
+            if (isPlayable && !isBorderPulseActive)
+            {
+                StartBorderPulsation();
+            }
+            else if (!isPlayable && isBorderPulseActive)
+            {
+                StopBorderPulsation();
+            }
         }
     }
     
@@ -349,6 +401,220 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
             .setOnComplete(() => {
                 transform.localPosition = originalPos;
             });
+    }
+    
+    /// <summary>
+    /// Startet die Border-Pulsation für spielbare Karten
+    /// </summary>
+    private void StartBorderPulsation()
+    {
+        if (playableBorderFrame == null || isBorderPulseActive) return;
+        
+        isBorderPulseActive = true;
+        
+        // Make border visible and set initial color
+        playableBorderFrame.color = new Color(borderColorPrimary.r, borderColorPrimary.g, borderColorPrimary.b, borderMinAlpha);
+        playableBorderFrame.gameObject.SetActive(true);
+        
+        // Start pulsing animation
+        PulseBorder();
+        
+        Debug.Log($"[CardUI] Started border pulsation for {cardData?.cardName}");
+    }
+    
+    /// <summary>
+    /// Stoppt die Border-Pulsation
+    /// </summary>
+    private void StopBorderPulsation()
+    {
+        if (!isBorderPulseActive) return;
+        
+        isBorderPulseActive = false;
+        
+        // Cancel active border tween
+        if (borderTweenId >= 0)
+        {
+            LeanTween.cancel(borderTweenId);
+            borderTweenId = -1;
+        }
+        
+        // Hide border frame
+        if (playableBorderFrame != null)
+        {
+            playableBorderFrame.gameObject.SetActive(false);
+        }
+        
+        Debug.Log($"[CardUI] Stopped border pulsation for {cardData?.cardName}");
+    }
+    
+    /// <summary>
+    /// Führt eine Border-Pulsation aus (rekursiv für kontinuierliche Animation)
+    /// </summary>
+    private void PulseBorder()
+    {
+        if (!isBorderPulseActive || playableBorderFrame == null) return;
+        
+        // Animate from min to max alpha with magical color cycling
+        borderTweenId = LeanTween.value(gameObject, borderMinAlpha, borderMaxAlpha, borderPulseDuration / 2f)
+            .setEase(borderEaseType)
+            .setOnUpdate((float val) => {
+                if (playableBorderFrame != null && isBorderPulseActive)
+                {
+                    // Choose color based on cycling preference
+                    Color baseColor = useColorCycling ? 
+                        Color.Lerp(borderColorPrimary, borderColorSecondary, (val - borderMinAlpha) / (borderMaxAlpha - borderMinAlpha)) :
+                        borderColorPrimary;
+                    
+                    // Apply HDR intensity for magical glow
+                    Color magicalColor = baseColor * glowIntensity;
+                    magicalColor.a = val;
+                    playableBorderFrame.color = magicalColor;
+                }
+            })
+            .setOnComplete(() => {
+                // Animate back from max to min alpha
+                if (isBorderPulseActive)
+                {
+                    borderTweenId = LeanTween.value(gameObject, borderMaxAlpha, borderMinAlpha, borderPulseDuration / 2f)
+                        .setEase(borderEaseType)
+                        .setOnUpdate((float val) => {
+                            if (playableBorderFrame != null && isBorderPulseActive)
+                            {
+                                // Choose color based on cycling preference (reverse cycle on fade)
+                                Color baseColor = useColorCycling ? 
+                                    Color.Lerp(borderColorSecondary, borderColorPrimary, (val - borderMinAlpha) / (borderMaxAlpha - borderMinAlpha)) :
+                                    borderColorPrimary;
+                                
+                                // Apply HDR intensity for magical glow
+                                Color magicalColor = baseColor * glowIntensity;
+                                magicalColor.a = val;
+                                playableBorderFrame.color = magicalColor;
+                            }
+                        })
+                        .setOnComplete(() => {
+                            // Recursively continue pulsing
+                            if (isBorderPulseActive)
+                            {
+                                PulseBorder();
+                            }
+                        }).id;
+                }
+            }).id;
+    }
+    
+    /// <summary>
+    /// Erstellt automatisch ein Border-Frame Element falls keines zugewiesen ist
+    /// </summary>
+    private void CreatePlayableBorderFrame()
+    {
+        // Create a new GameObject for the border
+        GameObject borderObject = new GameObject("PlayableBorderFrame");
+        borderObject.transform.SetParent(transform, false);
+        
+        // Add Image component
+        playableBorderFrame = borderObject.AddComponent<Image>();
+        
+        // Configure RectTransform to cover the entire card area
+        RectTransform borderRect = borderObject.GetComponent<RectTransform>();
+        borderRect.anchorMin = Vector2.zero;
+        borderRect.anchorMax = Vector2.one;
+        borderRect.sizeDelta = Vector2.zero;
+        borderRect.anchoredPosition = Vector2.zero;
+        
+        // Set as first child so it appears behind card content
+        borderObject.transform.SetAsFirstSibling();
+        
+        // Configure border appearance
+        playableBorderFrame.color = Color.clear; // Start transparent
+        playableBorderFrame.raycastTarget = false; // Don't block raycasts
+        
+        // Try to create a simple border sprite programmatically
+        CreateBorderSprite();
+        
+        Debug.Log("[CardUI] Auto-created PlayableBorderFrame");
+    }
+    
+    /// <summary>
+    /// Erstellt einen magischen, leuchtenden Border mit starkem Glow-Effekt
+    /// </summary>
+    private void CreateBorderSprite()
+    {
+        // Create a much larger texture for dramatic glow effect
+        int size = 200;
+        Texture2D borderTexture = new Texture2D(size, size);
+        Color[] pixels = new Color[size * size];
+        
+        Vector2 center = new Vector2(size / 2f, size / 2f);
+        float maxGlowDistance = glowSize; // Use configurable glow size
+        
+        // Create a magical glowing border pattern
+        for (int x = 0; x < size; x++)
+        {
+            for (int y = 0; y < size; y++)
+            {
+                // Calculate distance from edge for glow effect
+                int distFromEdge = Mathf.Min(
+                    Mathf.Min(x, size - 1 - x),
+                    Mathf.Min(y, size - 1 - y)
+                );
+                
+                Color pixelColor = Color.clear;
+                
+                if (distFromEdge < maxGlowDistance) // Large glow area
+                {
+                    float normalizedDist = distFromEdge / maxGlowDistance;
+                    
+                    if (distFromEdge < 6) // Very thin solid border
+                    {
+                        // Bright solid core
+                        pixelColor = new Color(1f, 1f, 1f, 1f);
+                    }
+                    else if (distFromEdge < 12) // Inner glow
+                    {
+                        // Strong inner glow
+                        float innerGlow = 1.0f - ((distFromEdge - 6) / 6.0f);
+                        pixelColor = new Color(1f, 1f, 1f, innerGlow * 0.9f);
+                    }
+                    else // Outer magical glow
+                    {
+                        // Magical falloff curve - more dramatic than quadratic
+                        float glowStrength = 1.0f - normalizedDist;
+                        float magicalAlpha = Mathf.Pow(glowStrength, 3.0f); // Cubic falloff for dramatic effect
+                        
+                        // Add some sparkle variation
+                        float sparkle = 1.0f + 0.2f * Mathf.Sin((x + y) * 0.3f) * Mathf.Sin(x * 0.7f) * Mathf.Sin(y * 0.5f);
+                        magicalAlpha *= sparkle;
+                        
+                        pixelColor = new Color(1f, 1f, 1f, Mathf.Clamp01(magicalAlpha));
+                    }
+                }
+                
+                pixels[y * size + x] = pixelColor;
+            }
+        }
+        
+        borderTexture.SetPixels(pixels);
+        borderTexture.Apply();
+        
+        // Create sprite from texture
+        Sprite borderSprite = Sprite.Create(
+            borderTexture, 
+            new Rect(0, 0, size, size), 
+            new Vector2(0.5f, 0.5f),
+            100,
+            0,
+            SpriteMeshType.FullRect,
+            new Vector4(maxGlowDistance, maxGlowDistance, maxGlowDistance, maxGlowDistance)
+        );
+        
+        // Apply to Image component
+        if (playableBorderFrame != null)
+        {
+            playableBorderFrame.sprite = borderSprite;
+            playableBorderFrame.type = Image.Type.Sliced;
+            
+            Debug.Log($"[CardUI] Created magical border sprite with glow size: {glowSize}");
+        }
     }
     
     /// <summary>
@@ -434,8 +700,9 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
         
         isHovered = hovered;
         
-        if (highlightEffect != null)
-            highlightEffect.SetActive(hovered);
+        // HOVER SYSTEM DEAKTIVIERT - nur Border-Pulsation wird verwendet
+        // if (highlightEffect != null)
+        //     highlightEffect.SetActive(hovered);
         
         // CRITICAL FIX: Cancel any existing scale tween before starting new one
         if (activeTweenId >= 0)
@@ -560,6 +827,7 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
     {
         return isDragging || isBeingDraggedCentrally;
     }
+    
     
     /// <summary>
     /// Wird vom HandController aufgerufen wenn ein Touch im gültigen Bereich beginnt

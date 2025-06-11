@@ -1,0 +1,59 @@
+--- Log started at 2025-05-08 17:58:25.096591 ---
+EARLY DEBUG: Python Executable: /Users/exqbitmac/TimeBlade/venv/bin/python
+EARLY DEBUG: Current Working Directory: /
+EARLY DEBUG: Script __file__: /Users/exqbitmac/TimeBlade/mcp_servers/mcp_supabase_server.py
+EARLY DEBUG: sys.path: ['/Users/exqbitmac/TimeBlade/mcp_servers', '/opt/homebrew/Cellar/python@3.10/3.10.16/Frameworks/Python.framework/Versions/3.10/lib/python310.zip', '/opt/homebrew/Cellar/python@3.10/3.10.16/Frameworks/Python.framework/Versions/3.10/lib/python3.10', '/opt/homebrew/Cellar/python@3.10/3.10.16/Frameworks/Python.framework/Versions/3.10/lib/python3.10/lib-dynload', '/Users/exqbitmac/TimeBlade/venv/lib/python3.10/site-packages']
+Attempting to load environment variables from /Users/exqbitmac/TimeBlade/.env
+Successfully imported FastMCP
+Successfully imported Supabase client
+Initializing FastMCP server
+Initializing Supabase client
+Supabase URL: https://slvxtnfmktzjgomwqmxk.supabase.co
+Supabase key length: 219
+Successfully created Supabase client
+Supabase client initialized successfully
+[05/08/25 17:58:25] INFO     HTTP Request: GET                   _client.py:1025
+                             https://slvxtnfmktzjgomwqmxk.supaba                
+                             se.co/rest/v1/cards?select=count&li                
+                             mit=1 "HTTP/2 200 OK"                              
+Cards table exists
+Starting Zeitklingen MCP Server with Python 3.10.16 (main, Dec  3 2024, 17:27:57) [Clang 16.0.0 (clang-1600.0.26.4)]
+Working directory: /
+Project root: /Users/exqbitmac/TimeBlade
+
+Registered tools:
+- read_cards: Retrieve card information from the database with optional filtering.
+- create_card: Create a new card in the database.
+- read_player_progress: Retrieve a player's current progress.
+- update_player_cards: Update a player's card collection.
+- update_player_materials: Update a player's material inventory.
+- read_world_data: Retrieve data about worlds.
+- delete_card: Delete a card from the database.
+- delete_cards: Delete multiple cards from the database.
+- log_game_session: Record gameplay metrics.
+
+Starting FastMCP server...
+Running in socket mode for Claude Desktop
+Error starting server: 'Tee' object has no attribute 'buffer'
+Traceback (most recent call last):
+  File "/Users/exqbitmac/TimeBlade/mcp_servers/mcp_supabase_server.py", line 640, in <module>
+    mcp.run()
+  File "/Users/exqbitmac/TimeBlade/venv/lib/python3.10/site-packages/mcp/server/fastmcp/server.py", line 192, in run
+    anyio.run(self.run_stdio_async)
+  File "/Users/exqbitmac/TimeBlade/venv/lib/python3.10/site-packages/anyio/_core/_eventloop.py", line 74, in run
+    return async_backend.run(func, args, {}, backend_options)
+  File "/Users/exqbitmac/TimeBlade/venv/lib/python3.10/site-packages/anyio/_backends/_asyncio.py", line 2310, in run
+    return runner.run(wrapper())
+  File "/Users/exqbitmac/TimeBlade/venv/lib/python3.10/site-packages/anyio/_backends/_asyncio.py", line 217, in run
+    return self._loop.run_until_complete(task)
+  File "/opt/homebrew/Cellar/python@3.10/3.10.16/Frameworks/Python.framework/Versions/3.10/lib/python3.10/asyncio/base_events.py", line 649, in run_until_complete
+    return future.result()
+  File "/Users/exqbitmac/TimeBlade/venv/lib/python3.10/site-packages/anyio/_backends/_asyncio.py", line 2298, in wrapper
+    return await func(*args)
+  File "/Users/exqbitmac/TimeBlade/venv/lib/python3.10/site-packages/mcp/server/fastmcp/server.py", line 548, in run_stdio_async
+    async with stdio_server() as (read_stream, write_stream):
+  File "/opt/homebrew/Cellar/python@3.10/3.10.16/Frameworks/Python.framework/Versions/3.10/lib/python3.10/contextlib.py", line 199, in __aenter__
+    return await anext(self.gen)
+  File "/Users/exqbitmac/TimeBlade/venv/lib/python3.10/site-packages/mcp/server/stdio.py", line 48, in stdio_server
+    stdout = anyio.wrap_file(TextIOWrapper(sys.stdout.buffer, encoding="utf-8"))
+AttributeError: 'Tee' object has no attribute 'buffer'

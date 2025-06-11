@@ -1,0 +1,6 @@
+[2025-04-04 11:30:19] MCP-Server-Testlauf:
+✅ supabase: gestartet
+✅ filesystem: gestartet
+✅ brave-search: gestartet
+✅ git: gestartet
+⚠️  memory: Timeout (wahrscheinlich OK)

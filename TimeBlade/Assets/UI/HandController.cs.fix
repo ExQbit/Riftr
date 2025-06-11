@@ -1,0 +1,228 @@
+using UnityEngine;
+using UnityEngine.UI;
+using UnityEngine.EventSystems;
+using System.Collections.Generic;
+
+/// <summary>
+/// Verwaltet die Kartenhand-UI und Drag&Drop
+/// </summary>
+public class HandController : MonoBehaviour
+{
+    [Header("Referenzen")]
+    [SerializeField] private Transform handContainer;
+    [SerializeField] private GameObject cardUIPrefab;
+    
+    [Header("Layout-Einstellungen")]
+    [SerializeField] private float cardSpacing = 80f; // Basis-Abstand zwischen Karten
+    [SerializeField] private float maxCardWidth = 120f; // Maximale Breite einer Karte
+    [SerializeField] private float fanAngle = 25f; // Maximaler Winkel für Fächer-Effekt
+    [SerializeField] private float curveHeight = 50f; // Höhe der Bogen-Kurve (erhöht für besseren Bogen)
+    [SerializeField] private float hoverLift = 20f; // Anhebung bei Hover (Wird aktuell verwendet in der Hover-Logik)
+    [SerializeField] private AnimationCurve layoutCurve = AnimationCurve.EaseInOut(0, 0, 1, 1);
+    [SerializeField] private bool invertFanAngle = true; // Kehrt die Fächer-Richtung um
+    [SerializeField] private float curveSmoothing = 0.8f; // Glättungsfaktor für weicheren Bogen (0-1)
+    
+    [Header("Touch-Einstellungen")]
+    [SerializeField] private bool enableFanning = true; // Auffächern bei Touch
+    [SerializeField] private float fanSpacing = 150f; // Abstand beim Auffächern
+    
+    // Aktive Karten-UI-Elemente
+    private List<GameObject> activeCardUIs = new List<GameObject>();
+    private bool isFanned = false;
+    private bool isTouching = false;
+    
+    // Referenz zum Spieler
+    private ZeitwaechterPlayer player;
+    
+    void Start()
+    {
+        player = ZeitwaechterPlayer.Instance;
+        
+        if (player != null)
+        {
+            // Instanz-Event abonnieren
+            player.OnHandChanged += UpdateHandDisplay;
+            
+            // Statische Events abonnieren
+            ZeitwaechterPlayer.OnCardDrawn += AddCardToHand;
+            ZeitwaechterPlayer.OnCardPlayed += RemoveCardFromHand;
+        }
+        
+        // Initial Hand anzeigen
+        UpdateHandDisplay();
+    }
+    
+    /// <summary>
+    /// Aktualisiert die Kartenhand-Anzeige
+    /// </summary>
+    public void UpdateHandDisplay()
+    {
+        if (player == null) return;
+        
+        // Hole aktuelle Hand
+        var cards = player.GetHand();
+        
+        // Entferne alte Karten
+        foreach (var card in activeCardUIs)
+        {
+            if (card != null)
+                Destroy(card);
+        }
+        activeCardUIs.Clear();
+        
+        // Erstelle neue Karten
+        foreach (var card in cards)
+        {
+            CreateCardUI(card);
+        }
+        
+        // Layout aktualisieren
+        UpdateHandLayout();
+    }
+    
+    /// <summary>
+    /// Erstellt ein UI-Element für eine Karte
+    /// </summary>
+    private GameObject CreateCardUI(TimeCardData cardData)
+    {
+        if (handContainer == null || cardUIPrefab == null) return null;
+        
+        // Instanziiere Karten-UI
+        GameObject cardUI = Instantiate(cardUIPrefab, handContainer);
+        
+        // Setze Karten-Daten
+        CardUI cardUIComponent = cardUI.GetComponent<CardUI>();
+        if (cardUIComponent != null)
+        {
+            cardUIComponent.SetCardData(cardData);
+            cardUIComponent.OnCardClicked += HandleCardClick;
+        }
+        
+        // Füge zur aktiven Liste hinzu
+        activeCardUIs.Add(cardUI);
+        
+        // Layout aktualisieren
+        UpdateHandLayout();
+        
+        return cardUI;
+    }
+    
+    /// <summary>
+    /// Aktualisiert das Layout der Kartenhand
+    /// </summary>
+    private void UpdateHandLayout()
+    {
+        int cardCount = activeCardUIs.Count;
+        if (cardCount == 0) return;
+        
+        // Berechne Gesamtbreite der Hand
+        float totalWidth = isFanned ? 
+            fanSpacing * (cardCount - 1) : 
+            Mathf.Min(cardSpacing * (cardCount - 1), maxCardWidth * cardCount);
+        
+        // Startposition (zentriert)
+        float startX = -totalWidth / 2f;
+        
+        // Positioniere jede Karte
+        for (int i = 0; i < cardCount; i++)
+        {
+            GameObject card = activeCardUIs[i];
+            if (card == null) continue;
+            
+            // Berechne Position basierend auf Kurve und Fächer
+            float normalizedPosition = cardCount > 1 ? (float)i / (cardCount - 1) : 0.5f;
+            float curveValue = layoutCurve.Evaluate(normalizedPosition);
+            
+            // Verbesserte Kurvenberechnung mit Glättung
+            // Definiere curveT basierend auf dem curveSmoothing-Parameter
+            float curveT = curveSmoothing;
+            float curveOffset = Mathf.Sin(normalizedPosition * Mathf.PI) * curveHeight * curveT;
+            
+            // X-Position mit Abstand
+            float xPos = startX + (isFanned ? fanSpacing * i : cardSpacing * i);
+            
+            // Rotation für Fächer-Effekt
+            float angle = 0f;
+            if (cardCount > 1)
+            {
+                // Berechne Winkel basierend auf Position
+                angle = Mathf.Lerp(-fanAngle, fanAngle, normalizedPosition);
+                if (invertFanAngle) angle = -angle;
+            }
+            
+            // Setze Position und Rotation
+            Vector3 position = new Vector3(xPos, curveOffset, 0);
+            Quaternion rotation = Quaternion.Euler(0, 0, angle);
+            
+            card.transform.localPosition = position;
+            card.transform.localRotation = rotation;
+            
+            // Speichere Original-Rotation in der CardUI-Komponente
+            var cardUIComponent = card.GetComponent<CardUI>();
+            if (cardUIComponent != null)
+            {
+                cardUIComponent.SetOriginalRotation(rotation);
+            }
+        }
+    }
+    
+    /// <summary>
+    /// Karte wurde angeklickt
+    /// </summary>
+    private void HandleCardClick(TimeCardData cardData)
+    {
+        if (player != null && RiftCombatManager.Instance != null)
+        {
+            // Versuche Karte zu spielen
+            RiftCombatManager.Instance.PlayerWantsToPlayCard(cardData, player);
+        }
+    }
+    
+    /// <summary>
+    /// Fügt eine Karte zur Hand hinzu (mit Animation)
+    /// </summary>
+    private void AddCardToHand(TimeCardData cardData)
+    {
+        CreateCardUI(cardData);
+        
+        // TODO: Draw-Animation
+    }
+    
+    /// <summary>
+    /// Entfernt eine Karte aus der Hand
+    /// </summary>
+    private void RemoveCardFromHand(TimeCardData cardData)
+    {
+        // Finde die entsprechende UI-Karte
+        for (int i = activeCardUIs.Count - 1; i >= 0; i--)
+        {
+            var cardUI = activeCardUIs[i];
+            if (cardUI != null)
+            {
+                var cardUIComponent = cardUI.GetComponent<CardUI>();
+                if (cardUIComponent != null && cardUIComponent.GetCardData() == cardData)
+                {
+                    // Entferne mit Animation
+                    activeCardUIs.RemoveAt(i);
+                    
+                    // TODO: Play-Animation
+                    Destroy(cardUI);
+                    break;
+                }
+            }
+        }
+    }
+    
+    void OnDestroy()
+    {
+        if (player != null)
+        {
+            // Instanz-Event abmelden
+            player.OnHandChanged -= UpdateHandDisplay;
+            
+            // Statische Events abmelden
+            ZeitwaechterPlayer.OnCardDrawn -= AddCardToHand;
+            ZeitwaechterPlayer.OnCardPlayed -= RemoveCardFromHand;
+        }
+    }
+}
