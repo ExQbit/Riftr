@@ -621,10 +621,10 @@ public class HandController : MonoBehaviour
                 // Nur Hover, keine Karte spielen!
             }
             
-            // TEMPORARY: Disable layout update to test for delayed movement
+            // Reset fanning and update layout
             isFanned = false;
-            // DISABLED: UpdateCardLayout(true) - testing if this causes delayed movement
-            Debug.Log("[HandController] TESTING: Skipped UpdateCardLayout on TouchEnd to prevent delayed movement");
+            UpdateCardLayout(false); // Animate back to normal layout (not immediate)
+            Debug.Log("[HandController] Touch ended - resetting layout from fanned to normal");
             
             // CRITICAL: Reset hover references after touch end (but no explicit ForceExitHover to avoid race condition)
             if (hoveredCard != null)
@@ -2389,16 +2389,31 @@ public class HandController : MonoBehaviour
     }
     
     /// <summary>
-    /// DISABLED: Animiert die Hand zurück zur zentrierten Position
-    /// This was causing delayed movement - the absolute parallax system handles centering
+    /// Resets hand offset to center position
     /// </summary>
     private void AnimateHandToCenter()
     {
-        Debug.Log($"[HandController] DISABLED AnimateHandToCenter (was offset: {currentHandOffset:F1}) - absolute parallax handles positioning");
+        Debug.Log($"[HandController] Resetting hand offset to center (was: {currentHandOffset:F1})");
         
-        // DISABLED: This animation was conflicting with absolute parallax positioning
-        // The absolute parallax system will handle proper positioning
+        // Reset offset and apply immediately
         currentHandOffset = 0f;
+        
+        // Apply the centered position to the hand container
+        if (handContainer != null)
+        {
+            RectTransform containerRect = handContainer.GetComponent<RectTransform>();
+            if (containerRect != null)
+            {
+                Vector3 currentPos = containerRect.localPosition;
+                currentPos.x = currentHandOffset;
+                
+                // Animate back to center smoothly
+                LeanTween.moveLocalX(handContainer.gameObject, 0f, 0.3f)
+                    .setEase(LeanTweenType.easeOutCubic);
+                    
+                Debug.Log($"[HandController] Animating hand container back to center");
+            }
+        }
     }
     
     /// <summary>
