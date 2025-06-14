@@ -3,6 +3,7 @@ using UnityEngine.UI;
 using UnityEngine.EventSystems;
 using TMPro;
 using System;
+using System.Collections;
 using System.Collections.Generic;
 
 /// <summary>
@@ -419,7 +420,7 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
         // Start pulsing animation
         PulseBorder();
         
-        Debug.Log($"[CardUI] Started border pulsation for {cardData?.cardName}");
+        // Debug.Log($"[CardUI] Started border pulsation for {cardData?.cardName}"); // REDUCED LOGGING
     }
     
     /// <summary>
@@ -622,8 +623,19 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
     /// </summary>
     public void OnPointerEnter(PointerEventData eventData)
     {
+        // CRITICAL FIX: Block ALL OnPointerEnter events when HandController is managing touch
+        if (handController != null && handController.IsTouchActive())
+        {
+            Debug.LogError($"[CardUI] *** BLOCKING ONPOINTERENTER DURING TOUCH *** HandController is managing touch for '{cardData?.cardName}'");
+            return;
+        }
+        
         // KRITISCH: Verhindere Phantom-Hover während Startup und Touch-Input
-        if (Input.touchCount > 0) return;
+        if (Input.touchCount > 0) 
+        {
+            Debug.LogError($"[CardUI] *** BLOCKING ONPOINTERENTER *** Touch count: {Input.touchCount} for '{cardData?.cardName}'");
+            return;
+        }
         
         // KRITISCH: Verhindere EventSystem-Phantom-Hover während der ersten Sekunden
         if (Time.time < 3f)
@@ -646,6 +658,7 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
             return;
         }
         
+        Debug.LogError($"[CardUI] *** ONPOINTERENTER ALLOWED *** Mouse hover on '{cardData?.cardName}'");
         SetHovered(true);
     }
     
@@ -654,6 +667,20 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
     /// </summary>
     public void OnPointerExit(PointerEventData eventData)
     {
+        // CRITICAL FIX: Block ALL OnPointerExit events when HandController is managing touch
+        if (handController != null && handController.IsTouchActive())
+        {
+            Debug.LogError($"[CardUI] *** BLOCKING ONPOINTEREXIT DURING TOUCH *** HandController is managing touch for '{cardData?.cardName}'");
+            return;
+        }
+        
+        // KRITISCH: Verhindere Phantom-Hover während Touch-Input
+        if (Input.touchCount > 0) 
+        {
+            Debug.LogError($"[CardUI] *** BLOCKING ONPOINTEREXIT *** Touch count: {Input.touchCount} for '{cardData?.cardName}'");
+            return;
+        }
+        
         // Behalte Hover wenn wir draggen
         if (isDragging) return;
         
@@ -664,6 +691,7 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
             return;
         }
         
+        Debug.LogError($"[CardUI] *** ONPOINTEREXIT ALLOWED *** Mouse exit on '{cardData?.cardName}'");
         SetHovered(false);
     }
     
@@ -675,12 +703,8 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
         // SCALING FIX: Don't process if being destroyed
         if (!gameObject.activeInHierarchy) return;
         
-        // SCALING FIX: Don't allow hover changes during layout animations
-        if (isInLayoutAnimation && hovered)
-        {
-            Debug.Log($"[CardUI] Hover blocked during layout animation for {cardData?.cardName}");
-            return;
-        }
+        // REMOVED: Layout animation blocking was preventing touch hover from working
+        // The hover animation should be allowed even during layout animation
         
         // CRITICAL: Protection for ALL cards during initial setup
         if (hovered && Time.time < 3f) // First 3 seconds after scene start
@@ -696,8 +720,23 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
             return;
         }
         
-        if (isHovered == hovered) return;
+        // CRITICAL FIX: Prevent unnecessary animation restarts
+        // If we're already hovered and trying to hover again, AND we have an active animation, skip
+        if (isHovered == hovered) 
+        {
+            if (hovered && activeTweenId >= 0)
+            {
+                Debug.LogError($"[CardUI] *** SKIPPING REDUNDANT HOVER *** Card {cardData?.cardName} already hovered with active animation (Tween ID: {activeTweenId})");
+                return; // Don't restart animation if already running
+            }
+            else if (!hovered)
+            {
+                return; // Skip false->false transitions
+            }
+            // Allow true->true if no active animation (animation might have been cancelled)
+        }
         
+        Debug.LogError($"[CardUI] *** SETTING HOVERED STATE *** Card: {cardData?.cardName}, Old State: {isHovered}, New State: {hovered}");
         isHovered = hovered;
         
         // HOVER SYSTEM DEAKTIVIERT - nur Border-Pulsation wird verwendet
@@ -745,21 +784,40 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
                 Vector3 targetPos = basePosition;
                 targetPos.y += lift;
                 
+                // CRITICAL FIX: Cancel any existing animations before starting new ones
+                LeanTween.cancel(gameObject);
+                activeTweenId = -1;
+                
                 // SCALING FIX: Force immediate scale reset before animating
                 transform.localScale = Vector3.one;
                 
-                // Start scale animation and track the tween ID
+                // CRITICAL DEBUG: Log animation start details
+                Debug.LogError($"[CardUI] *** STARTING HOVER ANIMATION *** Card: {cardData?.cardName}, BasePos: {basePosition}, TargetPos: {targetPos}, Lift: {lift}");
+                
+                // Start BOTH animations with the same timing to ensure they're synchronized
+                // Scale animation
                 activeTweenId = LeanTween.scale(gameObject, Vector3.one * 1.15f, hoverAnimDuration)
                     .setEase(hoverEaseType)
                     .setOnComplete(() => {
                         activeTweenId = -1; // Clear ID when complete
+                        Debug.Log($"[CardUI] Hover scale animation complete for {cardData?.cardName}");
                     }).id;
-                    
-                LeanTween.moveLocal(gameObject, targetPos, hoverAnimDuration).setEase(hoverEaseType);
+                
+                // Position animation - use the same duration and easing
+                LeanTween.moveLocal(gameObject, targetPos, hoverAnimDuration)
+                    .setEase(hoverEaseType)
+                    .setOnComplete(() => {
+                        Debug.Log($"[CardUI] Hover position animation complete for {cardData?.cardName}, Final Pos: {transform.localPosition}");
+                    });
+                
+                Debug.Log($"[CardUI] Started hover animations for {cardData?.cardName} - Scale to 1.15, Move to {targetPos}");
             }
         }
         else
         {
+            // CRITICAL FIX: Cancel any existing animations before starting new ones
+            LeanTween.cancel(gameObject);
+            
             // SCALING FIX: Return to normal scale with robust completion handling
             activeTweenId = LeanTween.scale(gameObject, Vector3.one, hoverAnimDuration * 1.2f)
                 .setEase(hoverEaseType)
@@ -772,7 +830,17 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
             // CRITICAL FIX: Return to base position
             if (hasBasePosition)
             {
-                LeanTween.moveLocal(gameObject, basePosition, hoverAnimDuration).setEase(hoverEaseType);
+                LeanTween.moveLocal(gameObject, basePosition, hoverAnimDuration)
+                    .setEase(hoverEaseType)
+                    .setOnComplete(() => {
+                        Debug.Log($"[CardUI] Hover exit complete for {cardData?.cardName}, Final Pos: {transform.localPosition}");
+                        // Reset base position flag when card is at rest
+                        if (!isDragging && !isBeingDraggedCentrally)
+                        {
+                            hasBasePosition = false;
+                            Debug.Log($"[CardUI] Reset base position flag for {cardData?.cardName}");
+                        }
+                    });
             }
             
             // Stelle Original-Index wieder her (KRITISCH für korrekte Reihenfolge)
@@ -866,7 +934,23 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
             activeTweenId = -1;
         }
         transform.localScale = Vector3.one;
+        
+        // CRITICAL FIX: Force immediate visual update
+        Canvas.ForceUpdateCanvases();
+        
         SetHovered(true);
+        
+        // ADDITIONAL FIX: Force another canvas update after hover animation starts
+        StartCoroutine(ForceCanvasUpdateNextFrame());
+    }
+    
+    /// <summary>
+    /// Forces canvas update on the next frame to ensure visual changes are visible
+    /// </summary>
+    private System.Collections.IEnumerator ForceCanvasUpdateNextFrame()
+    {
+        yield return null; // Wait one frame
+        Canvas.ForceUpdateCanvases();
     }
     
     /// <summary>
@@ -900,7 +984,7 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
         if (hasBasePosition)
         {
             transform.localPosition = basePosition;
-            Debug.Log($"[CardUI] ForceDisableHover restored position for {cardData?.cardName}: {basePosition}");
+            // Debug.Log($"[CardUI] ForceDisableHover restored position for {cardData?.cardName}: {basePosition}"); // REDUCED LOGGING
         }
         
         // CRITICAL: Restore SiblingIndex if we were hovering
@@ -940,11 +1024,19 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
     {
         isInLayoutAnimation = inAnimation;
         
-        // If animation is ending and we have wrong scale, fix it
+        // CRITICAL FIX: Don't reset scale if card is hovered or being dragged
+        // Only fix scale for cards that should be at normal scale
         if (!inAnimation && Mathf.Abs(transform.localScale.x - 1f) > 0.01f)
         {
-            Debug.LogWarning($"[CardUI] Scale incorrect after layout animation: {transform.localScale}. Fixing...");
-            transform.localScale = Vector3.one;
+            if (isHovered || isDragging || isBeingDraggedCentrally || activeTweenId >= 0)
+            {
+                Debug.Log($"[CardUI] Skipping scale fix for {cardData?.cardName} - hovered:{isHovered}, dragging:{isDragging}, activeTween:{activeTweenId}");
+            }
+            else
+            {
+                Debug.LogWarning($"[CardUI] Scale incorrect after layout animation: {transform.localScale}. Fixing...");
+                transform.localScale = Vector3.one;
+            }
         }
     }
     
@@ -1047,6 +1139,14 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
     /// </summary>
     public void UpdateBasePosition(Vector3 newPosition)
     {
+        // CRITICAL FIX: Don't update base position if card is hovered
+        // This prevents storing the lifted position as the base
+        if (isHovered)
+        {
+            Debug.Log($"[CardUI] Skipping base position update for {cardData?.cardName} - card is hovered");
+            return;
+        }
+        
         basePosition = newPosition;
         hasBasePosition = true;
         // If not hovered, ensure we're at base position

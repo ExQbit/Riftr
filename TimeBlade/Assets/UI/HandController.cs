@@ -39,11 +39,13 @@ public class HandController : MonoBehaviour
     [SerializeField] private float previewFadeOutTime = 0.1f; // Ausblend-Zeit
     
     [Header("Hover-Hysterese")]
-    [SerializeField] private float hoverHysteresisDistance = 20f; // Pixel-Abstand für stabilen Kartenwechsel
+    [SerializeField] private float hoverHysteresisDistance = 50f; // Pixel-Abstand für stabilen Kartenwechsel (erhöht für Touch)
     
     [Header("Parallax Hand-Verschiebung")]
-    [SerializeField] private float maxHorizontalShift = 150f; // Maximale horizontale Verschiebung
-    [SerializeField] private float parallaxSensitivity = 0.5f; // Wie stark die Hand reagiert (0.5 = 50% der Fingerbewegung)
+    [SerializeField] private float screenEdgeBuffer = 50f; // Puffer zum Bildschirmrand in Pixel
+    [SerializeField] private float parallaxSensitivity = 1.0f; // Wie stark die Hand reagiert (1.0 = 100% der Fingerbewegung)
+    [SerializeField] private float edgeDampingStart = 0.8f; // Ab wann Dämpfung beginnt (80% der max Verschiebung)
+    [SerializeField] private float edgeDampingStrength = 0.3f; // Dämpfungsstärke am Rand (30% der normalen Bewegung)
     [SerializeField] private float returnAnimationDuration = 0.3f; // Dauer der Rückkehr-Animation
     [SerializeField] private LeanTweenType returnEaseType = LeanTweenType.easeOutExpo; // Easing für Rückkehr
     
@@ -71,6 +73,7 @@ public class HandController : MonoBehaviour
     private bool isDraggingActive = false;    // Master-Flag: Ist gerade ein Drag aktiv?
     private Vector2 dragStartPosition;        // Screen-Position wo Touch begann (für Schwellenwert)
     private Vector2 lastDragPosition;         // Letzte Finger-Position (für Bewegungs-Tracking)  
+    private Vector2 lastFingerPosition;       // Letzte Finger-Position (für Parallax-Delta)
     private CardUI draggedCardUI = null;      // Die Karte die AKTUELL gedraggt wird (nicht Start-Karte!)
     
     // Drag-Schwellenwerte werden jetzt über öffentliche SerializeField-Variablen gesteuert
@@ -97,6 +100,13 @@ public class HandController : MonoBehaviour
     // Parallax Hand Shift System
     private float currentHandOffset = 0f; // Aktuelle horizontale Verschiebung
     private bool isParallaxActive = false; // Ist Parallax-Tracking aktiv?
+    private float touchStartTime = 0f; // Time when touch started (for reduced parallax sensitivity)
+    private float lastHoverChangeTime = 0f; // Time of last hover change (for throttling)
+    
+    // Touch anchor tracking
+    private Vector2 touchOffsetFromAnchorCard = Vector2.zero; // Offset of touch from anchor card center
+    private int anchoredCardIndex = -1; // Index of the card that should stay under the finger
+    private float anchoredCardInitialX = 0f; // Initial X position of anchored card relative to hand
     
     void Start()
     {
@@ -119,18 +129,8 @@ public class HandController : MonoBehaviour
                 Debug.LogError($"[HandController] WARNING: HandContainer has non-unit scale! This will affect card positions.");
             }
             
-            // CRITICAL: Check parent Canvas scales
-            Transform canvasParent = handContainer.parent;
-            while (canvasParent != null)
-            {
-                if (canvasParent.localScale == Vector3.zero)
-                {
-                    Debug.LogError($"[HandController] CRITICAL: Parent '{canvasParent.name}' has ZERO scale! This will break all card positioning.");
-                    Debug.LogError($"[HandController] Attempting to fix by temporarily setting scale to (1,1,1)...");
-                    canvasParent.localScale = Vector3.one;
-                }
-                canvasParent = canvasParent.parent;
-            }
+            // Note: Canvas Scale (0,0,0) is normal in iOS Simulator due to resolution mismatch
+            // This doesn't break functionality, just causes warnings in logs
         }
         
         if (cardUIPrefab == null)
@@ -235,7 +235,30 @@ public class HandController : MonoBehaviour
     
     void Update()
     {
+        // CRITICAL: Fix Canvas scale issues proactively every frame
+        FixCanvasScaleIssues();
+        
         HandleTouchInput();
+    }
+    
+    /// <summary>
+    /// CRITICAL FIX: Ensures all Canvas objects have proper scale (not 0,0,0)
+    /// </summary>
+    private void FixCanvasScaleIssues()
+    {
+        if (handContainer != null)
+        {
+            Transform current = handContainer.transform;
+            while (current != null)
+            {
+                if (current.localScale == Vector3.zero && current.name.Contains("Canvas"))
+                {
+                    Debug.LogError($"[HandController] CRITICAL FIX: Canvas '{current.name}' had ZERO scale! Setting to (1,1,1)");
+                    current.localScale = Vector3.one;
+                }
+                current = current.parent;
+            }
+        }
     }
     
     /// <summary>
@@ -341,6 +364,7 @@ public class HandController : MonoBehaviour
                 
                 isTouching = true;
                 isFanned = true;
+                touchStartTime = Time.time; // Record touch start time
                 
                 // WICHTIG: Setze Flag für alle Karten
                 CardUI.SetTouchStartedOnValidArea(true);
@@ -352,6 +376,7 @@ public class HandController : MonoBehaviour
                 // NEUES DRAG-SYSTEM: Speichere Start-Position
                 dragStartPosition = position;
                 lastDragPosition = position;
+                lastFingerPosition = position; // Für smooth Parallax-Delta
                 isDraggingActive = false;
                 draggedCardUI = null;
                 
@@ -367,16 +392,81 @@ public class HandController : MonoBehaviour
                 // WICHTIG: Setze lastDragPosition für frame-basierte Bewegung
                 lastDragPosition = position;
                 isParallaxActive = true;
-                // currentHandOffset behält seinen Wert - keine Rücksetzung!
                 
-                // Bestimme welche Karte unter dem Touch ist
+                // SMOOTH DELTA FIX: Reset to center for symmetric movement
+                currentHandOffset = 0f;
+                
+                // Reset container position to center immediately
+                RectTransform containerRect = handContainer.GetComponent<RectTransform>();
+                if (containerRect != null)
+                {
+                    Vector3 pos = containerRect.localPosition;
+                    pos.x = 0f;
+                    containerRect.localPosition = pos;
+                }
+                
+                Debug.Log("[HandController] RESET: Hand centered for smooth delta parallax");
+                
+                // CRITICAL: First find which card is under the touch BEFORE fanning
+                // This card will be the anchor for the fan animation
+                CardUI touchedCard = GetCardAtPosition(position);
+                
+                // Store the initial touch position and anchored card for Pokemon Pocket style tracking
+                if (touchedCard != null)
+                {
+                    // Find the index of the touched card
+                    for (int i = 0; i < activeCardUIs.Count; i++)
+                    {
+                        var cardUI = activeCardUIs[i].GetComponent<CardUI>();
+                        if (cardUI == touchedCard)
+                        {
+                            anchoredCardIndex = i;
+                            anchoredCardInitialX = activeCardUIs[i].transform.localPosition.x;
+                            break;
+                        }
+                    }
+                    
+                    // Store the card's screen position relative to touch for accurate tracking
+                    RectTransform touchedCardRect = touchedCard.GetComponent<RectTransform>();
+                    if (touchedCardRect != null)
+                    {
+                        Vector2 cardScreenPos = RectTransformUtility.WorldToScreenPoint(canvasCamera, touchedCardRect.position);
+                        touchOffsetFromAnchorCard = position - cardScreenPos;
+                        Debug.Log($"[HandController] Touch on card '{touchedCard.GetCardData()?.cardName}' (index {anchoredCardIndex}) - Touch pos: {position}, Card screen pos: {cardScreenPos}, Offset: {touchOffsetFromAnchorCard}");
+                    }
+                }
+                else
+                {
+                    touchOffsetFromAnchorCard = Vector2.zero;
+                    anchoredCardIndex = -1;
+                }
+                
+                // CRITICAL FIX: First do the layout animation with anchor, THEN hover the selected card
+                // This prevents UpdateCardLayout from cancelling the hover animation
+                
+                // IMMEDIATE Fan Animation (0.15s easeOutExpo per spec)
+                // Use the touched card as anchor so it stays under the finger
+                UpdateCardLayout(forceImmediate: false, isFromCardCreation: false, anchorCard: touchedCard);
+                
+                // CRITICAL FIX: Immediately enable hover after layout starts
+                // This allows the hover logic to work while cards are still animating
+                foreach (var cardObj in activeCardUIs)
+                {
+                    if (cardObj != null)
+                    {
+                        var cardUI = cardObj.GetComponent<CardUI>();
+                        if (cardUI != null)
+                        {
+                            cardUI.SetInLayoutAnimation(false);
+                        }
+                    }
+                }
+                
+                // AFTER layout is done, determine which card is under the touch and hover it
                 UpdateCardSelectionAtPosition(position);
                 
                 // NEU: Speichere die initial berührte Karte für Drift-Erkennung
                 initialHoveredCard = hoveredCard;
-                
-                // IMMEDIATE Fan Animation (0.15s easeOutExpo per spec)
-                UpdateCardLayout();
             }
             else
             {
@@ -404,7 +494,7 @@ public class HandController : MonoBehaviour
             UpdateParallaxHandShift(position);
         }
         
-        // Update der Kartenauswahl unter dem Finger
+        // Update card selection every frame for smooth card following
         UpdateCardSelectionAtPosition(position);
         
         // Prüfe ob Drag gestartet werden soll
@@ -497,6 +587,7 @@ public class HandController : MonoBehaviour
         }
         
         lastDragPosition = position;
+        lastFingerPosition = position; // Update für smooth Parallax-Delta
     }
     
     /// <summary>
@@ -514,6 +605,11 @@ public class HandController : MonoBehaviour
             isTouching = false;
             isFanned = false;
             
+            // Reset anchored card for Pokemon Pocket style
+            anchoredCardIndex = -1;
+            anchoredCardInitialX = 0f;
+            touchOffsetFromAnchorCard = Vector2.zero;
+            
             // NEUES DRAG-SYSTEM: Behandle Drag-Ende
             if (isDraggingActive)
             {
@@ -525,9 +621,10 @@ public class HandController : MonoBehaviour
                 // Nur Hover, keine Karte spielen!
             }
             
-            // CRITICAL: Force unfanning and immediate layout to prevent hanging
+            // TEMPORARY: Disable layout update to test for delayed movement
             isFanned = false;
-            UpdateCardLayout(true); // true = force immediate (already calls ForceDisableHover on all cards)
+            // DISABLED: UpdateCardLayout(true) - testing if this causes delayed movement
+            Debug.Log("[HandController] TESTING: Skipped UpdateCardLayout on TouchEnd to prevent delayed movement");
             
             // CRITICAL: Reset hover references after touch end (but no explicit ForceExitHover to avoid race condition)
             if (hoveredCard != null)
@@ -841,7 +938,7 @@ public class HandController : MonoBehaviour
     /// <summary>
     /// Aktualisiert das gebogene Layout aller Karten
     /// </summary>
-    public void UpdateCardLayout(bool forceImmediate = false, bool isFromCardCreation = false)
+    public void UpdateCardLayout(bool forceImmediate = false, bool isFromCardCreation = false, CardUI anchorCard = null)
     {
         // Debug.Log($"[HandController] Layout update - card count: {activeCardUIs.Count}, is fanned: {isFanned}, is touching: {isTouching}, force immediate: {forceImmediate}"); // REDUCED LOGGING
         
@@ -860,10 +957,14 @@ public class HandController : MonoBehaviour
                 var cardUI = cardObj.GetComponent<CardUI>();
                 if (cardUI != null)
                 {
-                    cardUI.ForceDisableHover();
+                    // CRITICAL: Don't disable hover for currently hovered or last hovered card
+                    if (cardUI != hoveredCard && cardUI != lastHoveredCard)
+                    {
+                        cardUI.ForceDisableHover();
+                        // CRITICAL: Only reset scale for non-hovered cards
+                        cardObj.transform.localScale = Vector3.one;
+                    }
                     cardUI.SetInLayoutAnimation(true);
-                    // CRITICAL: Ensure scale is correct before layout
-                    cardObj.transform.localScale = Vector3.one;
                 }
             }
         }
@@ -891,11 +992,49 @@ public class HandController : MonoBehaviour
             }
         }
         
-        // Berechne Start-Position (zentriert)
-        float totalWidth = (cardCount - 1) * actualSpacing;
-        float startX = -totalWidth / 2f;
+        // CRITICAL: If we have an anchor card (during touch), calculate positions relative to it
+        float startX;
+        int anchorIndex = -1;
+        Vector3 anchorOriginalPos = Vector3.zero;
+        bool hasAnchor = false;
         
-        // Debug.Log($"[HandController] Layout calculation - total width: {totalWidth}, spacing used: {actualSpacing}");
+        if (anchorCard != null && isFanned)
+        {
+            // Find the anchor card's index and current position
+            for (int i = 0; i < activeCardUIs.Count; i++)
+            {
+                var cardUI = activeCardUIs[i].GetComponent<CardUI>();
+                if (cardUI == anchorCard)
+                {
+                    anchorIndex = i;
+                    anchorOriginalPos = activeCardUIs[i].transform.localPosition;
+                    hasAnchor = true;
+                    break;
+                }
+            }
+            
+            if (hasAnchor)
+            {
+                // Calculate start position so anchor card stays at its current position
+                // IMPORTANT: Keep the anchor card exactly where it is
+                startX = anchorOriginalPos.x - (anchorIndex * actualSpacing);
+                Debug.Log($"[HandController] Anchoring layout to card {anchorIndex} '{anchorCard.GetCardData()?.cardName}' at position {anchorOriginalPos}, hand offset: {currentHandOffset}");
+            }
+            else
+            {
+                // Fallback to centered layout
+                float totalWidth = (cardCount - 1) * actualSpacing;
+                startX = -totalWidth / 2f;
+            }
+        }
+        else
+        {
+            // Normal centered layout
+            float totalWidth = (cardCount - 1) * actualSpacing;
+            startX = -totalWidth / 2f;
+        }
+        
+        // Debug.Log($"[HandController] Layout calculation - spacing used: {actualSpacing}, startX: {startX}");
         
         // Positioniere jede Karte
         for (int i = 0; i < cardCount; i++)
@@ -959,46 +1098,8 @@ public class HandController : MonoBehaviour
             float maxY = curveHeight * 2.5f; // Allow extra for stronger fanning arc (2.2x multiplier)
             y = Mathf.Clamp(y, 0, maxY);
             
-            // CRITICAL DEBUG: Check current position before setting
-            if (i == 1 && cardCount == 5)
-            {
-                Vector3 currentPos = cardRect.localPosition;
-                Debug.LogError($"[HandController] CARD 1 POSITION CHECK - Before: {currentPos}, Target Y: {y}");
-                
-                // Check if position is already multiplied
-                if (Mathf.Abs(currentPos.y - y) > 0.1f && Mathf.Abs(currentPos.y / y - 5f) < 0.1f)
-                {
-                    Debug.LogError($"[HandController] CRITICAL: Card 1 Y position appears to be 5x the target! Current: {currentPos.y}, Target: {y}");
-                    Debug.LogError($"[HandController] This suggests the curve is being applied multiple times or there's a scale issue.");
-                }
-                
-                // Check for scale issues on parent transforms
-                Transform current = card.transform;
-                while (current != null)
-                {
-                    if (current.localScale != Vector3.one)
-                    {
-                        Debug.LogError($"[HandController] WARNING: Transform '{current.name}' has non-unit scale: {current.localScale}");
-                        
-                        // CRITICAL: If we find zero scale on Canvas, this breaks all positioning
-                        if (current.localScale == Vector3.zero && current.name.Contains("Canvas"))
-                        {
-                            Debug.LogError($"[HandController] CRITICAL: Canvas '{current.name}' has ZERO scale! This breaks all card positioning!");
-                            Debug.LogError($"[HandController] IMMEDIATELY FIXING Canvas scale to (1,1,1)!");
-                            current.localScale = Vector3.one;
-                            Debug.LogError($"[HandController] Canvas '{current.name}' scale fixed to: {current.localScale}");
-                        }
-                    }
-                    current = current.parent;
-                }
-                
-                // CRITICAL FIX: If Y is wrong, force correct it
-                if (Mathf.Abs(cardRect.localPosition.y - y) > 0.1f)
-                {
-                    Debug.LogError($"[HandController] FORCING Card 1 to correct Y position: {y}");
-                    cardRect.localPosition = new Vector3(cardRect.localPosition.x, y, cardRect.localPosition.z);
-                }
-            }
+            // REMOVED: All debug position checking code was causing delayed movement issues
+            // The main problem was Canvas scale (0,0,0) which we now fix proactively
             
             // DEBUG: Log curve calculation for all cards when fanned
             if (isFanned && i <= 4)
@@ -1236,6 +1337,87 @@ public class HandController : MonoBehaviour
     }
     
     /// <summary>
+    /// Returns true if the HandController is currently managing touch input
+    /// </summary>
+    public bool IsTouchActive()
+    {
+        return isTouching;
+    }
+    
+    /// <summary>
+    /// Gets the card at the specified screen position
+    /// </summary>
+    private CardUI GetCardAtPosition(Vector2 screenPosition)
+    {
+        PointerEventData pointerData = new PointerEventData(EventSystem.current)
+        {
+            position = screenPosition
+        };
+        
+        List<RaycastResult> results = new List<RaycastResult>();
+        EventSystem.current.RaycastAll(pointerData, results);
+        
+        CardUI bestCard = null;
+        float closestDistance = float.MaxValue;
+        
+        // Find the card closest to the touch center
+        foreach (var result in results)
+        {
+            CardUI cardUI = result.gameObject.GetComponent<CardUI>();
+            if (cardUI != null && activeCardUIs.Contains(result.gameObject))
+            {
+                // Calculate distance to card center
+                RectTransform cardRect = result.gameObject.GetComponent<RectTransform>();
+                Vector2 localPoint;
+                RectTransformUtility.ScreenPointToLocalPointInRectangle(
+                    cardRect, screenPosition, canvasCamera, out localPoint);
+                
+                float distance = localPoint.magnitude;
+                if (distance < closestDistance)
+                {
+                    closestDistance = distance;
+                    bestCard = cardUI;
+                }
+            }
+        }
+        
+        return bestCard;
+    }
+    
+    /// <summary>
+    /// Calculate the total width of the hand when fanned out
+    /// </summary>
+    private float CalculateTotalHandWidth()
+    {
+        if (activeCardUIs.Count == 0) return 0f;
+        
+        // Use the same spacing calculation as UpdateCardLayout
+        float totalSpacing = isFanned ? fanSpacing : cardSpacing;
+        float actualSpacing = totalSpacing;
+        
+        // Apply same dynamic spacing adjustment as in UpdateCardLayout
+        int cardCount = activeCardUIs.Count;
+        if (cardCount > 3)
+        {
+            RectTransform containerRect = handContainer.GetComponent<RectTransform>();
+            if (containerRect != null)
+            {
+                float containerWidth = Mathf.Abs(containerRect.rect.width);
+                float maxWidth = (cardCount - 1) * totalSpacing + maxCardWidth;
+                if (maxWidth > containerWidth * 0.9f)
+                {
+                    actualSpacing = (containerWidth * 0.9f - maxCardWidth) / (cardCount - 1);
+                }
+            }
+        }
+        
+        // Total width is: spacing between cards + one card width
+        float totalWidth = (cardCount - 1) * actualSpacing + maxCardWidth;
+        
+        return totalWidth;
+    }
+    
+    /// <summary>
     /// Gibt den Hand-Container zurück (für CardUI Drag-Validation)
     /// </summary>
     public Transform GetHandContainer()
@@ -1383,73 +1565,67 @@ public class HandController : MonoBehaviour
             CardUI cardUI = result.gameObject.GetComponent<CardUI>();
             if (cardUI != null && activeCardUIs.Contains(result.gameObject))
             {
-                // Berechne Distanz zum Kartenzentrum für präzisere Auswahl
+                // CRITICAL: Calculate distance to card center for more precise selection
                 RectTransform cardRect = result.gameObject.GetComponent<RectTransform>();
                 Vector2 localPoint;
                 RectTransformUtility.ScreenPointToLocalPointInRectangle(
                     cardRect, screenPosition, canvasCamera, out localPoint);
                 
+                // IMPROVED: Consider card bounds for better touch detection
+                // Only change card if touch is significantly inside the new card
+                Rect cardBounds = cardRect.rect;
+                bool isWellInside = cardBounds.Contains(localPoint);
+                
+                // Calculate distance with preference for currently hovered card
                 float distance = localPoint.magnitude;
-                if (distance < closestDistance)
+                
+                // CRITICAL: Give strong preference to current card to prevent rapid switching
+                if (cardUI == previousHovered)
                 {
-                    closestDistance = distance;
-                    newHoveredCard = cardUI;
+                    distance *= 0.5f; // 50% distance = strong preference for current card
+                }
+                
+                // Only consider this card if touch is inside bounds or very close
+                if (isWellInside || distance < cardBounds.width * 0.4f)
+                {
+                    if (distance < closestDistance)
+                    {
+                        closestDistance = distance;
+                        newHoveredCard = cardUI;
+                    }
                 }
             }
         }
         
-        // HYSTERESE-LOGIK: Verhindere Flackern an Kartengrenzen
-        bool shouldChangeHover = false;
+        // FIXED HOVER LOGIC: Compare by card object reference for accurate transitions
+        // Each card object should be treated as separate, even if they have the same name
+        string previousCardName = previousHovered?.GetCardData()?.cardName ?? "none";
+        string newCardName = newHoveredCard?.GetCardData()?.cardName ?? "none";
+        bool shouldChangeHover = (newHoveredCard != previousHovered);
         
+        // HYSTERESIS FOR SAME-NAMED CARDS: Prevent rapid switching between cards with same name
+        if (shouldChangeHover && previousCardName == newCardName && previousCardName != "none")
+        {
+            // Check if finger moved enough to justify switching between same-named cards
+            float movementSinceLastHover = Vector2.Distance(screenPosition, lastHoverPosition);
+            if (movementSinceLastHover < hoverHysteresisDistance)
+            {
+                Debug.Log($"[HandController] HYSTERESIS: Blocking switch between same-named cards '{previousCardName}' (movement: {movementSinceLastHover:F1}px < {hoverHysteresisDistance}px)");
+                shouldChangeHover = false;
+            }
+        }
+        
+        // Debug log when card objects are different
         if (newHoveredCard != previousHovered)
         {
-            // Wenn keine vorherige Karte gehovert war, wechsle sofort
-            if (previousHovered == null)
-            {
-                shouldChangeHover = true;
-                isHysteresisActive = false;
-            }
-            // Wenn neue Karte null ist (Finger außerhalb aller Karten), wechsle sofort
-            else if (newHoveredCard == null)
-            {
-                shouldChangeHover = true;
-                isHysteresisActive = false;
-            }
-            // Ansonsten prüfe Hysterese
-            else
-            {
-                // Berechne Distanz seit letztem Hover-Wechsel
-                float distanceFromLastHover = Vector2.Distance(screenPosition, lastHoverPosition);
-                
-                // Wenn Hysterese aktiv ist, prüfe ob Schwellenwert überschritten
-                if (isHysteresisActive)
-                {
-                    if (distanceFromLastHover >= hoverHysteresisDistance)
-                    {
-                        shouldChangeHover = true;
-                        isHysteresisActive = false;
-                        Debug.Log($"[HandController] Hysteresis threshold reached: {distanceFromLastHover:F1}px >= {hoverHysteresisDistance}px");
-                    }
-                    else
-                    {
-                        // Bleibe bei aktueller Karte
-                        Debug.Log($"[HandController] Hysteresis active: {distanceFromLastHover:F1}px < {hoverHysteresisDistance}px - staying on {previousHovered.GetCardData()?.cardName}");
-                    }
-                }
-                else
-                {
-                    // Erste Bewegung zu neuer Karte - aktiviere Hysterese
-                    shouldChangeHover = true;
-                    isHysteresisActive = true;
-                }
-            }
+            Debug.Log($"[HandController] HOVER DETECTION: '{previousCardName}' → '{newCardName}' (objects different: True, names different: {previousCardName != newCardName}, allowed: {shouldChangeHover})");
         }
         
-        // Führe Hover-Wechsel nur aus wenn erlaubt
-        if (shouldChangeHover && newHoveredCard != previousHovered)
+        // Führe Hover-Wechsel aus wenn verschiedene Card-Objekte und erlaubt
+        if (shouldChangeHover)
         {
-            // Speichere Position für nächste Hysterese-Berechnung
-            lastHoverPosition = screenPosition;
+            lastHoverChangeTime = Time.time;
+            lastHoverPosition = screenPosition; // Update position for hysteresis
             
             // Alte Karte dehovern
             if (previousHovered != null)
@@ -1476,6 +1652,8 @@ public class HandController : MonoBehaviour
                     Debug.Log($"[HandController] *** LAST HOVERED BLOCKED *** Not updating lastHoveredCard to '{hoveredCard.GetCardData()?.cardName}' - touching:{isTouching}, playing:{isPlayingCard}");
                 }
             }
+            
+            // NOTE: Removed complex anchored card update logic - using simplified delta-based parallax now
             
             // Update Card Preview
             UpdateCardPreview();
@@ -2151,62 +2329,76 @@ public class HandController : MonoBehaviour
     /// </summary>
     private void UpdateParallaxHandShift(Vector2 currentPosition)
     {
-        // WICHTIG: Berechne die Bewegung relativ zur vorherigen Position für kontinuierliche Updates
-        float horizontalDelta = currentPosition.x - lastDragPosition.x;
+        // Get handContainer RectTransform once for use throughout method
+        RectTransform handContainerRect = handContainer.GetComponent<RectTransform>();
         
-        // Akkumuliere die Verschiebung (mit Parallax-Sensitivität und Inversion)
-        float newOffset = currentHandOffset - (horizontalDelta * parallaxSensitivity);
-        
-        // Begrenze auf maxHorizontalShift
-        newOffset = Mathf.Clamp(newOffset, -maxHorizontalShift, maxHorizontalShift);
-        
-        // Direkte Anwendung für responsive Bewegung (kein Lerp für bessere Reaktion)
-        currentHandOffset = newOffset;
-        
-        // Wende Verschiebung auf handContainer an
-        RectTransform containerRect = handContainer.GetComponent<RectTransform>();
-        if (containerRect != null)
+        // DEADZONE FIX: Prevent micro-movements from causing hand jumps
+        float movementSinceStart = Vector2.Distance(currentPosition, dragStartPosition);
+        if (movementSinceStart < 10f) // 10 pixel deadzone
         {
-            Vector3 pos = containerRect.localPosition;
-            pos.x = currentHandOffset;
-            containerRect.localPosition = pos;
-            
-            // Debug-Log
-            if (Mathf.Abs(horizontalDelta) > 5f)
-            {
-                Debug.Log($"[HandController] Parallax: Frame delta={horizontalDelta:F1}, Total offset={currentHandOffset:F1}");
-            }
+            Debug.Log($"[HandController] DEADZONE: Movement too small ({movementSinceStart:F1}px < 10px) - ignoring parallax");
+            return;
         }
         
-        // Update lastDragPosition für nächsten Frame
-        lastDragPosition = currentPosition;
+        // SMOOTH DELTA PARALLAX: Use smooth finger movement delta instead of absolute jumps
+        // Calculate horizontal movement since last frame
+        float horizontalDelta = currentPosition.x - lastFingerPosition.x;
+        
+        // Apply parallax movement (inverted for opposite hand movement)
+        float parallaxDelta = -horizontalDelta * parallaxSensitivity;
+        
+        // Add to current offset for smooth accumulation
+        float targetHandOffset = currentHandOffset + parallaxDelta;
+        
+        Debug.Log($"[HandController] SMOOTH PARALLAX: finger=({currentPosition.x:F1}, {currentPosition.y:F1}), delta={horizontalDelta:F1}, parallaxDelta={parallaxDelta:F1}, targetHandOffset={targetHandOffset:F1}");
+        
+        // CRITICAL: Calculate dynamic bounds based on actual hand width
+        float handWidth = CalculateTotalHandWidth();
+        float containerWidth = handContainerRect != null ? Mathf.Abs(handContainerRect.rect.width) : 800f;
+        
+        // Maximum shift should allow the outermost cards to reach the center
+        // For a 5-card hand with 150px spacing: total width ≈ 600px
+        // If container is 800px, we can shift ±100px to center any card
+        float maxShift = Mathf.Max(50f, (handWidth - containerWidth * 0.6f) * 0.5f + 100f);
+        
+        // Apply smooth delta movement (no lerping needed - already smooth)
+        currentHandOffset = Mathf.Clamp(targetHandOffset, -maxShift, maxShift);
+        
+        // Debug log every 30 frames
+        if (Time.frameCount % 30 == 0)
+        {
+            // CRITICAL DEBUG: Check if cards are centered
+            Vector3 containerPos = handContainerRect != null ? handContainerRect.localPosition : Vector3.zero;
+            Debug.Log($"[HandController] SMOOTH Parallax - Hand width: {handWidth:F1}, Max shift: ±{maxShift:F1}, Current: {currentHandOffset:F1}, Delta: {parallaxDelta:F1}");
+            Debug.Log($"[HandController] CENTERING DEBUG - Container width: {containerWidth:F1}, Container pos: {containerPos}, Should be (0,Y,0)");
+        }
+        
+        // Apply smooth delta movement to container
+        if (handContainerRect != null)
+        {
+            Vector3 pos = handContainerRect.localPosition;
+            pos.x = currentHandOffset;
+            handContainerRect.localPosition = pos;
+            
+            // Debug-Log for significant movement
+            if (Mathf.Abs(currentHandOffset) > 5f && Time.frameCount % 10 == 0) // Log every 10th frame
+            {
+                Debug.Log($"[HandController] SMOOTH Parallax: Hand offset={currentHandOffset:F1}, Delta={parallaxDelta:F1}, Current hovered: {(hoveredCard != null ? hoveredCard.GetCardData()?.cardName : "none")}");
+            }
+        }
     }
     
     /// <summary>
-    /// Animiert die Hand zurück zur zentrierten Position
+    /// DISABLED: Animiert die Hand zurück zur zentrierten Position
+    /// This was causing delayed movement - the absolute parallax system handles centering
     /// </summary>
     private void AnimateHandToCenter()
     {
-        RectTransform containerRect = handContainer.GetComponent<RectTransform>();
-        if (containerRect != null && Mathf.Abs(currentHandOffset) > 0.1f)
-        {
-            Debug.Log($"[HandController] Animating hand back to center from offset: {currentHandOffset:F1}");
-            
-            // Cancel any existing animation
-            LeanTween.cancel(handContainer.gameObject);
-            
-            // Animate back to center
-            LeanTween.moveLocalX(handContainer.gameObject, 0f, returnAnimationDuration)
-                .setEase(returnEaseType)
-                .setOnComplete(() => {
-                    currentHandOffset = 0f;
-                    Debug.Log("[HandController] Hand returned to center");
-                });
-        }
-        else
-        {
-            currentHandOffset = 0f;
-        }
+        Debug.Log($"[HandController] DISABLED AnimateHandToCenter (was offset: {currentHandOffset:F1}) - absolute parallax handles positioning");
+        
+        // DISABLED: This animation was conflicting with absolute parallax positioning
+        // The absolute parallax system will handle proper positioning
+        currentHandOffset = 0f;
     }
     
     /// <summary>
@@ -2544,5 +2736,15 @@ public class HandController : MonoBehaviour
         {
             Debug.LogError($"[HandController] Fixed SiblingIndex issues - cards should now render in correct order");
         }
+    }
+    
+    /// <summary>
+    /// Delayed fan animation to prevent interrupting hover animation
+    /// </summary>
+    private IEnumerator DelayedFanAnimation()
+    {
+        // Wait one frame to let hover animation start
+        yield return null;
+        UpdateCardLayout();
     }
 }
