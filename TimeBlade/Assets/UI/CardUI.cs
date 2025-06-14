@@ -623,6 +623,13 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
     /// </summary>
     public void OnPointerEnter(PointerEventData eventData)
     {
+        // ENHANCED: Use global touch state for more robust blocking
+        if (HandController.IsGlobalTouchActive)
+        {
+            Debug.LogError($"[CardUI] *** BLOCKING ONPOINTERENTER - GLOBAL TOUCH ACTIVE *** for '{cardData?.cardName}'");
+            return;
+        }
+        
         // CRITICAL FIX: Block ALL OnPointerEnter events when HandController is managing touch
         if (handController != null && handController.IsTouchActive())
         {
@@ -667,6 +674,13 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
     /// </summary>
     public void OnPointerExit(PointerEventData eventData)
     {
+        // ENHANCED: Use global touch state for more robust blocking
+        if (HandController.IsGlobalTouchActive)
+        {
+            Debug.LogError($"[CardUI] *** BLOCKING ONPOINTEREXIT - GLOBAL TOUCH ACTIVE *** for '{cardData?.cardName}'");
+            return;
+        }
+        
         // CRITICAL FIX: Block ALL OnPointerExit events when HandController is managing touch
         if (handController != null && handController.IsTouchActive())
         {
@@ -830,17 +844,18 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
             // CRITICAL FIX: Return to base position
             if (hasBasePosition)
             {
+                Debug.LogError($"[CardUI] HOVER EXIT: {cardData?.cardName} returning to basePosition: {basePosition} (current: {transform.localPosition})");
                 LeanTween.moveLocal(gameObject, basePosition, hoverAnimDuration)
                     .setEase(hoverEaseType)
                     .setOnComplete(() => {
                         Debug.Log($"[CardUI] Hover exit complete for {cardData?.cardName}, Final Pos: {transform.localPosition}");
-                        // Reset base position flag when card is at rest
-                        if (!isDragging && !isBeingDraggedCentrally)
-                        {
-                            hasBasePosition = false;
-                            Debug.Log($"[CardUI] Reset base position flag for {cardData?.cardName}");
-                        }
+                        // Don't reset base position flag - keep it for future hover operations
                     });
+            }
+            else
+            {
+                // If no base position stored, log error but don't move
+                Debug.LogError($"[CardUI] HOVER EXIT ERROR: No base position stored for {cardData?.cardName}!");
             }
             
             // Stelle Original-Index wieder her (KRITISCH für korrekte Reihenfolge)

@@ -3,6 +3,7 @@ using UnityEngine.UI;
 using UnityEngine.EventSystems;
 using System.Collections;
 using System.Collections.Generic;
+using System.Linq;
 
 /// <summary>
 /// Verwaltet die Kartenhand-UI und Drag&Drop
@@ -107,6 +108,15 @@ public class HandController : MonoBehaviour
     private Vector2 touchOffsetFromAnchorCard = Vector2.zero; // Offset of touch from anchor card center
     private int anchoredCardIndex = -1; // Index of the card that should stay under the finger
     private float anchoredCardInitialX = 0f; // Initial X position of anchored card relative to hand
+    
+    // CRITICAL FIX: Lock the initially touched card to prevent unwanted switches
+    private CardUI initiallyTouchedCard = null; // The card detected at touch start
+    private float touchMovementThreshold = 40f; // Movement required before allowing card switch (increased for stability)
+    private Vector2 touchStartScreenPos = Vector2.zero; // Screen position where touch started
+    
+    // ENHANCED: Global touch state for better event blocking
+    private static bool globalTouchActive = false; // Static flag to block all hover events during touch
+    public static bool IsGlobalTouchActive => globalTouchActive; // Public getter for CardUI
     
     void Start()
     {
@@ -366,6 +376,24 @@ public class HandController : MonoBehaviour
                 isFanned = true;
                 touchStartTime = Time.time; // Record touch start time
                 
+                // ENHANCED: Set global touch state to block all hover events
+                globalTouchActive = true;
+                Debug.Log("[HandController] GLOBAL TOUCH ACTIVE - All hover events will be blocked");
+                
+                // ENHANCED: Immediately disable all hover on all cards to prevent Unity EventSystem interference
+                foreach (var cardObj in activeCardUIs)
+                {
+                    if (cardObj != null)
+                    {
+                        var cardUI = cardObj.GetComponent<CardUI>();
+                        if (cardUI != null)
+                        {
+                            cardUI.ForceDisableHover();
+                        }
+                    }
+                }
+                Debug.Log("[HandController] Force disabled hover on ALL cards at touch start");
+                
                 // WICHTIG: Setze Flag für alle Karten
                 CardUI.SetTouchStartedOnValidArea(true);
                 
@@ -410,6 +438,20 @@ public class HandController : MonoBehaviour
                 // CRITICAL: First find which card is under the touch BEFORE fanning
                 // This card will be the anchor for the fan animation
                 CardUI touchedCard = GetCardAtPosition(position);
+                
+                // CRITICAL FIX: Lock this card as the initially touched card
+                initiallyTouchedCard = touchedCard;
+                touchStartScreenPos = position;
+                
+                // ENHANCED: Debug logging for touch lock initialization
+                if (touchedCard != null)
+                {
+                    Debug.LogError($"[HandController] *** TOUCH LOCK INITIALIZED *** Locked to: '{touchedCard.GetCardData()?.cardName}' at position {position}");
+                }
+                else
+                {
+                    Debug.LogWarning("[HandController] *** TOUCH LOCK WARNING *** No card found at touch position - lock may be ineffective");
+                }
                 
                 // Store the initial touch position and anchored card for Pokemon Pocket style tracking
                 if (touchedCard != null)
@@ -463,7 +505,27 @@ public class HandController : MonoBehaviour
                 }
                 
                 // AFTER layout is done, determine which card is under the touch and hover it
-                UpdateCardSelectionAtPosition(position);
+                // CRITICAL FIX: Use the initially touched card if available
+                if (initiallyTouchedCard != null)
+                {
+                    // Force hover on the initially touched card
+                    hoveredCard = initiallyTouchedCard;
+                    initiallyTouchedCard.ForceEnterHover();
+                    lastHoveredCard = initiallyTouchedCard;
+                    
+                    // Update card preview
+                    UpdateCardPreview();
+                    
+                    Debug.Log($"[HandController] *** INITIAL TOUCH LOCK *** Locked to card: '{initiallyTouchedCard.GetCardData()?.cardName}'");
+                    
+                    // ENHANCED: Set initialHoveredCard to prevent incorrect drift detection
+                    initialHoveredCard = initiallyTouchedCard;
+                }
+                else
+                {
+                    // Fallback to normal selection
+                    UpdateCardSelectionAtPosition(position);
+                }
                 
                 // NEU: Speichere die initial berührte Karte für Drift-Erkennung
                 initialHoveredCard = hoveredCard;
@@ -599,7 +661,9 @@ public class HandController : MonoBehaviour
         string lastHoveredCardName = lastHoveredCard?.GetCardData()?.cardName ?? "none";
         Debug.Log($"[HandController] Touch end - was touching: {isTouching}, was fanned: {isFanned}, hovered: {hoveredCardName}, lastHovered: {lastHoveredCardName}, isDragging: {isDraggingActive}");
         
-        if (isTouching && !isPlayingCard) // GUARD: Verhindere mehrfaches Ausführen
+        // CRITICAL FIX: Always reset layout when touch ends, regardless of isPlayingCard state
+        // This ensures the cards return to normal even if a card was played
+        if (isTouching) // Remove the isPlayingCard check
         {
             // KRITISCH: Setze isTouching SOFORT auf false um weitere hover Updates zu verhindern
             isTouching = false;
@@ -609,6 +673,10 @@ public class HandController : MonoBehaviour
             anchoredCardIndex = -1;
             anchoredCardInitialX = 0f;
             touchOffsetFromAnchorCard = Vector2.zero;
+            
+            // CRITICAL FIX: Reset initial touch lock
+            initiallyTouchedCard = null;
+            touchStartScreenPos = Vector2.zero;
             
             // NEUES DRAG-SYSTEM: Behandle Drag-Ende
             if (isDraggingActive)
@@ -656,6 +724,10 @@ public class HandController : MonoBehaviour
         
         // Reset touch validation flag
         CardUI.SetTouchStartedOnValidArea(false);
+        
+        // ENHANCED: Clear global touch state
+        globalTouchActive = false;
+        Debug.Log("[HandController] GLOBAL TOUCH INACTIVE - Hover events enabled again");
     }
     
     /// <summary>
@@ -1222,12 +1294,21 @@ public class HandController : MonoBehaviour
                     card.transform.localScale = Vector3.one;
                 }
                 
+                // CRITICAL FIX: Update base position IMMEDIATELY when fanning
+                // This prevents hover-exit from using the old position
+                if (cardUI != null && isFanned)
+                {
+                    cardUI.UpdateBasePosition(targetPosition);
+                    Debug.Log($"[HandController] IMMEDIATE base position update for {cardName} to {targetPosition} (fanned)");
+                }
+                
                 LeanTween.moveLocal(card, targetPosition, duration).setEase(easing)
                     .setOnComplete(() => {
-                        // Update base position after animation
-                        if (cardUI != null)
+                        // Update base position after animation (for non-fanned state)
+                        if (cardUI != null && !isFanned)
                         {
                             cardUI.UpdateBasePosition(targetPosition);
+                            Debug.Log($"[HandController] Updated base position for {cardName} to {targetPosition} after animation");
                         }
                     });
                 LeanTween.rotateLocal(card, targetRotation, duration).setEase(easing)
@@ -1277,6 +1358,15 @@ public class HandController : MonoBehaviour
         {
             // PLAY-CHAIN LOG: Karte wird gespielt
             Debug.Log($"[HandController] Card '{cardData.cardName}' clicked successfully, informing CombatManager");
+            
+            // CRITICAL FIX: Ensure layout is reset when card is played via click
+            // This handles the case where touch end might not be processed
+            if (isFanned)
+            {
+                Debug.Log($"[HandController] Card clicked while fanned - forcing layout reset");
+                isFanned = false;
+                UpdateCardLayout(false); // Animate back to normal
+            }
             
             // Versuche Karte zu spielen
             RiftCombatManager.Instance.PlayerWantsToPlayCard(cardData, player);
@@ -1357,28 +1447,75 @@ public class HandController : MonoBehaviour
         List<RaycastResult> results = new List<RaycastResult>();
         EventSystem.current.RaycastAll(pointerData, results);
         
+        // DEBUG: Log all raycast hits
+        Debug.Log($"[HandController] GetCardAtPosition - Raycast hits: {results.Count} at screen pos {screenPosition}");
+        foreach (var result in results)
+        {
+            Debug.Log($"[HandController] Raycast hit: {result.gameObject.name} at depth {result.depth}");
+        }
+        
         CardUI bestCard = null;
         float closestDistance = float.MaxValue;
+        int bestCardIndex = -1;
         
-        // Find the card closest to the touch center
+        // Find the card that actually contains the touch point
         foreach (var result in results)
         {
             CardUI cardUI = result.gameObject.GetComponent<CardUI>();
             if (cardUI != null && activeCardUIs.Contains(result.gameObject))
             {
-                // Calculate distance to card center
+                // Get the card's index in the hand
+                int cardIndex = activeCardUIs.IndexOf(result.gameObject);
+                
+                // Calculate if the touch is within the card's bounds
                 RectTransform cardRect = result.gameObject.GetComponent<RectTransform>();
                 Vector2 localPoint;
                 RectTransformUtility.ScreenPointToLocalPointInRectangle(
                     cardRect, screenPosition, canvasCamera, out localPoint);
                 
+                // Check if the touch is actually within the card's rect
+                Rect cardBounds = cardRect.rect;
+                bool isInBounds = cardBounds.Contains(localPoint);
+                
+                // Calculate distance from card center for tie-breaking
                 float distance = localPoint.magnitude;
-                if (distance < closestDistance)
+                
+                string cardName = cardUI.GetCardData()?.cardName ?? "UNKNOWN";
+                Debug.Log($"[HandController] Card '{cardName}' (index {cardIndex}): localPoint={localPoint}, inBounds={isInBounds}, distance={distance}");
+                
+                // CRITICAL: Prioritize cards that actually contain the touch point
+                if (isInBounds)
                 {
-                    closestDistance = distance;
-                    bestCard = cardUI;
+                    // Among cards that contain the touch, prefer the one with higher sibling index (on top)
+                    int siblingIndex = result.gameObject.transform.GetSiblingIndex();
+                    if (bestCard == null || siblingIndex > bestCard.transform.GetSiblingIndex())
+                    {
+                        closestDistance = distance;
+                        bestCard = cardUI;
+                        bestCardIndex = cardIndex;
+                    }
+                }
+                else if (bestCard == null)
+                {
+                    // Fallback: if no card contains the touch, use the closest one
+                    if (distance < closestDistance)
+                    {
+                        closestDistance = distance;
+                        bestCard = cardUI;
+                        bestCardIndex = cardIndex;
+                    }
                 }
             }
+        }
+        
+        if (bestCard != null)
+        {
+            string cardName = bestCard.GetCardData()?.cardName ?? "UNKNOWN";
+            Debug.Log($"[HandController] GetCardAtPosition selected: '{cardName}' (index {bestCardIndex}) at distance {closestDistance}");
+        }
+        else
+        {
+            Debug.Log("[HandController] GetCardAtPosition found no card at position");
         }
         
         return bestCard;
@@ -1544,6 +1681,43 @@ public class HandController : MonoBehaviour
             return;
         }
         
+        // CRITICAL FIX: Check if we should respect the initially touched card
+        if (initiallyTouchedCard != null && isTouching)
+        {
+            float movementDistance = Vector2.Distance(screenPosition, touchStartScreenPos);
+            if (movementDistance < touchMovementThreshold)
+            {
+                // Still within threshold - keep the initially touched card
+                if (hoveredCard != initiallyTouchedCard)
+                {
+                    Debug.Log($"[HandController] *** TOUCH LOCK ACTIVE *** Keeping initially touched card '{initiallyTouchedCard.GetCardData()?.cardName}' (movement: {movementDistance:F1}px < {touchMovementThreshold}px)");
+                    
+                    // Force hover on initially touched card
+                    if (hoveredCard != null && hoveredCard != initiallyTouchedCard)
+                    {
+                        hoveredCard.ForceExitHover();
+                    }
+                    
+                    hoveredCard = initiallyTouchedCard;
+                    initiallyTouchedCard.ForceEnterHover();
+                    lastHoveredCard = initiallyTouchedCard;
+                    
+                    // Update preview
+                    UpdateCardPreview();
+                    
+                    // ENHANCED: Also update initial hover state to prevent drift detection
+                    initialHoveredCard = initiallyTouchedCard;
+                }
+                return; // Don't allow card switching
+            }
+            else if (movementDistance >= touchMovementThreshold && initiallyTouchedCard != null)
+            {
+                // Threshold exceeded - unlock the initial card
+                Debug.Log($"[HandController] *** TOUCH LOCK RELEASED *** Movement {movementDistance:F1}px exceeded threshold {touchMovementThreshold}px");
+                initiallyTouchedCard = null; // Allow normal card switching from now on
+            }
+        }
+        
         // Debug: Vorheriger Zustand
         CardUI previousHovered = hoveredCard;
         
@@ -1558,42 +1732,92 @@ public class HandController : MonoBehaviour
         
         CardUI newHoveredCard = null;
         float closestDistance = float.MaxValue;
+        int bestSiblingIndex = -1;
         
-        // Suche nach CardUI in den Ergebnissen
+        // DEBUG: Log what we're looking for
+        Debug.Log($"[HandController] UpdateCardSelectionAtPosition - Looking for card at {screenPosition}, {results.Count} raycast hits");
+        
+        // First pass: find all cards that contain the touch point
+        List<(CardUI card, float distance, int siblingIndex)> candidateCards = new List<(CardUI, float, int)>();
+        
         foreach (var result in results)
         {
             CardUI cardUI = result.gameObject.GetComponent<CardUI>();
             if (cardUI != null && activeCardUIs.Contains(result.gameObject))
             {
-                // CRITICAL: Calculate distance to card center for more precise selection
+                // Get card info
                 RectTransform cardRect = result.gameObject.GetComponent<RectTransform>();
+                int cardIndex = activeCardUIs.IndexOf(result.gameObject);
+                int siblingIndex = result.gameObject.transform.GetSiblingIndex();
+                
                 Vector2 localPoint;
                 RectTransformUtility.ScreenPointToLocalPointInRectangle(
                     cardRect, screenPosition, canvasCamera, out localPoint);
                 
-                // IMPROVED: Consider card bounds for better touch detection
-                // Only change card if touch is significantly inside the new card
+                // Check if touch is within card bounds
                 Rect cardBounds = cardRect.rect;
-                bool isWellInside = cardBounds.Contains(localPoint);
+                bool isInBounds = cardBounds.Contains(localPoint);
                 
-                // Calculate distance with preference for currently hovered card
+                // Calculate distance from card center
                 float distance = localPoint.magnitude;
                 
-                // CRITICAL: Give strong preference to current card to prevent rapid switching
-                if (cardUI == previousHovered)
-                {
-                    distance *= 0.5f; // 50% distance = strong preference for current card
-                }
+                string cardName = cardUI.GetCardData()?.cardName ?? "UNKNOWN";
+                Debug.Log($"[HandController] Checking card '{cardName}' (index {cardIndex}, sibling {siblingIndex}): localPoint={localPoint}, inBounds={isInBounds}, distance={distance}");
                 
-                // Only consider this card if touch is inside bounds or very close
-                if (isWellInside || distance < cardBounds.width * 0.4f)
+                if (isInBounds)
                 {
+                    candidateCards.Add((cardUI, distance, siblingIndex));
+                }
+            }
+        }
+        
+        // Second pass: select the best card from candidates
+        if (candidateCards.Count > 0)
+        {
+            // Sort by sibling index (higher = on top = should be selected)
+            candidateCards.Sort((a, b) => b.siblingIndex.CompareTo(a.siblingIndex));
+            
+            // Take the topmost card
+            newHoveredCard = candidateCards[0].card;
+            closestDistance = candidateCards[0].distance;
+            bestSiblingIndex = candidateCards[0].siblingIndex;
+            
+            string selectedName = newHoveredCard.GetCardData()?.cardName ?? "UNKNOWN";
+            Debug.Log($"[HandController] Selected topmost card: '{selectedName}' with sibling index {bestSiblingIndex}");
+        }
+        else
+        {
+            // Fallback: no card contains the touch point, find closest
+            foreach (var result in results)
+            {
+                CardUI cardUI = result.gameObject.GetComponent<CardUI>();
+                if (cardUI != null && activeCardUIs.Contains(result.gameObject))
+                {
+                    RectTransform cardRect = result.gameObject.GetComponent<RectTransform>();
+                    Vector2 localPoint;
+                    RectTransformUtility.ScreenPointToLocalPointInRectangle(
+                        cardRect, screenPosition, canvasCamera, out localPoint);
+                    
+                    float distance = localPoint.magnitude;
+                    
+                    // Give preference to current card to prevent rapid switching
+                    if (cardUI == previousHovered)
+                    {
+                        distance *= 0.7f; // 30% closer = mild preference
+                    }
+                    
                     if (distance < closestDistance)
                     {
                         closestDistance = distance;
                         newHoveredCard = cardUI;
                     }
                 }
+            }
+            
+            if (newHoveredCard != null)
+            {
+                string fallbackName = newHoveredCard.GetCardData()?.cardName ?? "UNKNOWN";
+                Debug.Log($"[HandController] No card contains touch, using closest: '{fallbackName}' at distance {closestDistance}");
             }
         }
         
