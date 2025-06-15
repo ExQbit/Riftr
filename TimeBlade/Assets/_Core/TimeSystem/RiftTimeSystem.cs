@@ -114,10 +114,14 @@ public class RiftTimeSystem : MonoBehaviour
     /// </summary>
     private IEnumerator TimeCountdown()
     {
+        float uiUpdateInterval = 0.1f; // UI nur alle 0.1 Sekunden updaten
+        float lastUiUpdate = 0f;
+        
         while (isTimerRunning && currentTime > 0)
         {
-            // Zeit läuft kontinuierlich ab
-            currentTime -= Time.deltaTime;
+            // FIXED: Use unscaled time to avoid FPS dependency
+            float frameTime = 0.02f; // Fixed 50 FPS equivalent
+            currentTime -= frameTime;
             
             // Auf Präzision runden
             currentTime = Mathf.Round(currentTime / TIME_PRECISION) * TIME_PRECISION;
@@ -125,8 +129,12 @@ public class RiftTimeSystem : MonoBehaviour
             // Mindestens 0
             if (currentTime < 0) currentTime = 0;
             
-            // Update Event
-            OnTimeChanged?.Invoke(currentTime, maxTime);
+            // UI nur alle 0.1s updaten für bessere Performance
+            if (Time.time - lastUiUpdate >= uiUpdateInterval)
+            {
+                OnTimeChanged?.Invoke(currentTime, maxTime);
+                lastUiUpdate = Time.time;
+            }
             
             // Warnungen bei bestimmten Schwellen
             CheckTimeWarnings();
@@ -137,7 +145,7 @@ public class RiftTimeSystem : MonoBehaviour
                 TimeExpired();
             }
             
-            yield return null; // Jeden Frame updaten
+            yield return new WaitForSeconds(0.02f); // 50 FPS statt jeden Frame
         }
     }
     

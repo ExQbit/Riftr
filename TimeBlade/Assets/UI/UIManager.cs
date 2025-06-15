@@ -71,10 +71,9 @@ public class UIManager : MonoBehaviour
     private void SubscribeToEvents()
     {
         GameManager.OnStateChanged += HandleGameStateChanged;
-        TimeManager.OnTimeChanged += UpdateTimerDisplay;  
-        TimeManager.OnTimerExpired += HandleTimerExpired;
-        TimeManager.OnTimerWarning += HandleTimerWarning; 
-        TimeManager.OnTimerCritical += HandleTimerCritical; 
+        // FIX: Use RiftTimeSystem instead of old TimeManager
+        RiftTimeSystem.OnTimeChanged += UpdateTimerDisplay;  
+        RiftTimeSystem.OnTimeExpired += HandleTimerExpired; 
         
         PlayerController.OnHealthChanged += UpdatePlayerHealthUI; 
         
@@ -90,10 +89,9 @@ public class UIManager : MonoBehaviour
     private void UnsubscribeFromEvents()
     {
         GameManager.OnStateChanged -= HandleGameStateChanged;
-        TimeManager.OnTimeChanged -= UpdateTimerDisplay; 
-        TimeManager.OnTimerExpired -= HandleTimerExpired;
-        TimeManager.OnTimerWarning -= HandleTimerWarning; 
-        TimeManager.OnTimerCritical -= HandleTimerCritical; 
+        // FIX: Use RiftTimeSystem instead of old TimeManager
+        RiftTimeSystem.OnTimeChanged -= UpdateTimerDisplay; 
+        RiftTimeSystem.OnTimeExpired -= HandleTimerExpired; 
 
         PlayerController.OnHealthChanged -= UpdatePlayerHealthUI;
 
@@ -135,10 +133,21 @@ public class UIManager : MonoBehaviour
         }
     }
 
-    // Korrekte Signatur für TimeManager.OnTimeChanged (Action<float>)
-    private void UpdateTimerDisplay(float displayTime) 
+    // Fixed signature for RiftTimeSystem.OnTimeChanged (Action<float, float>)
+    private void UpdateTimerDisplay(float current, float max) 
     {
-        if (timerText != null) timerText.text = $"Time: {Mathf.Max(0, displayTime):00.0}";
+        if (timerText != null)
+        {
+            // Use RiftTimeSystem's proper formatting
+            if (RiftTimeSystem.Instance != null)
+            {
+                timerText.text = RiftTimeSystem.Instance.GetTimeDisplayString();
+            }
+            else
+            {
+                timerText.text = $"{Mathf.CeilToInt(current)}s";
+            }
+        }
     }
 
     private void HandleTimerExpired()
@@ -149,24 +158,6 @@ public class UIManager : MonoBehaviour
         {
             timerText.text = "TIME UP!"; // Deutlichere Nachricht
             timerText.color = criticalTimeColor; // Farbe auf kritisch setzen
-        }
-    }
-
-    private void HandleTimerWarning()
-    {
-        if (timerText != null && timerText.color != criticalTimeColor) // Nicht überschreiben, wenn schon kritisch
-        {
-            timerText.color = warningTimeColor;
-            Debug.Log("UIManager: Timer color set to warning.");
-        }
-    }
-
-    private void HandleTimerCritical()
-    {
-        if (timerText != null)
-        {
-            timerText.color = criticalTimeColor;
-            Debug.Log("UIManager: Timer color set to critical.");
         }
     }
 

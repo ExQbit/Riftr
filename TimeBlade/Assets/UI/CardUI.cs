@@ -445,7 +445,7 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
             playableBorderFrame.gameObject.SetActive(false);
         }
         
-        Debug.Log($"[CardUI] Stopped border pulsation for {cardData?.cardName}");
+        // Debug.Log($"[CardUI] Stopped border pulsation for {cardData?.cardName}"); // REDUCED LOGGING
     }
     
     /// <summary>
@@ -1066,7 +1066,7 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
             // If we're not in any special state but scale is wrong, fix it
             if (Mathf.Abs(transform.localScale.x - 1f) > 0.01f)
             {
-                Debug.LogWarning($"[CardUI] Detected stuck scale on {cardData?.cardName}: {transform.localScale}. Resetting to 1.");
+                // Silently fix the scale without spamming the log
                 transform.localScale = Vector3.one;
             }
         }
