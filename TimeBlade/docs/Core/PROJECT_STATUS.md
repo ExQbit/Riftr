@@ -238,6 +238,42 @@ Hierarchy:
    - **RiftBoss**: Spezielle Boss-Implementierung
    - **EnemyAttribute**: Positionierungssystem (Guardian, Aggressor, etc.)
 
+## 🔄 AKTUELLE FIXES (2025-06-17)
+
+### HOVER STATE MACHINE IMPLEMENTIERT:
+
+1. **Problem**: Race Conditions zwischen Hover-Animationen, Layout-Updates und Touch-Events
+   - Mehrere Systeme manipulierten gleichzeitig Kartenpositionen
+   - basePosition Tracking war fehlerhaft und inkonsistent
+   - Karten blieben manchmal im Hover-Zustand "hängen"
+   - Lücken entstanden bei schnellen Hover-Wechseln
+   - Parallax-Movement störte Hover-Positionen
+   
+2. **Lösung implementiert**:
+   - **State Machine**: HoverState enum mit None, EnteringHover, Hovered, ExitingHover
+   - **Getrennte Position-Tracking**: layoutTargetPosition (Soll) vs visualPosition (Ist)
+   - **Animation-IDs**: Separate Tracking für Position-, Scale- und Rotation-Animationen
+   - **Verzögerte Layout-Updates**: Während Hover werden Layout-Updates verzögert
+   - **Robuste Animation-Verwaltung**: Nur eine Animation pro Typ gleichzeitig
+   - **Optimiertes Parallax**: UpdateParallaxOffsetOnly() für minimale Störungen
+   
+3. **Technische Details**:
+   - CardUI.cs komplett überarbeitet mit State Machine Pattern
+   - UpdateLayoutTargetPosition() ersetzt UpdateBasePosition()
+   - Neue Methode UpdateParallaxXPosition() für Parallax während Hover
+   - UpdateParallaxOffsetOnly() in HandController_Utils.cs für optimierte Updates
+   - HandController_ArcLayout.cs überspringt hovering Karten komplett
+   - Excessive Debug-Logs entfernt für bessere Performance
+   
+4. **Vorteile der Lösung**:
+   - Keine Race Conditions mehr zwischen verschiedenen Systemen
+   - Flüssige Übergänge ohne "Springen" oder "Hängen"
+   - Hover bleibt während Parallax-Movement erhalten
+   - Layout-Updates stören Hover-Animationen nicht mehr
+   - Robuste Fehlerbehandlung und State-Konsistenz
+   - Hovering Karten behalten ihre Position bei schnellem Gleiten
+   - Keine ungleichmäßigen Lücken mehr zwischen Karten
+
 ## 🔄 AKTUELLE FIXES (2025-06-11)
 
 ### DRAG-AND-DROP KAMPFSYSTEM VOLLSTÄNDIG IMPLEMENTIERT:
@@ -518,3 +554,124 @@ Hierarchy:
   - Highlight_Effect ist bewusst deaktiviert (Performance-Gründe)
   - Zeitanzeige immer in Sekunden-Format beibehalten
   - Für mobile Optimierung alle UI-Elemente mit korrekten Anker und Pivots versehen
+
+## 🔄 AKTUELLE FIXES (2025-06-17) - ARC SYSTEM VEREINFACHUNG
+
+### HANDKARTEN-SYSTEM AUF EINFACHEN KREISBOGEN UMGESTELLT:
+
+1. **Problem**: Überkomplizierte Parabel-Berechnung mit normalisierten Positionen
+   - Komplexe Mathematik mit y = -a * x² Formeln
+   - Normalisierung von X-Positionen auf -1 bis 1
+   - Verschiedene Koordinatensysteme und Span-Multiplier
+   - Schwer verständlich und unnötig kompliziert
+
+2. **Lösung implementiert**:
+   - **Einfacher Kreisbogen** statt komplizierter Parabel:
+     - Kreis-Radius: 300 Pixel (fest)
+     - Bogen-Winkel: 60° (für schönen Bogen)
+     - Karten auf unterem Teil des Kreises platziert (240°-300°)
+     - Kreismittelpunkt liegt UNTER den Karten
+     - Ergibt nach unten gebogenen Bogen (wie echte Handkarten)
+   - **Einfache Winkelberechnung**:
+     - Startwinkel: 240° (270° - halber Bogen)
+     - Winkelschritte gleichmäßig verteilt
+     - Position mit simplem Sin/Cos berechnet
+   - **Rotation folgt Tangente**:
+     - Karten zeigen nach außen auf dem Kreis
+     - Einfache Berechnung: currentAngle - 270°
+
+3. **Technische Details**:
+   - Keine Normalisierung mehr nötig
+   - Keine komplizierten Span-Multiplier
+   - X = cos(angle) * radius
+   - Y = sin(angle) * radius + yOffset (nutzt unteren Kreisbogen)
+   - yOffset = radius * 0.8 (verschiebt Karten nach oben)
+   - Parallax funktioniert weiterhin durch einfachen X-Offset
+
+4. **Ergebnis**:
+   - Code massiv vereinfacht und verständlicher
+   - Gleiche visuelle Qualität mit weniger Komplexität
+   - Einfacher zu debuggen und anzupassen
+   - Performance-Verbesserung durch simplere Berechnungen
+
+### ALTE BOGEN-BEWEGUNG BEI PARALLAX (ERSETZT):
+
+1. **Problem**: Karten folgten nicht dem Bogen beim horizontalen Gleiten
+   - Y-Position der Karten wurde beim Parallax-Movement nicht angepasst
+   - Karten bewegten sich nur horizontal statt auf dem Bogen
+   - Hovering Karten wurden komplett übersprungen, was zu Lücken führte
+
+2. **Lösung implementiert**:
+   - **UpdateCardLayoutArc** angepasst:
+     - Hovering Karten werden jetzt mit bewegt statt übersprungen
+     - Neue Methode `UpdateParallaxPositionWithArc()` für hovering Karten
+     - Y-Position folgt jetzt korrekt der finalen X-Position auf dem Bogen
+   - **CardUI.cs** erweitert:
+     - Neue Methode `UpdateParallaxPositionWithArc()` implementiert
+     - Updates sowohl X als auch Y Position mit korrektem Hover-Offset
+     - Sanfte Animation mit halber Geschwindigkeit für hovering Karten
+
+3. **Technische Details**:
+   - Y-Position wird mit modifizierter Parabel-Formel berechnet
+   - Mindesthöhe von 15% verhindert komplettes Abflachen am Rand
+   - Unterschiedliche Bogenhöhen für gefächert (35px) und normal (30px)
+   - Span-Multiplier angepasst (0.8 für gefächert, 0.6 für normal)
+   - Hovering Karten bewegen sich mit halber Geschwindigkeit für smoothen Effekt
+
+4. **Ergebnis**:
+   - Karten folgen jetzt korrekt dem Bogen bei allen Bewegungen
+   - Keine Lücken mehr zwischen Karten beim schnellen Gleiten
+   - Hovering Karten behalten ihre erhöhte Position UND folgen dem Bogen
+   - Flüssige, natürliche Bewegung ohne Sprünge oder Hänger
+
+## 🔄 AKTUELLE FIXES (2025-06-15)
+
+### CARD-AWARE PARALLAX SYSTEM KORRIGIERT:
+
+1. **Problem**: Parallax-System funktionierte nicht korrekt
+   - Bei Touch auf rechte Karte und Bewegung nach links blieb offset bei 0.0
+   - Karten kamen dem Finger nicht entgegen
+   - Bewegungsgrenzen wurden falsch berechnet
+
+2. **Lösung implementiert**:
+   - **InitializeCardAwareParallax** korrigiert:
+     - Linke Karte (Index 0): kann nur nach links bewegt werden (maxAllowedRightMovement = 0)
+     - Rechte Karte (letzter Index): kann nur nach rechts bewegt werden (maxAllowedLeftMovement = 0)
+     - Mittlere Karten: können in beide Richtungen
+   - **UpdateParallaxHandShift** korrigiert:
+     - Bewegung jetzt INVERTIERT: Finger nach links → Hand bewegt sich nach RECHTS
+     - So kommen die Karten dem Finger "entgegen"
+     - Sensitivität auf 0.5f erhöht für besseres Gefühl
+
+3. **Gewünschtes Verhalten**:
+   - Auf der linken Karte: Finger kann nicht weiter nach rechts (Karten sind schon ganz links)
+   - Auf der rechten Karte: Finger kann nicht weiter nach links (Karten sind schon ganz rechts)  
+   - Mittlere Karten: Volle Bewegungsfreiheit in beide Richtungen
+   - Karten kommen dem Finger jetzt korrekt entgegen
+
+4. **Geänderte Dateien**:
+   - **HandController_Utils.cs**: InitializeCardAwareParallax() und UpdateParallaxHandShift() korrigiert
+
+### CARD-AWARE PARALLAX SYSTEM V2 - SYMMETRIE FIX:
+
+1. **Problem**: Fehlende Symmetrie beim Parallax
+   - Linke Karte erreichte nicht die gleiche zentrale Position wie rechte Karte
+   - Sensitivität zu niedrig für flüssige Bewegung
+
+2. **Lösung V2 implementiert**:
+   - **InitializeCardAwareParallax** erweitert:
+     - Berechnet tatsächliche Kartenpositionen basierend auf fanSpacing
+     - Für rechte Karte: maxAllowedRightMovement = Abstand der linken Karte zur Mitte
+     - Dadurch wird symmetrische Bewegung garantiert
+   - **UpdateParallaxHandShift** verbessert:
+     - Sensitivität von 0.5f auf 1.2f erhöht
+     - Volle Bewegung bei ca. 200-250 Pixel Fingerbewegung
+
+3. **Symmetrisches Verhalten**:
+   - Von rechter Karte nach links gleiten: Linke Karte landet exakt in der Mitte
+   - Von linker Karte nach rechts gleiten: Rechte Karte landet exakt in der Mitte
+   - Mittlere Karten haben proportionale Bewegungsfreiheit
+
+4. **Logging-Verbesserung**:
+   - logParallaxDetails aktiviert für Debugging
+   - Andere Logs deaktiviert für bessere Übersicht

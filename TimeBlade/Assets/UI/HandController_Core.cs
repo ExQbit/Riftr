@@ -30,15 +30,17 @@ public partial class HandController : MonoBehaviour
     [SerializeField] private LeanTweenType fanEaseType = LeanTweenType.easeOutExpo;
     // [SerializeField] private float touchAreaExtension = 50f; // Nicht mehr verwendet
     
-    [Header("Arc Movement Settings")]
-    // [Tooltip("Radius des unsichtbaren Kreises für die Bogenbewegung")]
-    // [SerializeField] private float arcRadius = 600f; // Nicht mehr verwendet - feste Werte in Utils
-    // [Tooltip("Winkelabstand zwischen Karten auf dem Bogen (in Radians)")]
-    // [SerializeField] private float arcAngleSpacing = 0.2f; // Nicht mehr verwendet - feste Winkel in Utils
-    // [Tooltip("Maximale Rotation des gesamten Bogens beim Parallax")]
-    // [SerializeField] private float arcMaxRotation = 0.3f; // Nicht mehr verwendet - feste Werte in Utils
-    // [Tooltip("Y-Achsen Skalierung für flacheren Bogen")]
-    // [SerializeField] private float arcYScale = 0.3f; // Nicht mehr verwendet - feste Werte in Utils
+    [Header("Arc Layout Settings")]
+    [Tooltip("Radius des Kreises für die Bogenbewegung")]
+    [SerializeField] private float arcRadius = 500f;
+    [Tooltip("Gesamtwinkel des Bogens in normaler Ansicht (Grad)")]
+    [SerializeField] private float arcAngleNormal = 40f;
+    [Tooltip("Gesamtwinkel des Bogens beim Fanning (Grad)")]
+    [SerializeField] private float arcAngleFanned = 80f;
+    [Tooltip("Y-Offset vom Kreismittelpunkt nach oben")]
+    [SerializeField] private float arcYOffset = 150f;
+    [Tooltip("Kartenbreite für Parallax-Scrolling")]
+    [SerializeField] private float parallaxCardWidth = 200f;
     
     [Header("Canvas-Einstellungen")]
     [SerializeField] private Canvas parentCanvas;

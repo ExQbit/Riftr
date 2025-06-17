@@ -545,23 +545,11 @@ public partial class HandController : MonoBehaviour
     
     private void SortCardUIsByPosition()
     {
-        // Sortiere die activeCardUIs Liste basierend auf der X-Position
-        activeCardUIs.Sort((a, b) => 
-        {
-            if (a == null || b == null) return 0;
-            
-            RectTransform rectA = a.GetComponent<RectTransform>();
-            RectTransform rectB = b.GetComponent<RectTransform>();
-            
-            if (rectA == null || rectB == null) return 0;
-            
-            float xA = rectA.localPosition.x;
-            float xB = rectB.localPosition.x;
-            
-            return xA.CompareTo(xB);
-        });
-        
-        // Sorted order debug entfernt
+        // WARNUNG: Diese Methode sollte NICHT mehr verwendet werden!
+        // Sie verursacht Karten-Identitäts-Probleme, da die Reihenfolge in activeCardUIs
+        // mit der Reihenfolge in player.hand übereinstimmen muss!
+        Debug.LogWarning("[HandController] SortCardUIsByPosition() sollte nicht mehr verwendet werden!");
+        return;
     }
     
     private void UpdateCardPreview()
@@ -600,7 +588,17 @@ public partial class HandController : MonoBehaviour
         // CRITICAL DEBUG - Always log this  
         Debug.Log($"[PARALLAX] UpdateParallaxOffsetOnly - offset: {effectiveParallaxOffset:F1}, cards: {cardCount}");
         
-        // Update ALLE Karten mit dem neuen Parallax-Offset UND Bogen-Position
+        // EINFACHE KREISBOGEN-BERECHNUNG (gleich wie in UpdateCardLayoutArc)
+        float circleRadius = arcRadius;
+        float totalArcAngle = arcAngleFanned;  // Fanning-Winkel (da diese Methode nur bei isFanned aufgerufen wird)
+        float startAngle = 90f - (totalArcAngle / 2f); // Oben minus halber Bogen
+        
+        // NEUER ANSATZ: Karten verschieben sich wie Perlen auf einer festen Kette
+        // Berechne virtuelle Index-Verschiebung basierend auf Parallax-Offset
+        float cardWidth = parallaxCardWidth;
+        float indexShift = effectiveParallaxOffset / cardWidth; // Wie viele "Karten-Positionen" verschieben
+        
+        // Update ALLE Karten mit virtueller Position auf dem festen Bogen
         for (int i = 0; i < cardCount; i++)
         {
             GameObject card = activeCardUIs[i];
@@ -609,48 +607,41 @@ public partial class HandController : MonoBehaviour
             CardUI cardUI = card.GetComponent<CardUI>();
             if (cardUI == null) continue;
             
-            // CRITICAL: Berechne die VOLLE Position auf dem Bogen (nicht nur X)
-            float normalizedPos = cardCount > 1 ? (float)i / (cardCount - 1) : 0.5f;
+            // Berechne virtuelle Position (kann zwischen Karten-Slots liegen)
+            float virtualIndex = i - indexShift; // Negative shift = Karten bewegen sich nach rechts
             
-            // Horizontale Position
-            float spacing = isFanned ? fanSpacing : cardSpacing;
-            float centerIndex = (cardCount - 1) * 0.5f;
-            float x = (i - centerIndex) * spacing + effectiveParallaxOffset;
+            // Winkel für virtuelle Position berechnen
+            float angleStep = cardCount > 1 ? totalArcAngle / (cardCount - 1) : 0f;
+            float currentAngle = startAngle + (virtualIndex * angleStep);
+            float angleInRadians = currentAngle * Mathf.Deg2Rad;
             
-            // WICHTIG: Y-Position basierend auf finaler X-Position berechnen!
-            float spanMultiplier = isFanned ? 0.8f : 0.6f;
-            float arcSpan = (cardCount - 1) * spacing * spanMultiplier;
-            float normalizedX = arcSpan > 0 ? x / arcSpan : 0f;
-            
-            // Bogen-Höhe berechnen - ERWEITERTE VERSION
-            float arcHeight = isFanned ? 35f : 30f;
-            
-            // PARABEL: Verwende normalizedX direkt für konsistenten Bogen
-            // Die Parabel sollte bei -1 und 1 am tiefsten Punkt sein
-            float parabola = 1f - (normalizedX * normalizedX);
-            
-            // Clamp die Parabel auf 0 als Minimum
-            parabola = Mathf.Max(0f, parabola);
-            
-            // Direkte Höhenberechnung
-            float y = arcHeight * parabola;
-            
-            // Rotation
-            float rotationNormalized = Mathf.Clamp(normalizedX, -1f, 1f);
-            float angleInDegrees = rotationNormalized * 20f;
-            float rotation = -angleInDegrees * 0.7f;
+            // EINFACHE KREIS-POSITION auf festem Bogen
+            float x = Mathf.Cos(angleInRadians) * circleRadius;
+            float y = Mathf.Sin(angleInRadians) * circleRadius - circleRadius + arcYOffset; // Oberer Teil des Kreises mit Offset
             
             Vector3 targetPosition = new Vector3(x, y, 0);
+            
+            // Rotation basiert auf virtueller Position
+            float targetRotation = currentAngle - 90f;
             
             // Debug für extreme Positionen
             if (Mathf.Abs(effectiveParallaxOffset) > 200f && (i == 0 || i == cardCount - 1))
             {
-                Debug.Log($"[PARALLAX DEBUG] Card {i}: x={x:F1}, normalizedX={normalizedX:F2}, parabola={parabola:F3}, y={y:F1}");
+                Debug.Log($"[PARALLAX DEBUG] Card {i}: virtualIndex={virtualIndex:F1}, angle={currentAngle:F1}°, pos=({x:F0}, {y:F0})");
             }
             
             // Update die Karte mit der vollen Arc-Position
             cardUI.UpdateParallaxPositionWithArc(targetPosition, 0.05f);
+            
+            // Rotation nur für nicht-hovering Karten setzen
+            if (!cardUI.IsHovering() && !cardUI.IsInHoverAnimation())
+            {
+                cardUI.transform.localEulerAngles = new Vector3(0, 0, targetRotation);
+            }
         }
+        
+        // Force Canvas update damit Collider mit visuellen Positionen übereinstimmen
+        Canvas.ForceUpdateCanvases();
     }
     
     private float CalculateTotalHandWidth()

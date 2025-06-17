@@ -68,6 +68,12 @@
 - ScreenSpaceOverlay: keine Kamera
 - ScreenSpaceCamera: Canvas.worldCamera verwenden
 
+### Timer-Display-Probleme (BEHOBEN 2025-06-11)
+- **Problem**: Timer lief laggy und sprunghaft, manchmal gar nicht
+- **Ursache**: Dual-Timer-System - UIManager nutzte alten TimeManager (Update() jeden Frame), RiftUIController nutzte neuen RiftTimeSystem
+- **Lösung**: UIManager auf RiftTimeSystem umgestellt, alte TimeManager-Events entfernt
+- **Resultat**: Einheitliche 0.1s UI-Update-Intervalle statt Frame-by-Frame Updates
+
 ## <� Gameplay-Mechaniken
 
 ### Zeit-System

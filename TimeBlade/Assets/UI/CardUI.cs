@@ -481,8 +481,8 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
         transform.SetAsLastSibling();
         needsIndexRestore = true;
         
-        // Calculate hover offset
-        hoverOffset = Vector3.up * hoverLiftAmount;
+        // Calculate hover offset - minimal for arc layout
+        hoverOffset = Vector3.up * 20f; // Fixed small offset for arc layout
         
         // Animate position
         Vector3 targetPos = layoutTargetPosition + hoverOffset;
@@ -623,7 +623,7 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
         transform.SetAsLastSibling();
         needsIndexRestore = true;
         
-        hoverOffset = Vector3.up * hoverLiftAmount;
+        hoverOffset = Vector3.up * 20f; // Fixed small offset for arc layout
         visualPosition = layoutTargetPosition + hoverOffset;
         transform.localPosition = visualPosition;
         transform.localScale = Vector3.one * hoverScaleAmount;

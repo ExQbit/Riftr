@@ -132,6 +132,7 @@ public partial class HandController : MonoBehaviour
         isDraggingActive = false;
         draggedCardUI = null;
         draggedCard = null;
+        draggedCardOriginalIndex = -1; // Reset index nach Drag-Ende
         
         EnableAllHoverEffects();
     }
@@ -263,9 +264,13 @@ public partial class HandController : MonoBehaviour
         }
     }
     
+    private int draggedCardOriginalIndex = -1;
+    
     public void RemoveCardForDrag(GameObject card)
     {
         draggedCard = card;
+        // WICHTIG: Index speichern BEVOR wir die Karte entfernen!
+        draggedCardOriginalIndex = activeCardUIs.IndexOf(card);
         activeCardUIs.Remove(card);
         // Beim Drag das Fanning beibehalten
         UpdateCardLayout(true, false, null);
@@ -277,8 +282,18 @@ public partial class HandController : MonoBehaviour
         
         if (!activeCardUIs.Contains(card))
         {
-            activeCardUIs.Add(card);
-            Debug.Log($"[HandController] Added card back to activeCardUIs list");
+            // KRITISCH: Karte an der ursprünglichen Position einfügen!
+            if (draggedCardOriginalIndex >= 0 && draggedCardOriginalIndex <= activeCardUIs.Count)
+            {
+                activeCardUIs.Insert(draggedCardOriginalIndex, card);
+                Debug.Log($"[HandController] Inserted card back at original index: {draggedCardOriginalIndex}");
+            }
+            else
+            {
+                // Fallback: Am Ende hinzufügen
+                activeCardUIs.Add(card);
+                Debug.Log($"[HandController] Added card at end (original index invalid: {draggedCardOriginalIndex})");
+            }
         }
         else
         {
@@ -286,6 +301,7 @@ public partial class HandController : MonoBehaviour
         }
         
         draggedCard = null;
+        draggedCardOriginalIndex = -1; // Reset index
         
         LeanTween.cancel(card);
         
@@ -293,6 +309,9 @@ public partial class HandController : MonoBehaviour
         card.transform.localScale = Vector3.one;
         card.transform.localRotation = Quaternion.identity;
         
+        // ENTFERNT: Sort zerstört die Synchronisation mit player.hand!
+        // Die Reihenfolge in activeCardUIs MUSS mit player.hand übereinstimmen!
+        /*
         activeCardUIs.Sort((a, b) => 
         {
             if (a == null || b == null) return 0;
@@ -300,6 +319,7 @@ public partial class HandController : MonoBehaviour
             float xB = b.GetComponent<RectTransform>().anchoredPosition.x;
             return xA.CompareTo(xB);
         });
+        */
         
         Debug.Log($"[HandController] Calling UpdateCardLayout for card return - force immediate");
         

@@ -7,7 +7,7 @@ using System.Collections;
 public partial class HandController : MonoBehaviour
 {
     /// <summary>
-    /// Neue UpdateCardLayout Methode mit Arc-Movement
+    /// Vereinfachte UpdateCardLayout Methode mit einfachem Kreisbogen
     /// </summary>
     public void UpdateCardLayoutArc(bool forceImmediate = false, bool isFromCardCreation = false, CardUI anchorCard = null)
     {
@@ -15,7 +15,6 @@ public partial class HandController : MonoBehaviour
         if (cardCount == 0) return;
         
         // CRITICAL FIX: Verhindere Layout-Updates während aktiver Hover-Animationen
-        // Dies verhindert Lücken bei schnellen Hover-Wechseln
         if (!forceImmediate && !isFromCardCreation)
         {
             foreach (var cardObj in activeCardUIs)
@@ -25,7 +24,6 @@ public partial class HandController : MonoBehaviour
                     var cardUI = cardObj.GetComponent<CardUI>();
                     if (cardUI != null && cardUI.IsInHoverAnimation())
                     {
-                        // Skip layout update - Hover animation is running
                         return;
                     }
                 }
@@ -40,15 +38,11 @@ public partial class HandController : MonoBehaviour
                 var cardUI = cardObj.GetComponent<CardUI>();
                 if (cardUI != null)
                 {
-                    // Only reset non-hovered cards
                     if (!cardUI.IsHovering() && cardUI != draggedCardUI)
                     {
                         cardUI.ForceDisableHover();
                         cardObj.transform.localScale = Vector3.one;
                     }
-                    
-                    // Set layout animation flag for all cards
-                    // This prevents hover animations from interfering during layout updates
                     cardUI.SetInLayoutAnimation(true);
                 }
             }
@@ -56,6 +50,17 @@ public partial class HandController : MonoBehaviour
         
         // Berechne Parallax-Offset für Arc-Movement
         float effectiveParallaxOffset = isFanned ? currentHandOffset : 0f;
+        
+        // EINFACHE KREISBOGEN-BERECHNUNG - verwendet Inspector-Werte
+        float circleRadius = arcRadius;
+        float totalArcAngle = isFanned ? arcAngleFanned : arcAngleNormal;
+        float startAngle = 90f - (totalArcAngle / 2f); // Startwinkel (90° = oben, minus halber Bogen)
+        
+        // Debug für Fanning
+        if (isFromCardCreation || forceImmediate)
+        {
+            Debug.Log($"[ARC LAYOUT] Cards: {cardCount}, isFanned: {isFanned}, totalAngle: {totalArcAngle}°, parallaxOffset: {effectiveParallaxOffset:F1}");
+        }
         
         // Layout jede Karte
         for (int i = 0; i < cardCount; i++)
@@ -79,60 +84,45 @@ public partial class HandController : MonoBehaviour
             
             if (cardRect == null || cardUI == null) continue;
             
-            // NEU: Berechne Position auf dem Bogen
-            Vector3 targetPosition;
-            float targetRotation;
+            // EINFACHE WINKELBERECHNUNG
+            float angleStep = cardCount > 1 ? totalArcAngle / (cardCount - 1) : 0f;
+            float currentAngle = startAngle + (i * angleStep); // Von links nach rechts
             
-            // EINHEITLICHER BOGEN für beide Zustände
-            float normalizedPos = cardCount > 1 ? (float)i / (cardCount - 1) : 0.5f;
-            
-            // Horizontale Position - nur der Abstand ändert sich beim Fächern
-            float spacing = isFanned ? fanSpacing : cardSpacing;
-            float centerIndex = (cardCount - 1) * 0.5f;
-            float x = (i - centerIndex) * spacing;
-            
-            // Füge Parallax-Offset hinzu wenn gefächert
-            if (isFanned)
+            // NEUER ANSATZ: Virtuelle Index-Position für Perlen-auf-Kette-Effekt
+            float virtualIndex = i;
+            if (isFanned && Mathf.Abs(effectiveParallaxOffset) > 0.1f)
             {
-                x += effectiveParallaxOffset;
+                float cardWidth = parallaxCardWidth;
+                float indexShift = effectiveParallaxOffset / cardWidth;
+                virtualIndex = i - indexShift; // Negative shift = Karten nach rechts
+                
+                // Debug für alle Karten bei großem Offset
+                if (Mathf.Abs(effectiveParallaxOffset) > 10f)
+                {
+                    Debug.Log($"[ARC] Card {i}: virtualIndex={virtualIndex:F2}, shift={indexShift:F2}, offset={effectiveParallaxOffset:F1}");
+                }
             }
             
-            // WICHTIG: Y-Position muss basierend auf der FINALEN X-Position berechnet werden!
-            // So folgen die Karten dem Bogen auch beim Parallax-Movement
+            // Berechne Winkel basierend auf virtueller Position
+            float virtualAngle = startAngle + (virtualIndex * angleStep);
+            float angleInRadians = virtualAngle * Mathf.Deg2Rad;
             
-            // Erweitere den Bereich für den Bogen, damit er natürlicher aussieht
-            // Verwende unterschiedliche Spans für gefächert und normal
-            float spanMultiplier = isFanned ? 0.8f : 0.6f; // Kleinerer Bereich wenn nicht gefächert
-            float arcSpan = (cardCount - 1) * spacing * spanMultiplier;
-            float normalizedX = arcSpan > 0 ? x / arcSpan : 0f;
+            // EINFACHE KREIS-POSITION
+            // Der Kreis liegt unterhalb bei (0, -circleRadius)
+            // Wir wollen den oberen Teil des Kreises verwenden
+            float x = Mathf.Cos(angleInRadians) * circleRadius;
+            float y = Mathf.Sin(angleInRadians) * circleRadius - circleRadius + arcYOffset; // Y-Offset nach unten + Verschiebung nach oben
             
-            // Vertikale Position - verwende eine sanftere Kurve
-            float arcHeight = isFanned ? 35f : 30f; // Etwas höher wenn gefächert
+            // Karten-Rotation folgt der Tangente des Kreises
+            float targetRotation = virtualAngle - 90f; // Tangente für oberen Kreisbogen
             
-            // PARABEL: Verwende normalizedX direkt für konsistenten Bogen
-            // Die Parabel sollte bei -1 und 1 am tiefsten Punkt sein
-            float parabola = 1f - (normalizedX * normalizedX);
+            Vector3 targetPosition = new Vector3(x, y, 0);
             
-            // Clamp die Parabel auf 0 als Minimum
-            parabola = Mathf.Max(0f, parabola);
-            
-            // Direkte Höhenberechnung
-            float y = arcHeight * parabola;
-            
-            // Debug-Ausgabe für extreme Positionen
-            if (Mathf.Abs(normalizedX) > 1.0f && logCardPositions)
+            // Debug-Ausgabe
+            if (logCardPositions && (i == 0 || i == cardCount - 1))
             {
-                Debug.Log($"[HandController] Card {i} at extreme position: x={x:F2}, normalizedX={normalizedX:F2}, y={y:F2}");
+                Debug.Log($"[HandController] Card {i}: angle={currentAngle:F1}°, pos=({x:F0}, {y:F0})");
             }
-            
-            // Rotation folgt auch der X-Position für konsistente Bogen-Bewegung
-            // Begrenze die Rotation auf den sichtbaren Bereich
-            float rotationNormalized = Mathf.Clamp(normalizedX, -1f, 1f);
-            float angleInDegrees = rotationNormalized * 20f; // Direkte Skalierung für intuitivere Rotation
-            float rotation = -angleInDegrees * 0.7f;
-            
-            targetPosition = new Vector3(x, y, 0);
-            targetRotation = rotation;
             
             // CRITICAL FIX: Setze Sibling Index nur für nicht-gehoverte Karten
             // Gehoverte Karten behalten ihren hohen SiblingIndex bei

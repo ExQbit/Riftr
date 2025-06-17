@@ -1,0 +1,40 @@
+--- HandController.cs (original)
++++ HandController.cs (fixed)
+@@ UpdateParallaxHandShift method:
+
+-    /// <summary>
+-    /// Updates parallax hand shift based on finger movement
+-    /// Uses SMOOTH DELTA system instead of absolute position for better feel
+-    /// </summary>
+-    private void UpdateParallaxHandShift(Vector2 currentPosition)
+-    {
+-        // SMOOTH DELTA PARALLAX: Use smooth finger movement delta instead of absolute jumps
+-        float horizontalDelta = currentPosition.x - lastFingerPosition.x;
+-        float parallaxDelta = -horizontalDelta * parallaxSensitivity;
+-        float targetHandOffset = currentHandOffset + parallaxDelta;
++    /// <summary>
++    /// Updates parallax hand shift based on finger movement
++    /// FIX: Uses ABSOLUTE system based on startTouchPosition for symmetry like Pokemon Pocket
++    /// </summary>
++    private void UpdateParallaxHandShift(Vector2 currentPosition)
++    {
++        // ABSOLUTE PARALLAX: Calculate total movement from start position for symmetry
++        float totalMovement = currentPosition.x - startTouchPosition.x;
++        float targetHandOffset = -totalMovement * parallaxSensitivity;
+         
+         // DEADZONE: Ignore very small movements to prevent jitter
+         const float PARALLAX_DEADZONE = 10f; // Minimum pixels of movement required
+-        float movementMagnitude = Mathf.Abs(horizontalDelta);
++        float movementMagnitude = Mathf.Abs(totalMovement);
+         if (movementMagnitude < PARALLAX_DEADZONE)
+         {
+             Debug.Log($"[HandController] DEADZONE: Movement too small ({movementMagnitude:F1}px < {PARALLAX_DEADZONE}px) - ignoring parallax");
+             return;
+         }
+         
+         // Rest of the method remains the same...
+         
+-        // Debug log
+-        Debug.Log($"[HandController] SMOOTH PARALLAX: finger=({currentPosition.x:F1}, {currentPosition.y:F1}), delta={horizontalDelta:F1}, parallaxDelta={parallaxDelta:F1}, targetHandOffset={targetHandOffset:F1}");
++        // Debug log with absolute values
++        Debug.Log($"[HandController] ABSOLUTE PARALLAX: finger=({currentPosition.x:F1}, {currentPosition.y:F1}), totalMovement={totalMovement:F1}, targetHandOffset={targetHandOffset:F1}");

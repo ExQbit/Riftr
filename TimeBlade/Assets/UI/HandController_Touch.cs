@@ -58,8 +58,8 @@ public partial class HandController : MonoBehaviour
         // CRITICAL DEBUG: Log the state of key variables
         Debug.Log($"[PARALLAX DEBUG] HandleTouchStart - enableFanning: {enableFanning}, activeCards: {activeCardUIs.Count}");
         
-        // WICHTIG: Stelle sicher, dass die Karten-Liste korrekt sortiert ist
-        SortCardUIsByPosition();
+        // ENTFERNT: SortCardUIsByPosition() - verursacht Karten-Identitäts-Probleme!
+        // Die Reihenfolge in activeCardUIs muss mit der Hand-Reihenfolge übereinstimmen
         
         // NEUE LOGIK: Zuerst prüfen ob eine Karte getroffen wurde
         CardUI touchedCard = GetCardAtPosition(position);
@@ -94,6 +94,10 @@ public partial class HandController : MonoBehaviour
         isFanned = true;
         touchStartTime = Time.time;
         globalTouchActive = true;
+        
+        // KRITISCH: Reset Parallax beim Start des Touch
+        currentHandOffset = 0f;
+        initialHandOffsetForCard = 0f;
         
         LogInfo("GLOBAL TOUCH ACTIVE - All hover events will be blocked", logTouchEvents);
         
