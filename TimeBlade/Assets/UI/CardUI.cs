@@ -7,39 +7,61 @@ using System.Collections;
 using System.Collections.Generic;
 
 /// <summary>
-/// 🃏 UI-KOMPONENTE FÜR EINZELNE HANDKARTE 🃏
+/// 🃏 HOVER STATE MACHINE CARD UI 🃏
 /// 
-/// WICHTIGE ARCHITEKTUR-ÄNDERUNG:
-/// Diese Klasse implementiert KEIN eigenes Drag-System mehr!
-/// Stattdessen wird sie vom HandController zentral verwaltet.
+/// Diese Version implementiert eine robuste State Machine für das Hover-System,
+/// um Race Conditions und Animation-Konflikte zu vermeiden.
 /// 
-/// WARUM?
-/// Unity's IBeginDragHandler/IDragHandler/IEndDragHandler sendet Events immer an die
-/// Karte wo der Touch BEGANN, nicht wo sich der Finger AKTUELL befindet.
-/// → Das führte zu verwirrenden UX wo Karte A visuell gedraggt wird aber Karte B gespielt wird.
+/// STATES:
+/// - None: Karte ist im Normalzustand
+/// - EnteringHover: Animation zum Hover-Zustand läuft
+/// - Hovered: Karte ist vollständig im Hover-Zustand
+/// - ExitingHover: Animation vom Hover-Zustand zurück läuft
 /// 
-/// NEUE VERANTWORTUNGEN:
-/// ✅ Karteninhalt anzeigen (Name, Kosten, etc.)
-/// ✅ Hover-Effekte (von HandController gesteuert)  
-/// ✅ Click-Events für direkte Kartenspiel
-/// ✅ Zentrale Drag-Integration (OnCentralDragStart/End)
+/// POSITION TRACKING:
+/// - layoutTargetPosition: Wo die Karte laut Layout sein sollte
+/// - visualPosition: Aktuelle visuelle Position (kann animiert sein)
+/// - hoverOffset: Zusätzlicher Offset für Hover-Effekt
 /// 
-/// ENTFERNTE VERANTWORTUNGEN:
-/// ❌ Eigene Drag-Event-Behandlung (jetzt zentral)
-/// ❌ Schwellenwert-Erkennung (jetzt im HandController)
-/// ❌ Drag-Position-Tracking (jetzt zentral)
-/// ❌ Spielbereich-Erkennung (jetzt zentral)
-/// 
-/// INTERFACES:
-/// - IPointerClickHandler ✅ (für direkte Clicks)
-/// - IPointerEnterHandler ✅ (für Hover-Start) 
-/// - IPointerExitHandler ✅ (für Hover-Ende)
-/// - IBeginDragHandler ❌ ENTFERNT (jetzt zentral)
-/// - IDragHandler ❌ ENTFERNT (jetzt zentral)  
-/// - IEndDragHandler ❌ ENTFERNT (jetzt zentral)
+/// ANIMATION MANAGEMENT:
+/// - Nur eine Animation pro Karte gleichzeitig
+/// - Neue Animationen canceln alte sauber
+/// - Warteschlange für Layout-Updates während Hover
 /// </summary>
 public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler, IPointerExitHandler
 {
+    // ===== HOVER STATE MACHINE =====
+    public enum HoverState
+    {
+        None,           // Normal state
+        EnteringHover,  // Animating to hover
+        Hovered,        // Fully hovered
+        ExitingHover    // Animating back from hover
+    }
+    
+    private HoverState currentHoverState = HoverState.None;
+    private HoverState targetHoverState = HoverState.None;
+    
+    // ===== POSITION TRACKING =====
+    private Vector3 layoutTargetPosition = Vector3.zero;  // Where card should be according to layout
+    private Vector3 visualPosition = Vector3.zero;       // Current visual position
+    private Vector3 hoverOffset = Vector3.zero;          // Additional offset when hovering
+    private bool hasValidLayoutPosition = false;
+    
+    // ===== ANIMATION TRACKING =====
+    private int positionAnimationId = -1;
+    private int scaleAnimationId = -1;
+    private int rotationAnimationId = -1;
+    private bool isAnimating = false;
+    
+    // ===== SIBLING INDEX TRACKING =====
+    private int layoutSiblingIndex = -1;  // The index this card should have in layout
+    private bool needsIndexRestore = false;
+    
+    // ===== DELAYED LAYOUT UPDATE =====
+    private Coroutine pendingLayoutUpdate = null;
+    private float layoutUpdateDelay = 0f;
+    
     [Header("UI-Elemente")]
     [SerializeField] private TextMeshProUGUI nameText;
     [SerializeField] private TextMeshProUGUI costText;
@@ -48,12 +70,35 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
     [SerializeField] private Image cardBackground;
     [SerializeField] private Image cardArt;
     [SerializeField] private GameObject highlightEffect;
-    [SerializeField] private Image playableBorderFrame; // Separater pulsierender Rahmen für Spielbarkeit
+    [SerializeField] private Image playableBorderFrame;
     
     [Header("Farben")]
     [SerializeField] private Color attackColor = new Color(1f, 0.3f, 0.3f);
     [SerializeField] private Color defenseColor = new Color(0.3f, 0.5f, 1f);
     [SerializeField] private Color timeColor = new Color(0.5f, 1f, 0.5f);
+    
+    [Header("Animation-Einstellungen")]
+    [SerializeField] private float hoverAnimDuration = 0.1f;
+    [SerializeField] private float exitAnimDuration = 0.15f;
+    [SerializeField] private float layoutAnimDuration = 0.2f;
+    [SerializeField] private LeanTweenType hoverEaseType = LeanTweenType.easeOutCubic;
+    [SerializeField] private LeanTweenType exitEaseType = LeanTweenType.easeOutQuad;
+    [SerializeField] private LeanTweenType layoutEaseType = LeanTweenType.easeOutExpo;
+    
+    [Header("Hover-Einstellungen")]
+    [SerializeField] private float hoverLiftAmount = 50f;
+    [SerializeField] private float hoverScaleAmount = 1.15f;
+    
+    [Header("🔮 Magischer Border-Glow")]
+    [SerializeField] private float borderPulseDuration = 0.8f;
+    [SerializeField] private float borderMinAlpha = 0.6f;
+    [SerializeField] private float borderMaxAlpha = 1.0f;
+    [SerializeField] private Color borderColorPrimary = new Color(0.2f, 0.8f, 2.0f, 1.0f);
+    [SerializeField] private Color borderColorSecondary = new Color(1.0f, 0.4f, 2.0f, 1.0f);
+    [SerializeField] private LeanTweenType borderEaseType = LeanTweenType.easeInOutSine;
+    [SerializeField] private float glowIntensity = 4.0f;
+    [SerializeField] private float glowSize = 30f;
+    [SerializeField] private bool useColorCycling = true;
     
     // Events
     public event Action<TimeCardData> OnCardClicked;
@@ -62,78 +107,32 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
     private TimeCardData cardData;
     private bool isPlayable = true;
     
-    // Drag & Drop - VEREINFACHT für zentralisiertes System
+    // Drag & Drop
     private bool isDragging = false;
-    private Vector3 originalPosition;
-    private Vector3 originalRotation;
+    private bool isBeingDraggedCentrally = false;
     private Vector3 originalScale;
     private CanvasGroup canvasGroup;
     private HandController handController;
     
-    // Für Click-Erkennung
-    private Vector2 pointerStartPosition;
-    private int originalSiblingIndex = -1; // Für korrekte Wiederherstellung nach Hover
+    // Border-Pulsation
+    private int borderTweenId = -1;
+    private bool isBorderPulseActive = false;
     
-    // Zentralisiertes Drag-System (keine eigenen Drag-Events mehr)
-    private bool isBeingDraggedCentrally = false;
-    
-    // LEGACY: Diese Drag-Parameter werden NICHT MEHR VERWENDET!
-    // Das neue zentrale Drag-System läuft über HandController.
-    // Diese Felder bleiben nur zur Kompatibilität erhalten.
-    [Header("🚫 LEGACY Drag-Einstellungen (NICHT VERWENDET)")]
-    [SerializeField] public float dragThreshold = 30f; // LEGACY - wird ignoriert
-    [SerializeField] public float verticalDragBias = 1.5f; // LEGACY - wird ignoriert  
-    [SerializeField] public float minVerticalSwipe = 15f; // LEGACY - wird ignoriert
-    
-    [Header("Animation-Einstellungen (NEUE FELDER)")]
-    [SerializeField] public float hoverAnimDuration = 0.1f; // Schnellere Hover-Animation
-    [SerializeField] public float dragAnimDuration = 0.08f; // Sehr schnelle Drag-Animation
-    [SerializeField] public float returnAnimDuration = 0.25f; // Smooth Return
-    [SerializeField] public LeanTweenType hoverEaseType = LeanTweenType.easeOutCubic;
-    [SerializeField] public LeanTweenType dragEaseType = LeanTweenType.easeOutExpo;
-    [SerializeField] public LeanTweenType returnEaseType = LeanTweenType.easeOutBack;
-    
-    [Header("🔮 Magischer Border-Glow")]
-    [SerializeField] public float borderPulseDuration = 0.8f; // Magische Pulsation
-    [SerializeField] public float borderMinAlpha = 0.6f; // Immer gut sichtbar
-    [SerializeField] public float borderMaxAlpha = 1.0f; // Voll leuchtend
-    [SerializeField] public Color borderColorPrimary = new Color(0.2f, 0.8f, 2.0f, 1.0f); // Helles Cyan
-    [SerializeField] public Color borderColorSecondary = new Color(1.0f, 0.4f, 2.0f, 1.0f); // Magenta für Farbwechsel
-    [SerializeField] public LeanTweenType borderEaseType = LeanTweenType.easeInOutSine; // Smooth magische Bewegung
-    [SerializeField] public float glowIntensity = 4.0f; // Starker magischer Glow
-    [SerializeField] public float glowSize = 30f; // Größe des Glow-Effekts
-    [SerializeField] public bool useColorCycling = true; // Farbwechsel-Effekt
-    
-    // Hover-State
-    private bool isHovered = false;
+    // Touch state
     private static bool touchStartedInHandArea = false;
-    
-    // Scaling fix tracking
-    private int activeTweenId = -1; // Track active scale tween to cancel it properly
-    private bool isInLayoutAnimation = false; // Prevent hover during layout animations
-    
-    // CRITICAL: Store base position for hover calculations
-    private Vector3 basePosition = Vector3.zero; // Position without any hover lift
-    private bool hasBasePosition = false;
-    
-    // Border-Pulsation tracking (getrennt von Hover-System)
-    private int borderTweenId = -1; // Track active border animation
-    private bool isBorderPulseActive = false; // Is border pulse animation running?
     
     void Awake()
     {
-        // SCALING FIX: FORCE scale to 1 immediately, before any other component runs
+        // Force scale to 1 and disable any animators
         transform.localScale = Vector3.one;
         
-        // CRITICAL FIX: Disable any Animator that might be setting scale
         Animator animator = GetComponent<Animator>();
         if (animator != null)
         {
-            Debug.LogWarning($"[CardUI] Found Animator on card prefab! Disabling it to prevent scale issues.");
+            Debug.LogWarning($"[CardUI] Found Animator on card prefab! Disabling it.");
             animator.enabled = false;
         }
         
-        // Check for any Animation component (legacy)
         Animation legacyAnim = GetComponent<Animation>();
         if (legacyAnim != null)
         {
@@ -141,10 +140,8 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
             legacyAnim.enabled = false;
         }
         
-        // Get CanvasGroup if it exists
         canvasGroup = GetComponent<CanvasGroup>();
         
-        // Initialize playable border frame (create if not assigned)
         if (playableBorderFrame == null)
         {
             CreatePlayableBorderFrame();
@@ -152,48 +149,47 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
         
         if (playableBorderFrame != null)
         {
-            // Set border color and hide initially
             playableBorderFrame.color = new Color(borderColorPrimary.r, borderColorPrimary.g, borderColorPrimary.b, 0f);
             playableBorderFrame.gameObject.SetActive(false);
         }
         
-        // Initialize hover effect (separate from border system)
         if (highlightEffect != null)
         {
             highlightEffect.SetActive(false);
         }
+        
+        // Initialize positions
+        layoutTargetPosition = transform.localPosition;
+        visualPosition = transform.localPosition;
+        hasValidLayoutPosition = true;
     }
     
     void Start()
     {
-        // SCALING FIX: Double-check scale after all initialization
+        // Double-check scale
         if (transform.localScale != Vector3.one)
         {
             Debug.LogWarning($"[CardUI] Scale was not 1 at Start! Was: {transform.localScale}. Fixing...");
             transform.localScale = Vector3.one;
         }
         
-        // CRITICAL: Cancel any animations that might be running from prefab
-        LeanTween.cancel(gameObject);
+        // Cancel any animations
+        CancelAllAnimations();
     }
     
     void OnDestroy()
     {
-        // SCALING FIX: Clean up any running tweens when destroyed
-        if (activeTweenId >= 0)
-        {
-            LeanTween.cancel(activeTweenId);
-        }
-        
-        // Stop border pulsation before destruction
+        CancelAllAnimations();
         StopBorderPulsation();
         
-        LeanTween.cancel(gameObject);
+        if (pendingLayoutUpdate != null)
+        {
+            StopCoroutine(pendingLayoutUpdate);
+        }
     }
     
     void OnEnable()
     {
-        // SCALING FIX: Reset state when card becomes active
         ResetCardState();
     }
     
@@ -202,17 +198,26 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
     /// </summary>
     private void ResetCardState()
     {
-        // Cancel ALL animations
-        LeanTween.cancel(gameObject);
+        CancelAllAnimations();
         
-        // Force scale to 1
+        // Reset state machine
+        currentHoverState = HoverState.None;
+        targetHoverState = HoverState.None;
+        isAnimating = false;
+        
+        // Reset positions
+        if (hasValidLayoutPosition)
+        {
+            transform.localPosition = layoutTargetPosition;
+            visualPosition = layoutTargetPosition;
+        }
+        hoverOffset = Vector3.zero;
+        
+        // Reset visual state
         transform.localScale = Vector3.one;
-        
-        // Reset flags
-        isHovered = false;
+        transform.localRotation = Quaternion.identity;
         isDragging = false;
         isBeingDraggedCentrally = false;
-        activeTweenId = -1;
         
         // Stop border pulsation
         StopBorderPulsation();
@@ -223,8 +228,465 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
     }
     
     /// <summary>
-    /// Setzt die Kartendaten und aktualisiert die Anzeige
+    /// Cancels all running animations
     /// </summary>
+    private void CancelAllAnimations()
+    {
+        if (positionAnimationId >= 0)
+        {
+            LeanTween.cancel(positionAnimationId);
+            positionAnimationId = -1;
+        }
+        
+        if (scaleAnimationId >= 0)
+        {
+            LeanTween.cancel(scaleAnimationId);
+            scaleAnimationId = -1;
+        }
+        
+        if (rotationAnimationId >= 0)
+        {
+            LeanTween.cancel(rotationAnimationId);
+            rotationAnimationId = -1;
+        }
+        
+        // Also cancel any other tweens on this object
+        LeanTween.cancel(gameObject);
+        
+        isAnimating = false;
+    }
+    
+    /// <summary>
+    /// Updates the layout target position (called by HandController)
+    /// </summary>
+    public void UpdateLayoutTargetPosition(Vector3 newPosition, float animationDuration = 0.2f, bool immediate = false)
+    {
+        layoutTargetPosition = newPosition;
+        hasValidLayoutPosition = true;
+        
+        // If we're in a hover state, delay the layout update
+        if (currentHoverState == HoverState.Hovered || currentHoverState == HoverState.EnteringHover)
+        {
+            if (pendingLayoutUpdate != null)
+            {
+                StopCoroutine(pendingLayoutUpdate);
+            }
+            pendingLayoutUpdate = StartCoroutine(DelayedLayoutUpdate(animationDuration));
+            layoutUpdateDelay = animationDuration;
+        }
+        else if (immediate || animationDuration <= 0f)
+        {
+            // Immediate update
+            ApplyLayoutPosition(true);
+        }
+        else
+        {
+            // Animated update
+            AnimateToLayoutPosition(animationDuration);
+        }
+    }
+    
+    /// <summary>
+    /// Special method for parallax updates - only updates X position while maintaining hover
+    /// </summary>
+    public void UpdateParallaxXPosition(float newX, float duration = 0.05f)
+    {
+        if (currentHoverState == HoverState.Hovered || currentHoverState == HoverState.EnteringHover)
+        {
+            // Für hovering Karten: Update nur die X-Position, behalte den Hover-Y-Offset
+            Vector3 targetPos = new Vector3(newX, layoutTargetPosition.y + hoverOffset.y, layoutTargetPosition.z);
+            
+            if (positionAnimationId >= 0)
+            {
+                LeanTween.cancel(positionAnimationId);
+            }
+            
+            positionAnimationId = LeanTween.moveLocalX(gameObject, targetPos.x, duration)
+                .setEase(LeanTweenType.easeOutQuad)
+                .setOnComplete(() => {
+                    positionAnimationId = -1;
+                }).id;
+            
+            // Update auch die layout target X für spätere Referenz
+            layoutTargetPosition.x = newX;
+        }
+        else
+        {
+            // Nicht-hovering Karten: Normales X-Update
+            layoutTargetPosition.x = newX;
+            AnimateToLayoutPosition(duration);
+        }
+    }
+    
+    /// <summary>
+    /// Special method for parallax updates with arc movement - updates both X and Y
+    /// </summary>
+    public void UpdateParallaxPositionWithArc(Vector3 newTargetPosition, float duration = 0.05f)
+    {
+        layoutTargetPosition = newTargetPosition;
+        
+        if (currentHoverState == HoverState.Hovered || currentHoverState == HoverState.EnteringHover)
+        {
+            // Für hovering Karten: Neue Position mit Hover-Offset
+            Vector3 targetPos = newTargetPosition + hoverOffset;
+            
+            if (positionAnimationId >= 0)
+            {
+                LeanTween.cancel(positionAnimationId);
+            }
+            
+            positionAnimationId = LeanTween.moveLocal(gameObject, targetPos, duration)
+                .setEase(LeanTweenType.easeOutQuad)
+                .setOnComplete(() => {
+                    positionAnimationId = -1;
+                    visualPosition = targetPos;
+                }).id;
+        }
+        else
+        {
+            // Nicht-hovering Karten: Normale Position-Update
+            AnimateToLayoutPosition(duration);
+        }
+    }
+    
+    /// <summary>
+    /// Coroutine to delay layout updates during hover
+    /// </summary>
+    private IEnumerator DelayedLayoutUpdate(float duration)
+    {
+        // Wait until we're no longer hovering
+        while (currentHoverState == HoverState.Hovered || currentHoverState == HoverState.EnteringHover)
+        {
+            yield return new WaitForSeconds(0.1f);
+        }
+        
+        // Apply the layout update
+        AnimateToLayoutPosition(duration);
+        pendingLayoutUpdate = null;
+    }
+    
+    /// <summary>
+    /// Applies the layout position immediately
+    /// </summary>
+    private void ApplyLayoutPosition(bool updateVisual = true)
+    {
+        if (!hasValidLayoutPosition) return;
+        
+        visualPosition = layoutTargetPosition + hoverOffset;
+        
+        if (updateVisual && !isAnimating)
+        {
+            transform.localPosition = visualPosition;
+        }
+    }
+    
+    /// <summary>
+    /// Animates to the layout position
+    /// </summary>
+    private void AnimateToLayoutPosition(float duration)
+    {
+        if (!hasValidLayoutPosition || isAnimating) return;
+        
+        Vector3 targetPos = layoutTargetPosition + hoverOffset;
+        
+        if (positionAnimationId >= 0)
+        {
+            LeanTween.cancel(positionAnimationId);
+        }
+        
+        if (duration <= 0f)
+        {
+            transform.localPosition = targetPos;
+            visualPosition = targetPos;
+        }
+        else
+        {
+            positionAnimationId = LeanTween.moveLocal(gameObject, targetPos, duration)
+                .setEase(layoutEaseType)
+                .setOnComplete(() => {
+                    positionAnimationId = -1;
+                    visualPosition = targetPos;
+                }).id;
+        }
+    }
+    
+    /// <summary>
+    /// State machine transition
+    /// </summary>
+    private void TransitionToState(HoverState newState)
+    {
+        if (currentHoverState == newState) return;
+        
+        HoverState oldState = currentHoverState;
+        currentHoverState = newState;
+        
+        // Debug-Log nur bei wichtigen Übergängen (optional)
+        // Debug.Log($"[CardUI] {cardData?.cardName} State: {oldState} → {newState}");
+        
+        // Handle state transitions
+        switch (newState)
+        {
+            case HoverState.None:
+                OnEnterNoneState();
+                break;
+                
+            case HoverState.EnteringHover:
+                OnEnterEnteringHoverState();
+                break;
+                
+            case HoverState.Hovered:
+                OnEnterHoveredState();
+                break;
+                
+            case HoverState.ExitingHover:
+                OnEnterExitingHoverState();
+                break;
+        }
+    }
+    
+    /// <summary>
+    /// None state entry
+    /// </summary>
+    private void OnEnterNoneState()
+    {
+        hoverOffset = Vector3.zero;
+        needsIndexRestore = false;
+        
+        // Cancel any pending layout updates
+        if (pendingLayoutUpdate != null)
+        {
+            StopCoroutine(pendingLayoutUpdate);
+            pendingLayoutUpdate = null;
+        }
+        
+        // Apply any pending layout updates immediately
+        if (layoutUpdateDelay > 0f)
+        {
+            AnimateToLayoutPosition(layoutUpdateDelay);
+            layoutUpdateDelay = 0f;
+        }
+    }
+    
+    /// <summary>
+    /// EnteringHover state entry
+    /// </summary>
+    private void OnEnterEnteringHoverState()
+    {
+        isAnimating = true;
+        
+        // Store current sibling index
+        layoutSiblingIndex = transform.GetSiblingIndex();
+        
+        // Bring to front
+        transform.SetAsLastSibling();
+        needsIndexRestore = true;
+        
+        // Calculate hover offset
+        hoverOffset = Vector3.up * hoverLiftAmount;
+        
+        // Animate position
+        Vector3 targetPos = layoutTargetPosition + hoverOffset;
+        
+        CancelAllAnimations();
+        
+        positionAnimationId = LeanTween.moveLocal(gameObject, targetPos, hoverAnimDuration)
+            .setEase(hoverEaseType)
+            .setOnComplete(() => {
+                positionAnimationId = -1;
+                visualPosition = targetPos;
+                TransitionToState(HoverState.Hovered);
+            }).id;
+        
+        // Animate scale
+        scaleAnimationId = LeanTween.scale(gameObject, Vector3.one * hoverScaleAmount, hoverAnimDuration)
+            .setEase(hoverEaseType)
+            .setOnComplete(() => {
+                scaleAnimationId = -1;
+            }).id;
+    }
+    
+    /// <summary>
+    /// Hovered state entry
+    /// </summary>
+    private void OnEnterHoveredState()
+    {
+        isAnimating = false;
+        
+        // Ensure we're at the correct position
+        visualPosition = layoutTargetPosition + hoverOffset;
+        transform.localPosition = visualPosition;
+        transform.localScale = Vector3.one * hoverScaleAmount;
+    }
+    
+    /// <summary>
+    /// ExitingHover state entry
+    /// </summary>
+    private void OnEnterExitingHoverState()
+    {
+        isAnimating = true;
+        
+        // Reset hover offset
+        hoverOffset = Vector3.zero;
+        
+        // Restore sibling index
+        if (needsIndexRestore && layoutSiblingIndex >= 0)
+        {
+            transform.SetSiblingIndex(layoutSiblingIndex);
+            needsIndexRestore = false;
+        }
+        
+        // Animate back to layout position
+        CancelAllAnimations();
+        
+        positionAnimationId = LeanTween.moveLocal(gameObject, layoutTargetPosition, exitAnimDuration)
+            .setEase(exitEaseType)
+            .setOnComplete(() => {
+                positionAnimationId = -1;
+                visualPosition = layoutTargetPosition;
+                TransitionToState(HoverState.None);
+            }).id;
+        
+        // Animate scale
+        scaleAnimationId = LeanTween.scale(gameObject, Vector3.one, exitAnimDuration)
+            .setEase(exitEaseType)
+            .setOnComplete(() => {
+                scaleAnimationId = -1;
+                transform.localScale = Vector3.one; // Force exact scale
+            }).id;
+    }
+    
+    /// <summary>
+    /// Public method to set hover state
+    /// </summary>
+    public void SetHovered(bool hovered)
+    {
+        // Don't process if being destroyed or inactive
+        if (!gameObject.activeInHierarchy) return;
+        
+        // Protection during initial setup
+        if (hovered && Time.time < 3f)
+        {
+            Debug.LogWarning($"[CardUI] Blocking startup hover for '{cardData?.cardName}'");
+            return;
+        }
+        
+        // Block hover during drag
+        if (hovered && handController != null && handController.IsDragActive())
+        {
+            Debug.Log($"[CardUI] Blocking hover during drag for '{cardData?.cardName}'");
+            return;
+        }
+        
+        // Determine target state
+        targetHoverState = hovered ? HoverState.Hovered : HoverState.None;
+        
+        // Handle state transitions based on current state
+        if (hovered)
+        {
+            if (currentHoverState == HoverState.None)
+            {
+                TransitionToState(HoverState.EnteringHover);
+            }
+            else if (currentHoverState == HoverState.ExitingHover)
+            {
+                // Reverse the exit animation
+                TransitionToState(HoverState.EnteringHover);
+            }
+        }
+        else
+        {
+            if (currentHoverState == HoverState.Hovered)
+            {
+                TransitionToState(HoverState.ExitingHover);
+            }
+            else if (currentHoverState == HoverState.EnteringHover)
+            {
+                // Reverse the enter animation
+                TransitionToState(HoverState.ExitingHover);
+            }
+        }
+    }
+    
+    /// <summary>
+    /// Force immediate hover state without animation
+    /// </summary>
+    public void ForceEnterHover()
+    {
+        CancelAllAnimations();
+        
+        // Set state directly
+        currentHoverState = HoverState.Hovered;
+        targetHoverState = HoverState.Hovered;
+        
+        // Apply hover visuals immediately
+        layoutSiblingIndex = transform.GetSiblingIndex();
+        transform.SetAsLastSibling();
+        needsIndexRestore = true;
+        
+        hoverOffset = Vector3.up * hoverLiftAmount;
+        visualPosition = layoutTargetPosition + hoverOffset;
+        transform.localPosition = visualPosition;
+        transform.localScale = Vector3.one * hoverScaleAmount;
+        
+        // Force canvas update
+        Canvas.ForceUpdateCanvases();
+    }
+    
+    /// <summary>
+    /// Force immediate exit from hover
+    /// </summary>
+    public void ForceExitHover()
+    {
+        CancelAllAnimations();
+        TransitionToState(HoverState.None);
+        
+        // Apply normal state immediately
+        if (needsIndexRestore && layoutSiblingIndex >= 0)
+        {
+            transform.SetSiblingIndex(layoutSiblingIndex);
+            needsIndexRestore = false;
+        }
+        
+        hoverOffset = Vector3.zero;
+        visualPosition = layoutTargetPosition;
+        transform.localPosition = visualPosition;
+        transform.localScale = Vector3.one;
+    }
+    
+    /// <summary>
+    /// Force disable hover (used during drag operations)
+    /// </summary>
+    public void ForceDisableHover()
+    {
+        CancelAllAnimations();
+        
+        // Reset to none state
+        currentHoverState = HoverState.None;
+        targetHoverState = HoverState.None;
+        
+        // Restore position and scale
+        if (needsIndexRestore && layoutSiblingIndex >= 0)
+        {
+            transform.SetSiblingIndex(layoutSiblingIndex);
+            needsIndexRestore = false;
+        }
+        
+        hoverOffset = Vector3.zero;
+        
+        if (hasValidLayoutPosition)
+        {
+            transform.localPosition = layoutTargetPosition;
+            visualPosition = layoutTargetPosition;
+        }
+        
+        transform.localScale = Vector3.one;
+        
+        if (highlightEffect != null)
+            highlightEffect.SetActive(false);
+    }
+    
+    // ===== ORIGINAL METHODS (adapted to work with new system) =====
+    
     public void SetCardData(TimeCardData data)
     {
         if (data == null) return;
@@ -233,65 +695,37 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
         UpdateDisplay();
     }
     
-    /// <summary>
-    /// Setzt die Referenz zum HandController
-    /// </summary>
     public void SetHandController(HandController controller)
     {
         handController = controller;
     }
     
-    /// <summary>
-    /// Initialize method for compatibility with HandController
-    /// </summary>
     public void Initialize(TimeCardData cardData, HandController controller, Camera camera)
     {
         SetCardData(cardData);
         SetHandController(controller);
     }
     
-    /// <summary>
-    /// InitializeCard method for compatibility
-    /// </summary>
     public void InitializeCard(HandController controller, TimeCardData data, Camera canvasCam)
     {
-        // SCALING FIX: Ensure clean state on initialization
         transform.localScale = Vector3.one;
-        isHovered = false;
-        activeTweenId = -1;
-        
-        // Cancel any existing tweens on this object (in case of pooling/reuse)
-        LeanTween.cancel(gameObject);
+        CancelAllAnimations();
         
         SetHandController(controller);
         SetCardData(data);
     }
     
-    /// <summary>
-    /// IsMouseInput static method for compatibility
-    /// </summary>
-    public static bool IsMouseInput()
-    {
-        return Input.mousePresent && Input.touchCount == 0;
-    }
-    
-    /// <summary>
-    /// Aktualisiert alle UI-Elemente basierend auf den Kartendaten
-    /// </summary>
     private void UpdateDisplay()
     {
-        // Name
         if (nameText != null)
             nameText.text = cardData.cardName;
         
-        // Zeitkosten (gerundet für Anzeige)
         if (costText != null)
         {
             float displayCost = cardData.GetDisplayTimeCost();
             costText.text = $"{displayCost:F1}s";
         }
         
-        // Schaden (nur für Angriffskarten)
         if (damageText != null)
         {
             if (cardData.baseDamage > 0)
@@ -305,15 +739,12 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
             }
         }
         
-        // Beschreibung
         if (descriptionText != null)
             descriptionText.text = cardData.description;
         
-        // Karten-Art
         if (cardArt != null && cardData.cardArt != null)
             cardArt.sprite = cardData.cardArt;
         
-        // Hintergrundfarbe basierend auf Kartentyp
         if (cardBackground != null)
         {
             switch (cardData.cardType)
@@ -330,13 +761,9 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
             }
         }
         
-        // Spielbarkeit prüfen
         CheckPlayability();
     }
     
-    /// <summary>
-    /// Prüft ob die Karte spielbar ist (genug Zeit vorhanden)
-    /// </summary>
     private void CheckPlayability()
     {
         if (RiftTimeSystem.Instance != null)
@@ -346,7 +773,6 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
             
             isPlayable = currentTime >= cardCost;
             
-            // Visuelles Feedback
             if (cardBackground != null)
             {
                 Color baseColor = cardBackground.color;
@@ -355,7 +781,6 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
                     new Color(baseColor.r * 0.5f, baseColor.g * 0.5f, baseColor.b * 0.5f, 0.7f);
             }
             
-            // Border-Pulsation für spielbare Karten
             if (isPlayable && !isBorderPulseActive)
             {
                 StartBorderPulsation();
@@ -367,33 +792,46 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
         }
     }
     
-    /// <summary>
-    /// Karte wurde angeklickt
-    /// </summary>
     public void OnPointerClick(PointerEventData eventData)
     {
         if (!isPlayable || isDragging) return;
         
-        // Vereinfacht: Da wir zentrales Drag-System verwenden, gilt jeder Click als direkt
+        if (!isPlayable)
         {
-            // Visuelles Feedback für nicht spielbare Karte
-            if (!isPlayable)
-            {
-                ShakeCard();
-                Debug.Log($"Nicht genug Zeit für {cardData.cardName}!");
-                return;
-            }
-            
-            OnCardClicked?.Invoke(cardData);
+            ShakeCard();
+            Debug.Log($"Nicht genug Zeit für {cardData.cardName}!");
+            return;
         }
+        
+        OnCardClicked?.Invoke(cardData);
     }
     
-    /// <summary>
-    /// Shake-Animation für nicht spielbare Karte
-    /// </summary>
+    public void OnPointerEnter(PointerEventData eventData)
+    {
+        if (HandController.IsGlobalTouchActive) return;
+        if (handController != null && handController.IsTouchActive()) return;
+        if (Input.touchCount > 0) return;
+        if (Time.time < 3f) return;
+        if (!Input.mousePresent) return;
+        if (handController != null && handController.IsDragActive()) return;
+        
+        SetHovered(true);
+    }
+    
+    public void OnPointerExit(PointerEventData eventData)
+    {
+        if (HandController.IsGlobalTouchActive) return;
+        if (handController != null && handController.IsTouchActive()) return;
+        if (Input.touchCount > 0) return;
+        if (isDragging) return;
+        if (handController != null && handController.IsDragActive()) return;
+        
+        SetHovered(false);
+    }
+    
     private void ShakeCard()
     {
-        LeanTween.cancel(gameObject);
+        CancelAllAnimations();
         
         Vector3 originalPos = transform.localPosition;
         LeanTween.moveLocalX(gameObject, originalPos.x + 5f, 0.05f)
@@ -404,76 +842,54 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
             });
     }
     
-    /// <summary>
-    /// Startet die Border-Pulsation für spielbare Karten
-    /// </summary>
     private void StartBorderPulsation()
     {
         if (playableBorderFrame == null || isBorderPulseActive) return;
         
         isBorderPulseActive = true;
-        
-        // Make border visible and set initial color
         playableBorderFrame.color = new Color(borderColorPrimary.r, borderColorPrimary.g, borderColorPrimary.b, borderMinAlpha);
         playableBorderFrame.gameObject.SetActive(true);
         
-        // Start pulsing animation
         PulseBorder();
-        
-        // Debug.Log($"[CardUI] Started border pulsation for {cardData?.cardName}"); // REDUCED LOGGING
     }
     
-    /// <summary>
-    /// Stoppt die Border-Pulsation
-    /// </summary>
     private void StopBorderPulsation()
     {
         if (!isBorderPulseActive) return;
         
         isBorderPulseActive = false;
         
-        // Cancel active border tween
         if (borderTweenId >= 0)
         {
             LeanTween.cancel(borderTweenId);
             borderTweenId = -1;
         }
         
-        // Hide border frame
         if (playableBorderFrame != null)
         {
             playableBorderFrame.gameObject.SetActive(false);
         }
-        
-        // Debug.Log($"[CardUI] Stopped border pulsation for {cardData?.cardName}"); // REDUCED LOGGING
     }
     
-    /// <summary>
-    /// Führt eine Border-Pulsation aus (rekursiv für kontinuierliche Animation)
-    /// </summary>
     private void PulseBorder()
     {
         if (!isBorderPulseActive || playableBorderFrame == null) return;
         
-        // Animate from min to max alpha with magical color cycling
         borderTweenId = LeanTween.value(gameObject, borderMinAlpha, borderMaxAlpha, borderPulseDuration / 2f)
             .setEase(borderEaseType)
             .setOnUpdate((float val) => {
                 if (playableBorderFrame != null && isBorderPulseActive)
                 {
-                    // Choose color based on cycling preference
                     Color baseColor = useColorCycling ? 
                         Color.Lerp(borderColorPrimary, borderColorSecondary, (val - borderMinAlpha) / (borderMaxAlpha - borderMinAlpha)) :
                         borderColorPrimary;
                     
-                    // Apply HDR intensity for magical glow
                     Color magicalColor = baseColor * glowIntensity;
                     magicalColor.a = val;
                     playableBorderFrame.color = magicalColor;
                 }
             })
             .setOnComplete(() => {
-                // Animate back from max to min alpha
                 if (isBorderPulseActive)
                 {
                     borderTweenId = LeanTween.value(gameObject, borderMaxAlpha, borderMinAlpha, borderPulseDuration / 2f)
@@ -481,19 +897,16 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
                         .setOnUpdate((float val) => {
                             if (playableBorderFrame != null && isBorderPulseActive)
                             {
-                                // Choose color based on cycling preference (reverse cycle on fade)
                                 Color baseColor = useColorCycling ? 
                                     Color.Lerp(borderColorSecondary, borderColorPrimary, (val - borderMinAlpha) / (borderMaxAlpha - borderMinAlpha)) :
                                     borderColorPrimary;
                                 
-                                // Apply HDR intensity for magical glow
                                 Color magicalColor = baseColor * glowIntensity;
                                 magicalColor.a = val;
                                 playableBorderFrame.color = magicalColor;
                             }
                         })
                         .setOnComplete(() => {
-                            // Recursively continue pulsing
                             if (isBorderPulseActive)
                             {
                                 PulseBorder();
@@ -503,57 +916,40 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
             }).id;
     }
     
-    /// <summary>
-    /// Erstellt automatisch ein Border-Frame Element falls keines zugewiesen ist
-    /// </summary>
     private void CreatePlayableBorderFrame()
     {
-        // Create a new GameObject for the border
         GameObject borderObject = new GameObject("PlayableBorderFrame");
         borderObject.transform.SetParent(transform, false);
         
-        // Add Image component
         playableBorderFrame = borderObject.AddComponent<Image>();
         
-        // Configure RectTransform to cover the entire card area
         RectTransform borderRect = borderObject.GetComponent<RectTransform>();
         borderRect.anchorMin = Vector2.zero;
         borderRect.anchorMax = Vector2.one;
         borderRect.sizeDelta = Vector2.zero;
         borderRect.anchoredPosition = Vector2.zero;
         
-        // Set as first child so it appears behind card content
         borderObject.transform.SetAsFirstSibling();
         
-        // Configure border appearance
-        playableBorderFrame.color = Color.clear; // Start transparent
-        playableBorderFrame.raycastTarget = false; // Don't block raycasts
+        playableBorderFrame.color = Color.clear;
+        playableBorderFrame.raycastTarget = false;
         
-        // Try to create a simple border sprite programmatically
         CreateBorderSprite();
-        
-        Debug.Log("[CardUI] Auto-created PlayableBorderFrame");
     }
     
-    /// <summary>
-    /// Erstellt einen magischen, leuchtenden Border mit starkem Glow-Effekt
-    /// </summary>
     private void CreateBorderSprite()
     {
-        // Create a much larger texture for dramatic glow effect
         int size = 200;
         Texture2D borderTexture = new Texture2D(size, size);
         Color[] pixels = new Color[size * size];
         
         Vector2 center = new Vector2(size / 2f, size / 2f);
-        float maxGlowDistance = glowSize; // Use configurable glow size
+        float maxGlowDistance = glowSize;
         
-        // Create a magical glowing border pattern
         for (int x = 0; x < size; x++)
         {
             for (int y = 0; y < size; y++)
             {
-                // Calculate distance from edge for glow effect
                 int distFromEdge = Mathf.Min(
                     Mathf.Min(x, size - 1 - x),
                     Mathf.Min(y, size - 1 - y)
@@ -561,28 +957,24 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
                 
                 Color pixelColor = Color.clear;
                 
-                if (distFromEdge < maxGlowDistance) // Large glow area
+                if (distFromEdge < maxGlowDistance)
                 {
                     float normalizedDist = distFromEdge / maxGlowDistance;
                     
-                    if (distFromEdge < 6) // Very thin solid border
+                    if (distFromEdge < 6)
                     {
-                        // Bright solid core
                         pixelColor = new Color(1f, 1f, 1f, 1f);
                     }
-                    else if (distFromEdge < 12) // Inner glow
+                    else if (distFromEdge < 12)
                     {
-                        // Strong inner glow
                         float innerGlow = 1.0f - ((distFromEdge - 6) / 6.0f);
                         pixelColor = new Color(1f, 1f, 1f, innerGlow * 0.9f);
                     }
-                    else // Outer magical glow
+                    else
                     {
-                        // Magical falloff curve - more dramatic than quadratic
                         float glowStrength = 1.0f - normalizedDist;
-                        float magicalAlpha = Mathf.Pow(glowStrength, 3.0f); // Cubic falloff for dramatic effect
+                        float magicalAlpha = Mathf.Pow(glowStrength, 3.0f);
                         
-                        // Add some sparkle variation
                         float sparkle = 1.0f + 0.2f * Mathf.Sin((x + y) * 0.3f) * Mathf.Sin(x * 0.7f) * Mathf.Sin(y * 0.5f);
                         magicalAlpha *= sparkle;
                         
@@ -597,7 +989,6 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
         borderTexture.SetPixels(pixels);
         borderTexture.Apply();
         
-        // Create sprite from texture
         Sprite borderSprite = Sprite.Create(
             borderTexture, 
             new Rect(0, 0, size, size), 
@@ -608,476 +999,29 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
             new Vector4(maxGlowDistance, maxGlowDistance, maxGlowDistance, maxGlowDistance)
         );
         
-        // Apply to Image component
         if (playableBorderFrame != null)
         {
             playableBorderFrame.sprite = borderSprite;
             playableBorderFrame.type = Image.Type.Sliced;
-            
-            Debug.Log($"[CardUI] Created magical border sprite with glow size: {glowSize}");
-        }
-    }
-    
-    /// <summary>
-    /// Maus über Karte (nur für Desktop)
-    /// </summary>
-    public void OnPointerEnter(PointerEventData eventData)
-    {
-        // ENHANCED: Use global touch state for more robust blocking
-        if (HandController.IsGlobalTouchActive)
-        {
-            Debug.LogError($"[CardUI] *** BLOCKING ONPOINTERENTER - GLOBAL TOUCH ACTIVE *** for '{cardData?.cardName}'");
-            return;
-        }
-        
-        // CRITICAL FIX: Block ALL OnPointerEnter events when HandController is managing touch
-        if (handController != null && handController.IsTouchActive())
-        {
-            Debug.LogError($"[CardUI] *** BLOCKING ONPOINTERENTER DURING TOUCH *** HandController is managing touch for '{cardData?.cardName}'");
-            return;
-        }
-        
-        // KRITISCH: Verhindere Phantom-Hover während Startup und Touch-Input
-        if (Input.touchCount > 0) 
-        {
-            Debug.LogError($"[CardUI] *** BLOCKING ONPOINTERENTER *** Touch count: {Input.touchCount} for '{cardData?.cardName}'");
-            return;
-        }
-        
-        // KRITISCH: Verhindere EventSystem-Phantom-Hover während der ersten Sekunden
-        if (Time.time < 3f)
-        {
-            Debug.LogError($"[CardUI] *** PHANTOM HOVER BLOCKED *** OnPointerEnter for '{cardData?.cardName}' blocked during startup! Time: {Time.time}");
-            return;
-        }
-        
-        // KRITISCH: Nur bei tatsächlicher Mausbewegung (nicht EventSystem-Artifact)
-        if (!Input.mousePresent)
-        {
-            Debug.LogError($"[CardUI] *** PHANTOM HOVER BLOCKED *** No mouse present, ignoring OnPointerEnter for '{cardData?.cardName}'");
-            return;
-        }
-        
-        // CRITICAL: Verhindere Hover während einer aktiven Drag-Operation
-        if (handController != null && handController.IsDragActive())
-        {
-            Debug.Log($"[CardUI] *** BLOCKING ONPOINTERENTER DURING DRAG *** Preventing OnPointerEnter on '{cardData?.cardName}' while another card is being dragged");
-            return;
-        }
-        
-        Debug.LogError($"[CardUI] *** ONPOINTERENTER ALLOWED *** Mouse hover on '{cardData?.cardName}'");
-        SetHovered(true);
-    }
-    
-    /// <summary>
-    /// Maus verlässt Karte (nur für Desktop)
-    /// </summary>
-    public void OnPointerExit(PointerEventData eventData)
-    {
-        // ENHANCED: Use global touch state for more robust blocking
-        if (HandController.IsGlobalTouchActive)
-        {
-            Debug.LogError($"[CardUI] *** BLOCKING ONPOINTEREXIT - GLOBAL TOUCH ACTIVE *** for '{cardData?.cardName}'");
-            return;
-        }
-        
-        // CRITICAL FIX: Block ALL OnPointerExit events when HandController is managing touch
-        if (handController != null && handController.IsTouchActive())
-        {
-            Debug.LogError($"[CardUI] *** BLOCKING ONPOINTEREXIT DURING TOUCH *** HandController is managing touch for '{cardData?.cardName}'");
-            return;
-        }
-        
-        // KRITISCH: Verhindere Phantom-Hover während Touch-Input
-        if (Input.touchCount > 0) 
-        {
-            Debug.LogError($"[CardUI] *** BLOCKING ONPOINTEREXIT *** Touch count: {Input.touchCount} for '{cardData?.cardName}'");
-            return;
-        }
-        
-        // Behalte Hover wenn wir draggen
-        if (isDragging) return;
-        
-        // CRITICAL: Verhindere Hover-Änderungen während einer aktiven Drag-Operation
-        if (handController != null && handController.IsDragActive())
-        {
-            Debug.Log($"[CardUI] *** BLOCKING ONPOINTEREXIT DURING DRAG *** Preventing OnPointerExit on '{cardData?.cardName}' while another card is being dragged");
-            return;
-        }
-        
-        Debug.LogError($"[CardUI] *** ONPOINTEREXIT ALLOWED *** Mouse exit on '{cardData?.cardName}'");
-        SetHovered(false);
-    }
-    
-    /// <summary>
-    /// Setzt den Hover-Status der Karte
-    /// </summary>
-    public void SetHovered(bool hovered)
-    {
-        // SCALING FIX: Don't process if being destroyed
-        if (!gameObject.activeInHierarchy) return;
-        
-        // REMOVED: Layout animation blocking was preventing touch hover from working
-        // The hover animation should be allowed even during layout animation
-        
-        // CRITICAL: Protection for ALL cards during initial setup
-        if (hovered && Time.time < 3f) // First 3 seconds after scene start
-        {
-            Debug.LogError($"[CardUI] *** BLOCKING STARTUP HOVER *** Preventing hover during initial setup for '{cardData?.cardName}' at SiblingIndex {transform.GetSiblingIndex()}! Time: {Time.time}");
-            return;
-        }
-        
-        // CRITICAL: Verhindere Hover während einer aktiven Drag-Operation
-        if (hovered && handController != null && handController.IsDragActive())
-        {
-            Debug.Log($"[CardUI] *** BLOCKING HOVER DURING DRAG *** Preventing hover on '{cardData?.cardName}' while another card is being dragged");
-            return;
-        }
-        
-        // CRITICAL FIX: Prevent unnecessary animation restarts
-        // If we're already hovered and trying to hover again, AND we have an active animation, skip
-        if (isHovered == hovered) 
-        {
-            if (hovered && activeTweenId >= 0)
-            {
-                Debug.LogError($"[CardUI] *** SKIPPING REDUNDANT HOVER *** Card {cardData?.cardName} already hovered with active animation (Tween ID: {activeTweenId})");
-                return; // Don't restart animation if already running
-            }
-            else if (!hovered)
-            {
-                return; // Skip false->false transitions
-            }
-            // Allow true->true if no active animation (animation might have been cancelled)
-        }
-        
-        Debug.LogError($"[CardUI] *** SETTING HOVERED STATE *** Card: {cardData?.cardName}, Old State: {isHovered}, New State: {hovered}");
-        isHovered = hovered;
-        
-        // HOVER SYSTEM DEAKTIVIERT - nur Border-Pulsation wird verwendet
-        // if (highlightEffect != null)
-        //     highlightEffect.SetActive(hovered);
-        
-        // CRITICAL FIX: Cancel any existing scale tween before starting new one
-        if (activeTweenId >= 0)
-        {
-            LeanTween.cancel(activeTweenId);
-            activeTweenId = -1;
-        }
-        
-        if (hovered)
-        {
-            // Speichere Original-Index für korrekte Wiederherstellung
-            originalSiblingIndex = transform.GetSiblingIndex();
-            
-            // Nach vorne bringen (für bessere Sichtbarkeit beim Hover)
-            Debug.LogError($"[CardUI] HOVER ENTER: {cardData?.cardName} SetAsLastSibling! Original: {originalSiblingIndex} -> New: will be highest");
-            transform.SetAsLastSibling();
-            int newSiblingIndex = transform.GetSiblingIndex();
-            Debug.LogError($"[CardUI] HOVER ENTER: {cardData?.cardName} now has SiblingIndex: {newSiblingIndex}");
-            
-            // CRITICAL: Track when Card 3 specifically gets promoted
-            if (cardData?.cardName == "Schwertschlag" && originalSiblingIndex == 3)
-            {
-                Debug.LogError($"[CardUI] *** CARD 3 PROMOTION DETECTED *** Schwertschlag moved from SiblingIndex 3 to {newSiblingIndex}!");
-                Debug.LogError($"[CardUI] Position: {transform.localPosition}, Scale: {transform.localScale}");
-            }
-            
-            // Hover-Animation
-            if (handController != null)
-            {
-                // CRITICAL FIX: Store base position if not set
-                if (!hasBasePosition)
-                {
-                    basePosition = transform.localPosition;
-                    hasBasePosition = true;
-                    Debug.Log($"[CardUI] Stored base position for {cardData?.cardName}: {basePosition}");
-                }
-                
-                float lift = handController.GetHoverLift();
-                // CRITICAL FIX: Use base position, not current position
-                Vector3 targetPos = basePosition;
-                targetPos.y += lift;
-                
-                // CRITICAL FIX: Cancel any existing animations before starting new ones
-                LeanTween.cancel(gameObject);
-                activeTweenId = -1;
-                
-                // SCALING FIX: Force immediate scale reset before animating
-                transform.localScale = Vector3.one;
-                
-                // CRITICAL DEBUG: Log animation start details
-                Debug.LogError($"[CardUI] *** STARTING HOVER ANIMATION *** Card: {cardData?.cardName}, BasePos: {basePosition}, TargetPos: {targetPos}, Lift: {lift}");
-                
-                // Start BOTH animations with the same timing to ensure they're synchronized
-                // Scale animation
-                activeTweenId = LeanTween.scale(gameObject, Vector3.one * 1.15f, hoverAnimDuration)
-                    .setEase(hoverEaseType)
-                    .setOnComplete(() => {
-                        activeTweenId = -1; // Clear ID when complete
-                        Debug.Log($"[CardUI] Hover scale animation complete for {cardData?.cardName}");
-                    }).id;
-                
-                // Position animation - use the same duration and easing
-                LeanTween.moveLocal(gameObject, targetPos, hoverAnimDuration)
-                    .setEase(hoverEaseType)
-                    .setOnComplete(() => {
-                        Debug.Log($"[CardUI] Hover position animation complete for {cardData?.cardName}, Final Pos: {transform.localPosition}");
-                    });
-                
-                Debug.Log($"[CardUI] Started hover animations for {cardData?.cardName} - Scale to 1.15, Move to {targetPos}");
-            }
-        }
-        else
-        {
-            // CRITICAL FIX: Cancel any existing animations before starting new ones
-            LeanTween.cancel(gameObject);
-            
-            // SCALING FIX: Return to normal scale with robust completion handling
-            activeTweenId = LeanTween.scale(gameObject, Vector3.one, hoverAnimDuration * 1.2f)
-                .setEase(hoverEaseType)
-                .setOnComplete(() => {
-                    // CRITICAL: Force scale to exactly 1
-                    transform.localScale = Vector3.one;
-                    activeTweenId = -1; // Clear ID
-                }).id;
-            
-            // CRITICAL FIX: Return to base position
-            if (hasBasePosition)
-            {
-                Debug.LogError($"[CardUI] HOVER EXIT: {cardData?.cardName} returning to basePosition: {basePosition} (current: {transform.localPosition})");
-                LeanTween.moveLocal(gameObject, basePosition, hoverAnimDuration)
-                    .setEase(hoverEaseType)
-                    .setOnComplete(() => {
-                        Debug.Log($"[CardUI] Hover exit complete for {cardData?.cardName}, Final Pos: {transform.localPosition}");
-                        // Don't reset base position flag - keep it for future hover operations
-                    });
-            }
-            else
-            {
-                // If no base position stored, log error but don't move
-                Debug.LogError($"[CardUI] HOVER EXIT ERROR: No base position stored for {cardData?.cardName}!");
-            }
-            
-            // Stelle Original-Index wieder her (KRITISCH für korrekte Reihenfolge)
-            if (!isDragging && originalSiblingIndex >= 0)
-            {
-                Debug.LogError($"[CardUI] HOVER EXIT: {cardData?.cardName} restoring SiblingIndex from {transform.GetSiblingIndex()} to {originalSiblingIndex}");
-                transform.SetSiblingIndex(originalSiblingIndex);
-                int finalSiblingIndex = transform.GetSiblingIndex();
-                Debug.LogError($"[CardUI] HOVER EXIT: {cardData?.cardName} final SiblingIndex: {finalSiblingIndex}");
-                
-                // CRITICAL: Track when Card 3 specifically gets restored (or fails to)
-                if (cardData?.cardName == "Schwertschlag" && originalSiblingIndex == 3)
-                {
-                    if (finalSiblingIndex != 3)
-                    {
-                        Debug.LogError($"[CardUI] *** CARD 3 RESTORATION FAILED *** Expected SiblingIndex 3, got {finalSiblingIndex}!");
-                    }
-                    else
-                    {
-                        Debug.LogError($"[CardUI] *** CARD 3 RESTORATION SUCCESS *** Correctly restored to SiblingIndex 3");
-                    }
-                }
-            }
-            else
-            {
-                Debug.LogError($"[CardUI] HOVER EXIT FAILED: {cardData?.cardName} could not restore SiblingIndex! isDragging={isDragging}, originalIndex={originalSiblingIndex}");
-                
-                // CRITICAL: Track Card 3 failures specifically
-                if (cardData?.cardName == "Schwertschlag")
-                {
-                    Debug.LogError($"[CardUI] *** CARD 3 HOVER EXIT FAILURE *** Cannot restore SiblingIndex!");
-                }
-            }
-            
-            // Layout-Update - simplified for compatibility
-            // Debug.Log($"[CardUI] Layout update needed after hover end"); // Removed to reduce log spam
-        }
-    }
-    
-    /// <summary>
-    /// Gibt die Kartendaten zurück
-    /// </summary>
-    public TimeCardData GetCardData()
-    {
-        return cardData;
-    }
-    
-    /// <summary>
-    /// Gibt zurück ob die Karte gerade gezogen wird (zentral oder legacy)
-    /// </summary>
-    public bool IsDragging()
-    {
-        return isDragging || isBeingDraggedCentrally;
-    }
-    
-    
-    /// <summary>
-    /// Wird vom HandController aufgerufen wenn ein Touch im gültigen Bereich beginnt
-    /// </summary>
-    public static void SetTouchStartedInHandArea(bool valid)
-    {
-        touchStartedInHandArea = valid;
-    }
-    
-    /// <summary>
-    /// Compatibility method for HandController
-    /// </summary>
-    public static void SetTouchStartedOnValidArea(bool valid)
-    {
-        touchStartedInHandArea = valid;
-        Debug.Log($"[CardUI] SetTouchStartedOnValidArea called with: {valid}");
-    }
-    
-    /// <summary>
-    /// Compatibility method for HandController
-    /// </summary>
-    public static void SetIsMouseInput(bool isUsingMouse)
-    {
-        // Static compatibility - not needed for this implementation
-    }
-    
-    /// <summary>
-    /// Compatibility method for HandController
-    /// </summary>
-    public void ForceEnterHover()
-    {
-        // SCALING FIX: Always ensure clean state before hover
-        if (activeTweenId >= 0)
-        {
-            LeanTween.cancel(activeTweenId);
-            activeTweenId = -1;
-        }
-        transform.localScale = Vector3.one;
-        
-        // CRITICAL FIX: Force immediate visual update
-        Canvas.ForceUpdateCanvases();
-        
-        SetHovered(true);
-        
-        // ADDITIONAL FIX: Force another canvas update after hover animation starts
-        StartCoroutine(ForceCanvasUpdateNextFrame());
-    }
-    
-    /// <summary>
-    /// Forces canvas update on the next frame to ensure visual changes are visible
-    /// </summary>
-    private System.Collections.IEnumerator ForceCanvasUpdateNextFrame()
-    {
-        yield return null; // Wait one frame
-        Canvas.ForceUpdateCanvases();
-    }
-    
-    /// <summary>
-    /// Compatibility method for HandController
-    /// </summary>
-    public void ForceExitHover()
-    {
-        // SCALING FIX: Force immediate scale normalization on exit
-        if (activeTweenId >= 0)
-        {
-            LeanTween.cancel(activeTweenId);
-            activeTweenId = -1;
-        }
-        SetHovered(false);
-    }
-    
-    /// <summary>
-    /// Compatibility method for HandController
-    /// </summary>
-    public void ForceDisableHover()
-    {
-        // CRITICAL: Cancel ALL tweens on this card, not just the active one
-        // This prevents hover-exit animations from overriding layout positions
-        LeanTween.cancel(gameObject);
-        activeTweenId = -1;
-        
-        // Force immediate scale reset
-        transform.localScale = Vector3.one;
-        
-        // CRITICAL: Restore position to base position if we have one
-        if (hasBasePosition)
-        {
-            transform.localPosition = basePosition;
-            // Debug.Log($"[CardUI] ForceDisableHover restored position for {cardData?.cardName}: {basePosition}"); // REDUCED LOGGING
-        }
-        
-        // CRITICAL: Restore SiblingIndex if we were hovering
-        if (isHovered && originalSiblingIndex >= 0)
-        {
-            transform.SetSiblingIndex(originalSiblingIndex);
-            Debug.Log($"[CardUI] ForceDisableHover restored SiblingIndex for {cardData?.cardName}: {originalSiblingIndex}");
-            originalSiblingIndex = -1; // Reset to prevent double-restoration
-        }
-        
-        // Force hover state to false
-        isHovered = false;
-        if (highlightEffect != null)
-            highlightEffect.SetActive(false);
-    }
-    
-    /// <summary>
-    /// Compatibility method for HandController
-    /// </summary>
-    public void EnableHover()
-    {
-        // Allow hover again - simplified implementation
-    }
-    
-    /// <summary>
-    /// Compatibility method for HandController
-    /// </summary>
-    public void SetOriginalRotation(float rotation)
-    {
-        // Store original rotation - simplified implementation
-    }
-    
-    /// <summary>
-    /// Sets whether the card is currently in a layout animation
-    /// </summary>
-    public void SetInLayoutAnimation(bool inAnimation)
-    {
-        isInLayoutAnimation = inAnimation;
-        
-        // CRITICAL FIX: Don't reset scale if card is hovered or being dragged
-        // Only fix scale for cards that should be at normal scale
-        if (!inAnimation && Mathf.Abs(transform.localScale.x - 1f) > 0.01f)
-        {
-            if (isHovered || isDragging || isBeingDraggedCentrally || activeTweenId >= 0)
-            {
-                Debug.Log($"[CardUI] Skipping scale fix for {cardData?.cardName} - hovered:{isHovered}, dragging:{isDragging}, activeTween:{activeTweenId}");
-            }
-            else
-            {
-                Debug.LogWarning($"[CardUI] Scale incorrect after layout animation: {transform.localScale}. Fixing...");
-                transform.localScale = Vector3.one;
-            }
         }
     }
     
     void Update()
     {
-        // Spielbarkeit regelmäßig prüfen
         CheckPlayability();
         
-        // SCALING FIX: Safety check to prevent stuck scales
-        if (!isHovered && !isDragging && !isBeingDraggedCentrally)
+        // Safety check for stuck scales
+        if (currentHoverState == HoverState.None && !isDragging && !isBeingDraggedCentrally)
         {
-            // If we're not in any special state but scale is wrong, fix it
             if (Mathf.Abs(transform.localScale.x - 1f) > 0.01f)
             {
-                // Silently fix the scale without spamming the log
                 transform.localScale = Vector3.one;
             }
         }
     }
     
-    // ===== NEUES ZENTRALISIERTES DRAG-SYSTEM =====
-    // Drag-Events werden jetzt vom HandController verwaltet!
+    // ===== DRAG SYSTEM INTEGRATION =====
     
-    /// <summary>
-    /// NEUE METHODE: Wird vom HandController aufgerufen wenn zentraler Drag startet
-    /// </summary>
     public void OnCentralDragStart()
     {
         if (!isPlayable) return;
@@ -1085,27 +1029,19 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
         isBeingDraggedCentrally = true;
         isDragging = true;
         
-        // Speichere ursprüngliche Werte
-        originalPosition = transform.localPosition;
-        originalRotation = transform.localEulerAngles;
         originalScale = transform.localScale;
         
-        Debug.Log($"[CardUI] *** CENTRAL DRAG START *** for {cardData?.cardName}");
+        Debug.Log($"[CardUI] Central drag start for {cardData?.cardName}");
         
-        // Canvas Group für Raycast-Blocking
         canvasGroup = GetComponent<CanvasGroup>();
         if (canvasGroup == null)
             canvasGroup = gameObject.AddComponent<CanvasGroup>();
         
         canvasGroup.blocksRaycasts = false;
         
-        // Visueller Start-Effekt
-        LeanTween.scale(gameObject, Vector3.one * 1.1f, dragAnimDuration).setEase(dragEaseType);
+        LeanTween.scale(gameObject, Vector3.one * 1.1f, 0.08f).setEase(LeanTweenType.easeOutExpo);
     }
     
-    /// <summary>
-    /// NEUE METHODE: Wird vom HandController aufgerufen wenn zentraler Drag endet
-    /// </summary>
     public void OnCentralDragEnd()
     {
         if (!isBeingDraggedCentrally) return;
@@ -1113,103 +1049,76 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
         isBeingDraggedCentrally = false;
         isDragging = false;
         
-        Debug.Log($"[CardUI] *** CENTRAL DRAG END *** for {cardData?.cardName}");
+        Debug.Log($"[CardUI] Central drag end for {cardData?.cardName}");
         
-        // SCALING FIX: Cancel any active tweens before starting new ones
-        if (activeTweenId >= 0)
-        {
-            LeanTween.cancel(activeTweenId);
-            activeTweenId = -1;
-        }
-        LeanTween.cancel(gameObject);
+        CancelAllAnimations();
         
-        // Position
-        LeanTween.moveLocal(gameObject, originalPosition, returnAnimDuration)
-            .setEase(returnEaseType);
+        LeanTween.moveLocal(gameObject, layoutTargetPosition, 0.25f)
+            .setEase(LeanTweenType.easeOutBack);
         
-        // Rotation
-        LeanTween.rotateLocal(gameObject, originalRotation, returnAnimDuration)
-            .setEase(returnEaseType);
+        LeanTween.rotateLocal(gameObject, Vector3.zero, 0.25f)
+            .setEase(LeanTweenType.easeOutBack);
         
-        // Skalierung - CRITICAL: Ensure we return to exactly 1.0 scale
-        LeanTween.scale(gameObject, Vector3.one, returnAnimDuration * 0.7f)
+        LeanTween.scale(gameObject, Vector3.one, 0.175f)
             .setEase(hoverEaseType)
             .setOnComplete(() => {
-                // SCALING FIX: Force exact scale after animation
                 transform.localScale = Vector3.one;
             });
         
-        // Stelle sicher dass Raycasts wieder funktionieren
         if (canvasGroup != null)
         {
             canvasGroup.blocksRaycasts = true;
         }
         
-        // Hover zurücksetzen
         SetHovered(false);
     }
     
-    /// <summary>
-    /// Updates the base position after layout changes
-    /// </summary>
+    // ===== HELPER METHODS =====
+    
+    public TimeCardData GetCardData() { return cardData; }
+    public bool IsDragging() { return isDragging || isBeingDraggedCentrally; }
+    public bool IsHovering() { return currentHoverState == HoverState.Hovered || currentHoverState == HoverState.EnteringHover; }
+    public bool IsInHoverAnimation() { return isAnimating; }
+    public bool IsBeingDraggedCentrally() { return isBeingDraggedCentrally; }
+    
+    public void SetInLayoutAnimation(bool inAnimation)
+    {
+        // This can be used to prevent hover during layout animations if needed
+    }
+    
+    public void EnableHover()
+    {
+        // Re-enable hover after drag operations
+    }
+    
+    public void SetOriginalRotation(float rotation)
+    {
+        // Store original rotation if needed
+    }
+    
     public void UpdateBasePosition(Vector3 newPosition)
     {
-        // CRITICAL FIX: Don't update base position if card is hovered
-        // This prevents storing the lifted position as the base
-        if (isHovered)
-        {
-            Debug.Log($"[CardUI] Skipping base position update for {cardData?.cardName} - card is hovered");
-            return;
-        }
-        
-        basePosition = newPosition;
-        hasBasePosition = true;
-        // If not hovered, ensure we're at base position
-        if (!isHovered && !isDragging)
-        {
-            transform.localPosition = basePosition;
-        }
+        // This is now handled by UpdateLayoutTargetPosition
+        UpdateLayoutTargetPosition(newPosition, 0.2f, false);
     }
     
-    // ===== 🚫 LEGACY DRAG-EVENTS (ENTFERNT/IGNORIERT) 🚫 =====
-    // 
-    // WARUM ENTFERNT?
-    // Unity's Drag-Events werden immer an die Karte gesendet, wo der Touch BEGANN.
-    // Wenn der Finger sich zu einer anderen Karte bewegt, bekommt immer noch die 
-    // ursprüngliche Karte die Events → falsche Karte wird gedraggt!
-    // 
-    // BEISPIEL DES PROBLEMS:
-    // 1. Touch auf Karte A (Schildschlag)
-    // 2. Finger zu Karte B (Schwertschlag) 
-    // 3. Drag nach oben
-    // 4. Unity sendet OnDrag an Karte A → Schildschlag wird visuell gedraggt
-    // 5. Aber Spieler wollte Schwertschlag draggen → Verwirrend!
-    //
-    // LÖSUNG: 
-    // Interfaces IBeginDragHandler/IDragHandler/IEndDragHandler wurden aus der
-    // Klassen-Deklaration entfernt. Diese Methoden existieren nur noch als
-    // Dokumentation und werden nie aufgerufen.
-    
-    // Diese Methoden werden NICHT MEHR AUFGERUFEN da Interfaces entfernt:
-    // public void OnBeginDrag() → DEAD CODE
-    // public void OnDrag()      → DEAD CODE  
-    // public void OnEndDrag()   → DEAD CODE
-    
-    /// <summary>
-    /// VEREINFACHT: Gibt zurück ob die Karte gerade zentral gedraggt wird
-    /// </summary>
-    public bool IsBeingDraggedCentrally()
+    public static void SetTouchStartedInHandArea(bool valid)
     {
-        return isBeingDraggedCentrally;
+        touchStartedInHandArea = valid;
     }
     
-    /// <summary>
-    /// VEREINFACHT: Legacy-Methode für Kompatibilität
-    /// </summary>
-    private void PlayCard()
+    public static void SetTouchStartedOnValidArea(bool valid)
     {
-        // Diese Methode sollte nicht mehr direkt aufgerufen werden
-        // Alle Karten-Spiele werden jetzt über den HandController verwaltet
-        Debug.LogWarning($"[CardUI] PlayCard() called directly - should use HandController instead for {cardData?.cardName}");
+        touchStartedInHandArea = valid;
+    }
+    
+    public static void SetIsMouseInput(bool isUsingMouse)
+    {
+        // Static compatibility
+    }
+    
+    public static bool IsMouseInput()
+    {
+        return Input.mousePresent && Input.touchCount == 0;
     }
 }
