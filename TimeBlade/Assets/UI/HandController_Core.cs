@@ -30,15 +30,24 @@ public partial class HandController : MonoBehaviour
     [SerializeField] private LeanTweenType fanEaseType = LeanTweenType.easeOutExpo;
     // [SerializeField] private float touchAreaExtension = 50f; // Nicht mehr verwendet
     
-    [Header("Arc Movement Settings")]
-    // [Tooltip("Radius des unsichtbaren Kreises für die Bogenbewegung")]
-    // [SerializeField] private float arcRadius = 600f; // Nicht mehr verwendet - feste Werte in Utils
-    // [Tooltip("Winkelabstand zwischen Karten auf dem Bogen (in Radians)")]
-    // [SerializeField] private float arcAngleSpacing = 0.2f; // Nicht mehr verwendet - feste Winkel in Utils
-    // [Tooltip("Maximale Rotation des gesamten Bogens beim Parallax")]
-    // [SerializeField] private float arcMaxRotation = 0.3f; // Nicht mehr verwendet - feste Werte in Utils
-    // [Tooltip("Y-Achsen Skalierung für flacheren Bogen")]
-    // [SerializeField] private float arcYScale = 0.3f; // Nicht mehr verwendet - feste Werte in Utils
+    [Header("Arc Layout Settings")]
+    [Tooltip("Basishöhe des Bogens für normale Ansicht")]
+    [SerializeField] private float baseArcHeight = 30f;
+    
+    [Tooltip("Basishöhe des Bogens für gefächerte Ansicht")]
+    [SerializeField] private float baseArcHeightFanned = 35f;
+    
+    [Tooltip("Maximale Rotation der Karten in Grad")]
+    [SerializeField] private float maxCardRotation = 14f;
+    
+    [Tooltip("Skalierungsfaktor für die Breite des Bogens (normal)")]
+    [SerializeField] private float arcSpanMultiplierNormal = 0.6f;
+    
+    [Tooltip("Skalierungsfaktor für die Breite des Bogens (gefächert)")]
+    [SerializeField] private float arcSpanMultiplierFanned = 0.8f;
+    
+    [Tooltip("Dynamische Anpassung der Bogenhöhe basierend auf Kartenanzahl")]
+    [SerializeField] private bool dynamicArcHeight = true;
     
     [Header("Canvas-Einstellungen")]
     [SerializeField] private Canvas parentCanvas;

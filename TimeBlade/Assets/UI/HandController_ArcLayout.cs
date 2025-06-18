@@ -101,13 +101,20 @@ public partial class HandController : MonoBehaviour
             // So folgen die Karten dem Bogen auch beim Parallax-Movement
             
             // Erweitere den Bereich für den Bogen, damit er natürlicher aussieht
-            // Verwende unterschiedliche Spans für gefächert und normal
-            float spanMultiplier = isFanned ? 0.8f : 0.6f; // Kleinerer Bereich wenn nicht gefächert
+            // Verwende unterschiedliche Spans für gefächert und normal basierend auf Inspector-Einstellungen
+            float spanMultiplier = isFanned ? arcSpanMultiplierFanned : arcSpanMultiplierNormal;
             float arcSpan = (cardCount - 1) * spacing * spanMultiplier;
             float normalizedX = arcSpan > 0 ? x / arcSpan : 0f;
             
-            // Vertikale Position - verwende eine sanftere Kurve
-            float arcHeight = isFanned ? 35f : 30f; // Etwas höher wenn gefächert
+            // Vertikale Position - verwende die konfigurierbaren Höhenparameter
+            float arcHeight = isFanned ? baseArcHeightFanned : baseArcHeight;
+            
+            // Dynamische Anpassung der Bogenhöhe basierend auf Kartenanzahl, wenn aktiviert
+            if (dynamicArcHeight && cardCount > 5)
+            {
+                float cardCountFactor = Mathf.Min(1f + (cardCount - 5) * 0.1f, 1.5f);
+                arcHeight *= cardCountFactor;
+            }
             
             // PARABEL: Verwende normalizedX direkt für konsistenten Bogen
             // Die Parabel sollte bei -1 und 1 am tiefsten Punkt sein
@@ -125,11 +132,16 @@ public partial class HandController : MonoBehaviour
                 Debug.Log($"[HandController] Card {i} at extreme position: x={x:F2}, normalizedX={normalizedX:F2}, y={y:F2}");
             }
             
-            // Rotation folgt auch der X-Position für konsistente Bogen-Bewegung
+            // Rotation folgt der X-Position für konsistente Bogen-Bewegung
             // Begrenze die Rotation auf den sichtbaren Bereich
             float rotationNormalized = Mathf.Clamp(normalizedX, -1f, 1f);
-            float angleInDegrees = rotationNormalized * 20f; // Direkte Skalierung für intuitivere Rotation
-            float rotation = -angleInDegrees * 0.7f;
+            
+            // Verwende den konfigurierbaren Parameter für die maximale Rotation
+            float angleInDegrees = rotationNormalized * maxCardRotation;
+            
+            // Invertiere die Rotation, damit die Karten zum Mittelpunkt des Bogens zeigen
+            // Skalierungsfaktor entfernt, da wir jetzt direkt die maximale Rotation konfigurieren können
+            float rotation = -angleInDegrees;
             
             targetPosition = new Vector3(x, y, 0);
             targetRotation = rotation;

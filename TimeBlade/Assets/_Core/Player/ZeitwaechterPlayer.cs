@@ -26,8 +26,12 @@ public class ZeitwaechterPlayer : MonoBehaviour
     [SerializeField] private Transform handTransform; // Container für Handkarten
     [SerializeField] private GameObject cardPrefab; // Karten-UI-Prefab
     
-    private const int MAX_HAND_SIZE = 5;
-    private const int INITIAL_DRAW = 5;
+    [Header("Karten-System")]
+    [Tooltip("Maximale Anzahl Karten, die gleichzeitig auf der Hand sein können")]
+    [SerializeField] private int maxHandSize = 5;
+    
+    [Tooltip("Anzahl der Karten, die zu Beginn eines Kampfes gezogen werden")]
+    [SerializeField] private int initialDrawCount = 5; // Anzahl Startkarten
     
     // Block-System
     private bool isBlocking = false;
@@ -129,7 +133,7 @@ public class ZeitwaechterPlayer : MonoBehaviour
         ShuffleDeck();
         
         // Starthand ziehen mit normaler DrawCard Methode
-        for (int i = 0; i < INITIAL_DRAW; i++)
+        for (int i = 0; i < initialDrawCount; i++)
         {
             DrawCard();
         }
@@ -142,7 +146,7 @@ public class ZeitwaechterPlayer : MonoBehaviour
     /// </summary>
     public TimeCardData DrawCard()
     {
-        if (hand.Count >= MAX_HAND_SIZE)
+        if (hand.Count >= maxHandSize)
         {
             Debug.LogWarning("[Zeitwächter] Hand ist voll!");
             return null;
@@ -184,7 +188,7 @@ public class ZeitwaechterPlayer : MonoBehaviour
     /// </summary>
     private TimeCardData DrawCardSilent()
     {
-        if (hand.Count >= MAX_HAND_SIZE)
+        if (hand.Count >= maxHandSize)
         {
             Debug.LogWarning("[Zeitwächter] Hand ist voll!");
             return null;
