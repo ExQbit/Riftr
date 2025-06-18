@@ -346,7 +346,7 @@ public partial class HandController : MonoBehaviour
     private void UpdateParallaxHandShift(Vector2 position)
     {
         // CRITICAL DEBUG - Always log this
-        Debug.Log($"[PARALLAX] UpdateParallaxHandShift called! pos: {position}, isFanned: {isFanned}, currentOffset: {currentHandOffset:F1}");
+        // Debug.Log($"[PARALLAX] UpdateParallaxHandShift called! pos: {position}, isFanned: {isFanned}, currentOffset: {currentHandOffset:F1}");
         
         if (!isFanned) 
         {
@@ -371,7 +371,7 @@ public partial class HandController : MonoBehaviour
         
         // CRITICAL FIX: Nur bei signifikanter Änderung updaten
         float offsetDifference = Mathf.Abs(targetOffset - currentHandOffset);
-        if (offsetDifference < 5f) // Weniger als 5 Pixel Unterschied
+        if (offsetDifference < 0.5f) // Ultra-feine Schwelle für maximale Smoothness
         {
             return; // Keine Änderung nötig
         }
@@ -384,7 +384,7 @@ public partial class HandController : MonoBehaviour
         UpdateParallaxOffsetOnly();
         
         // CRITICAL DEBUG - Always log this
-        Debug.Log($"[PARALLAX] Offset updated to {currentHandOffset:F1} (finger moved {fingerMovement:F1}px)");
+        // Debug.Log($"[PARALLAX] Offset updated to {currentHandOffset:F1} (finger moved {fingerMovement:F1}px)");
         
         // Nur bei größeren Bewegungen loggen (deaktiviert)
         // if (logParallaxDetails && Mathf.Abs(fingerMovement) > 10f)
@@ -410,7 +410,8 @@ public partial class HandController : MonoBehaviour
             }
         }
         
-        Debug.Log($"[HandController] NotifyLastHoveredCardChanged - all cards informed that lastHovered is now: '{lastHoveredName}'");
+        // Performance: Log auskommentiert
+        // Debug.Log($"[HandController] NotifyLastHoveredCardChanged - all cards informed that lastHovered is now: '{lastHoveredName}'");
     }
     
     private void AnimateHandToCenter()
@@ -586,7 +587,7 @@ public partial class HandController : MonoBehaviour
         int cardCount = activeCardUIs.Count;
         
         // CRITICAL DEBUG - Always log this  
-        Debug.Log($"[PARALLAX] UpdateParallaxOffsetOnly - offset: {effectiveParallaxOffset:F1}, cards: {cardCount}");
+        // Debug.Log($"[PARALLAX] UpdateParallaxOffsetOnly - offset: {effectiveParallaxOffset:F1}, cards: {cardCount}");
         
         // EINFACHE KREISBOGEN-BERECHNUNG (gleich wie in UpdateCardLayoutArc)
         float circleRadius = arcRadius;
@@ -615,33 +616,46 @@ public partial class HandController : MonoBehaviour
             float currentAngle = startAngle + (virtualIndex * angleStep);
             float angleInRadians = currentAngle * Mathf.Deg2Rad;
             
-            // EINFACHE KREIS-POSITION auf festem Bogen
+            // KREISBOGEN-POSITION mit Parallax
             float x = Mathf.Cos(angleInRadians) * circleRadius;
-            float y = Mathf.Sin(angleInRadians) * circleRadius - circleRadius + arcYOffset; // Oberer Teil des Kreises mit Offset
+            float y = Mathf.Sin(angleInRadians) * circleRadius - circleRadius + arcYOffset;
+            
+            // PERSPEKTIVE: Karten in der Mitte sind etwas höher
+            float distanceFromCenter = Mathf.Abs(virtualIndex - (cardCount - 1) * 0.5f);
+            float perspectiveY = (1f - (distanceFromCenter / (cardCount * 0.5f))) * 10f;
+            y += perspectiveY;
             
             Vector3 targetPosition = new Vector3(x, y, 0);
             
-            // Rotation basiert auf virtueller Position
-            float targetRotation = currentAngle - 90f;
+            // WICHTIG: Rotation MUSS sich mit der Position ändern!
+            // Karten zeigen IMMER zum Kreismittelpunkt (0, -circleRadius + arcYOffset)
+            float targetRotation = currentAngle - 90f; // Radiale Ausrichtung folgt der Position
             
-            // Debug für extreme Positionen
-            if (Mathf.Abs(effectiveParallaxOffset) > 200f && (i == 0 || i == cardCount - 1))
+            // Update Karte mit Position UND Rotation für echte Kreisbahn-Bewegung
+            RectTransform cardRect = card.GetComponent<RectTransform>();
+            if (cardRect != null)
             {
-                Debug.Log($"[PARALLAX DEBUG] Card {i}: virtualIndex={virtualIndex:F1}, angle={currentAngle:F1}°, pos=({x:F0}, {y:F0})");
+                // Setze Position UND Rotation für korrekte Kreisbahn
+                // KEIN Hover-Offset mehr - nur Scale-Animation!
+                cardRect.localPosition = targetPosition;
+                cardRect.localRotation = Quaternion.Euler(0, 0, targetRotation);
+                
+                // Debug für Kreisbahn-Bewegung
+                if (logCardPositions && Mathf.Abs(effectiveParallaxOffset) > 50f)
+                {
+                    Debug.Log($"[PARALLAX CIRCULAR] Card {i}: angle={currentAngle:F1}°, rotation={targetRotation:F1}°, pos=({targetPosition.x:F0}, {targetPosition.y:F0}), virtualIndex={virtualIndex:F2}");
+                }
             }
             
-            // Update die Karte mit der vollen Arc-Position
-            cardUI.UpdateParallaxPositionWithArc(targetPosition, 0.05f);
-            
-            // Rotation nur für nicht-hovering Karten setzen
-            if (!cardUI.IsHovering() && !cardUI.IsInHoverAnimation())
-            {
-                cardUI.transform.localEulerAngles = new Vector3(0, 0, targetRotation);
-            }
+            // CardUI braucht kein Update, da wir die Position direkt setzen
         }
         
-        // Force Canvas update damit Collider mit visuellen Positionen übereinstimmen
-        Canvas.ForceUpdateCanvases();
+        // Canvas update entfernt - Unity's automatisches Update reicht aus
+        // Nur bei extremen Offsets für Collider-Sync
+        if (Mathf.Abs(effectiveParallaxOffset) > 300f)
+        {
+            Canvas.ForceUpdateCanvases();
+        }
     }
     
     private float CalculateTotalHandWidth()

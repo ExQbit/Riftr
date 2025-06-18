@@ -56,11 +56,11 @@ public partial class HandController : MonoBehaviour
         float totalArcAngle = isFanned ? arcAngleFanned : arcAngleNormal;
         float startAngle = 90f - (totalArcAngle / 2f); // Startwinkel (90° = oben, minus halber Bogen)
         
-        // Debug für Fanning
-        if (isFromCardCreation || forceImmediate)
-        {
-            Debug.Log($"[ARC LAYOUT] Cards: {cardCount}, isFanned: {isFanned}, totalAngle: {totalArcAngle}°, parallaxOffset: {effectiveParallaxOffset:F1}");
-        }
+        // Debug für Fanning (deaktiviert für Performance)
+        // if (isFromCardCreation || forceImmediate)
+        // {
+        //     Debug.Log($"[ARC LAYOUT] Cards: {cardCount}, isFanned: {isFanned}, totalAngle: {totalArcAngle}°, parallaxOffset: {effectiveParallaxOffset:F1}");
+        // }
         
         // Layout jede Karte
         for (int i = 0; i < cardCount; i++)
@@ -96,32 +96,51 @@ public partial class HandController : MonoBehaviour
                 float indexShift = effectiveParallaxOffset / cardWidth;
                 virtualIndex = i - indexShift; // Negative shift = Karten nach rechts
                 
-                // Debug für alle Karten bei großem Offset
-                if (Mathf.Abs(effectiveParallaxOffset) > 10f)
-                {
-                    Debug.Log($"[ARC] Card {i}: virtualIndex={virtualIndex:F2}, shift={indexShift:F2}, offset={effectiveParallaxOffset:F1}");
-                }
+                // Debug für alle Karten bei großem Offset (deaktiviert für Performance)
+                // if (Mathf.Abs(effectiveParallaxOffset) > 10f)
+                // {
+                //     Debug.Log($"[ARC] Card {i}: virtualIndex={virtualIndex:F2}, shift={indexShift:F2}, offset={effectiveParallaxOffset:F1}");
+                // }
             }
             
-            // Berechne Winkel basierend auf virtueller Position
-            float virtualAngle = startAngle + (virtualIndex * angleStep);
+            // Berechne BEIDE Winkel - real für Layout, virtual für Parallax-Position
+            float realAngle = startAngle + (i * angleStep); // Echter Index ohne Parallax
+            float virtualAngle = startAngle + (virtualIndex * angleStep); // Mit Parallax-Verschiebung
+            
+            // WICHTIG: Für echte Kreisbahn-Bewegung beim Parallax:
+            // Die Karten müssen sich AUF DEM KREISBOGEN bewegen, nicht linear!
             float angleInRadians = virtualAngle * Mathf.Deg2Rad;
             
-            // EINFACHE KREIS-POSITION
+            // KREISBOGEN-POSITION mit Parallax
             // Der Kreis liegt unterhalb bei (0, -circleRadius)
-            // Wir wollen den oberen Teil des Kreises verwenden
+            // Karten bewegen sich auf diesem Kreisbogen
             float x = Mathf.Cos(angleInRadians) * circleRadius;
-            float y = Mathf.Sin(angleInRadians) * circleRadius - circleRadius + arcYOffset; // Y-Offset nach unten + Verschiebung nach oben
+            float y = Mathf.Sin(angleInRadians) * circleRadius - circleRadius + arcYOffset;
             
-            // Karten-Rotation folgt der Tangente des Kreises
-            float targetRotation = virtualAngle - 90f; // Tangente für oberen Kreisbogen
+            // PERSPEKTIVE: Karten in der Mitte sind etwas höher (näher)
+            // Dies verstärkt den 3D-Effekt des Kreisbogens
+            float distanceFromCenter = Mathf.Abs(virtualIndex - (cardCount - 1) * 0.5f);
+            float perspectiveY = (1f - (distanceFromCenter / (cardCount * 0.5f))) * 10f; // Max 10 Pixel höher in der Mitte
+            y += perspectiveY;
+            
+            // RADIALE ROTATION - Karten zeigen IMMER zum Kreismittelpunkt
+            // Die Rotation folgt der POSITION auf dem Kreisbogen
+            float targetRotation = virtualAngle - 90f; // Rotation passt sich der Kreisposition an
             
             Vector3 targetPosition = new Vector3(x, y, 0);
+            // KEIN Hover-Offset mehr - nur Scale für stabiles Hover!
             
-            // Debug-Ausgabe
-            if (logCardPositions && (i == 0 || i == cardCount - 1))
+            // Debug-Ausgabe für Kreisbahn-Visualisierung
+            if (logCardPositions && (i == 0 || i == cardCount - 1 || Mathf.Abs(effectiveParallaxOffset) > 50f))
             {
-                Debug.Log($"[HandController] Card {i}: angle={currentAngle:F1}°, pos=({x:F0}, {y:F0})");
+                Debug.Log($"[ARC LAYOUT] Card {i}: realAngle={realAngle:F1}°, virtualAngle={virtualAngle:F1}°, rotation={targetRotation:F1}°, pos=({x:F0}, {y:F0}), parallax={effectiveParallaxOffset:F0}");
+                
+                // Zeige Kreismittelpunkt für Debug
+                if (i == 0)
+                {
+                    Vector3 circleCenter = new Vector3(0, -circleRadius + arcYOffset, 0);
+                    Debug.Log($"[CIRCLE CENTER] Position: {circleCenter}, Radius: {circleRadius}");
+                }
             }
             
             // CRITICAL FIX: Setze Sibling Index nur für nicht-gehoverte Karten
@@ -136,6 +155,11 @@ public partial class HandController : MonoBehaviour
             if (cardUI != null)
             {
                 cardUI.SetOriginalRotation(targetRotation);
+                // DEBUG: Verifikation der Original-Rotation
+                if (logCardPositions && (i == 0 || i == cardCount - 1))
+                {
+                    Debug.Log($"[ORIGINAL ROTATION] Card {i}: setting originalRotation to {targetRotation:F1}° (realAngle={realAngle:F1}°)");
+                }
             }
             
             Vector3 targetRotationVector = new Vector3(0, 0, targetRotation);
@@ -156,8 +180,24 @@ public partial class HandController : MonoBehaviour
                     {
                         // Nur nicht-hovering Karten updaten
                         cardRect.localPosition = targetPosition;
-                        cardRect.localEulerAngles = targetRotationVector;
-                        cardUI.UpdateLayoutTargetPosition(targetPosition, 0f, true);
+                        cardRect.localRotation = Quaternion.Euler(0, 0, targetRotation);
+                        cardUI.UpdateLayoutTargetPosition(targetPosition, targetRotation, true);
+                        
+                        // DEBUG: Überprüfe ob Rotation korrekt gesetzt wurde
+                        // ERWEITERTE DEBUG-AUSGABE für Rotation
+                        if (isFanned && Mathf.Abs(effectiveParallaxOffset) > 50f) // Niedrigerer Threshold
+                        {
+                        float actualRotation = cardRect.localRotation.eulerAngles.z;
+                            float rotationDiff = Mathf.Abs(targetRotation - actualRotation);
+                        if (rotationDiff > 1f) // Warnung bei Abweichung
+                        {
+                            Debug.LogWarning($"[ROTATION MISMATCH] Card {i}: target={targetRotation:F1}°, actual={actualRotation:F1}°, diff={rotationDiff:F1}°, realAngle={realAngle:F1}°, virtualAngle={virtualAngle:F1}°");
+                        }
+                        else if (i == 0 || i == cardCount - 1)
+                        {
+                            Debug.Log($"[ROTATION OK] Card {i}: rotation={actualRotation:F1}° (target={targetRotation:F1}°), realAngle={realAngle:F1}°");
+                        }
+                    }
                     }
                 }
             }
@@ -180,20 +220,26 @@ public partial class HandController : MonoBehaviour
                 // Update layout target position nur für nicht-hovering Karten
                 if (cardUI != null)
                 {
-                    cardUI.UpdateLayoutTargetPosition(targetPosition, duration, false);
+                    cardUI.UpdateLayoutTargetPosition(targetPosition, targetRotation, duration, false);
                 }
                 
                 // Position Animation
-                LeanTween.moveLocal(card, targetPosition, duration).setEase(easing);
-                
-                // Rotation Animation
-                LeanTween.rotateLocal(card, targetRotationVector, duration).setEase(easing)
+                LeanTween.moveLocal(card, targetPosition, duration).setEase(easing)
                     .setOnComplete(() => {
                         if (cardUI != null)
                         {
                             cardUI.SetInLayoutAnimation(false);
                         }
                     });
+                
+                // Rotation Animation
+                LeanTween.rotateLocal(card, targetRotationVector, duration).setEase(easing);
+                
+                // DEBUG: Verifiziere animierte Rotation
+                if (logCardPositions && isFanned && (i == 0 || i == cardCount - 1))
+                {
+                    Debug.Log($"[ANIM ROTATION] Card {i}: animating to rotation {targetRotation:F1}° (realAngle={realAngle:F1}°)");
+                }
             }
         }
         

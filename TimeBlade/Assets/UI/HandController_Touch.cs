@@ -32,22 +32,26 @@ public partial class HandController : MonoBehaviour
                 HandleTouchEnd();
             }
         }
-        // Mouse (für Editor-Testing)
-        else
+        // Mouse (für Editor-Testing) - ABER NUR FÜR DRAG, NICHT FÜR HOVER!
+        else if (Input.GetMouseButtonDown(0))
         {
-            if (Input.GetMouseButtonDown(0))
+            // Check if mouse is over a card when clicking
+            CardUI clickedCard = GetCardAtPosition(Input.mousePosition);
+            if (clickedCard != null)
             {
+                // Only start touch/fan if we clicked on a card with intent to drag
+                // Don't start for simple hover movements
                 CardUI.SetIsMouseInput(true);
                 HandleTouchStart(Input.mousePosition);
             }
-            else if (Input.GetMouseButton(0) && isTouching && !isPlayingCard)
-            {
-                HandleTouchMove(Input.mousePosition);
-            }
-            else if (Input.GetMouseButtonUp(0))
-            {
-                HandleTouchEnd();
-            }
+        }
+        else if (Input.GetMouseButton(0) && isTouching && !isPlayingCard)
+        {
+            HandleTouchMove(Input.mousePosition);
+        }
+        else if (Input.GetMouseButtonUp(0) && isTouching)
+        {
+            HandleTouchEnd();
         }
     }
     
@@ -616,7 +620,8 @@ public partial class HandController : MonoBehaviour
                 if (isTouching && !isPlayingCard)
                 {
                     lastHoveredCard = hoveredCard;
-                    Debug.Log($"[HandController] *** LAST HOVERED UPDATED *** Set lastHoveredCard to: '{lastHoveredCard.GetCardData()?.cardName}'");
+                    // Performance: Log auskommentiert
+                    // Debug.Log($"[HandController] *** LAST HOVERED UPDATED *** Set lastHoveredCard to: '{lastHoveredCard.GetCardData()?.cardName}'");
                     NotifyLastHoveredCardChanged();
                 }
                 else
@@ -630,7 +635,8 @@ public partial class HandController : MonoBehaviour
             string previousName = previousHovered != null ? previousHovered.GetCardData()?.cardName ?? "NULL" : "none";
             string newName = hoveredCard != null ? hoveredCard.GetCardData()?.cardName ?? "NULL" : "none";
             string lastHoveredName = lastHoveredCard != null ? lastHoveredCard.GetCardData()?.cardName ?? "NULL" : "none";
-            Debug.Log($"[HandController] *** FINGER TRACKING *** Finger moved from '{previousName}' to '{newName}' (lastHovered: '{lastHoveredName}') at {screenPosition}");
+            // Performance: Finger tracking auskommentiert
+            // Debug.Log($"[HandController] *** FINGER TRACKING *** Finger moved from '{previousName}' to '{newName}' (lastHovered: '{lastHoveredName}') at {screenPosition}");
             
             if (initialHoveredCard == null && hoveredCard != null && !hasChangedCards)
             {
@@ -647,7 +653,8 @@ public partial class HandController : MonoBehaviour
                     
                     int initialIndex = activeCardUIs.IndexOf(initialHoveredCard.gameObject);
                     int currentIndex = activeCardUIs.IndexOf(hoveredCard.gameObject);
-                    Debug.Log($"[HandController] Card drift detected '{initialCardName}' → '{newName}' (but NOT blocking drag anymore)");
+                    // Performance: Card drift log auskommentiert
+                    // Debug.Log($"[HandController] Card drift detected '{initialCardName}' → '{newName}' (but NOT blocking drag anymore)");
                 }
             }
         }

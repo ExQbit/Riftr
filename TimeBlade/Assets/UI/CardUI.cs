@@ -42,17 +42,28 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
     private HoverState currentHoverState = HoverState.None;
     private HoverState targetHoverState = HoverState.None;
     
+    // ===== HOVER FLICKER PREVENTION =====
+    private bool isPointerOver = false;      // Track pointer state independently
+    
     // ===== POSITION TRACKING =====
     private Vector3 layoutTargetPosition = Vector3.zero;  // Where card should be according to layout
     private Vector3 visualPosition = Vector3.zero;       // Current visual position
     private Vector3 hoverOffset = Vector3.zero;          // Additional offset when hovering
     private bool hasValidLayoutPosition = false;
+    private float layoutTargetRotation = 0f;              // Target rotation from arc layout
+    private float originalRotation = 0f;                  // Original rotation from arc layout
     
     // ===== ANIMATION TRACKING =====
     private int positionAnimationId = -1;
     private int scaleAnimationId = -1;
     private int rotationAnimationId = -1;
     private bool isAnimating = false;
+    
+    // ===== HOVER FIX =====
+    private float lastPointerEnterTime = 0f;
+    private bool isPointerInside = false;
+    private Vector2 lastKnownPointerPosition = Vector2.zero;
+    private Transform visualContainer = null; // Container for all visual elements
     
     // ===== SIBLING INDEX TRACKING =====
     private int layoutSiblingIndex = -1;  // The index this card should have in layout
@@ -78,8 +89,8 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
     [SerializeField] private Color timeColor = new Color(0.5f, 1f, 0.5f);
     
     [Header("Animation-Einstellungen")]
-    [SerializeField] private float hoverAnimDuration = 0.1f;
-    [SerializeField] private float exitAnimDuration = 0.15f;
+    [SerializeField] private float hoverAnimDuration = 0.08f;  // Noch schneller!
+    [SerializeField] private float exitAnimDuration = 0.06f;   // Ultra-schnell beim Exit
     [SerializeField] private float layoutAnimDuration = 0.2f;
     [SerializeField] private LeanTweenType hoverEaseType = LeanTweenType.easeOutCubic;
     [SerializeField] private LeanTweenType exitEaseType = LeanTweenType.easeOutQuad;
@@ -173,6 +184,9 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
             transform.localScale = Vector3.one;
         }
         
+        // Create fixed hover area to prevent scale-based flicker
+        CreateFixedHoverArea();
+        
         // Cancel any animations
         CancelAllAnimations();
     }
@@ -259,9 +273,10 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
     /// <summary>
     /// Updates the layout target position (called by HandController)
     /// </summary>
-    public void UpdateLayoutTargetPosition(Vector3 newPosition, float animationDuration = 0.2f, bool immediate = false)
+    public void UpdateLayoutTargetPosition(Vector3 newPosition, float targetRotation, float animationDuration = 0.2f, bool immediate = false)
     {
         layoutTargetPosition = newPosition;
+        layoutTargetRotation = targetRotation;
         hasValidLayoutPosition = true;
         
         // If we're in a hover state, delay the layout update
@@ -284,6 +299,12 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
             // Animated update
             AnimateToLayoutPosition(animationDuration);
         }
+    }
+    
+    // Overload for backward compatibility
+    public void UpdateLayoutTargetPosition(Vector3 newPosition, float animationDuration = 0.2f, bool immediate = false)
+    {
+        UpdateLayoutTargetPosition(newPosition, layoutTargetRotation, animationDuration, immediate);
     }
     
     /// <summary>
@@ -324,11 +345,24 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
     public void UpdateParallaxPositionWithArc(Vector3 newTargetPosition, float duration = 0.05f)
     {
         layoutTargetPosition = newTargetPosition;
+        // WICHTIG: Rotation bleibt unverändert beim Parallax!
+        // Nur die Position ändert sich, die Rotation bleibt stabil
+        // layoutTargetRotation wird NICHT geändert!
         
         if (currentHoverState == HoverState.Hovered || currentHoverState == HoverState.EnteringHover)
         {
             // Für hovering Karten: Neue Position mit Hover-Offset
             Vector3 targetPos = newTargetPosition + hoverOffset;
+            
+            // Optimierung: Bei duration 0 oder sehr nah am Ziel, direkt setzen
+            float distance = Vector3.Distance(transform.localPosition, targetPos);
+            if (duration <= 0f || distance < 0.5f) // Noch kleinerer Threshold
+            {
+                transform.localPosition = targetPos;
+                visualPosition = targetPos;
+                // Rotation bleibt unverändert!
+                return;
+            }
             
             if (positionAnimationId >= 0)
             {
@@ -341,11 +375,21 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
                     positionAnimationId = -1;
                     visualPosition = targetPos;
                 }).id;
+            // Keine Rotation-Animation beim Parallax!
         }
         else
         {
-            // Nicht-hovering Karten: Normale Position-Update
-            AnimateToLayoutPosition(duration);
+            // Nicht-hovering Karten: Bei Parallax direkt setzen für instant response
+            if (duration <= 0f)
+            {
+                transform.localPosition = newTargetPosition;
+                visualPosition = newTargetPosition;
+                // Rotation bleibt unverändert!
+            }
+            else
+            {
+                AnimateToLayoutPosition(duration);
+            }
         }
     }
     
@@ -377,6 +421,7 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
         if (updateVisual && !isAnimating)
         {
             transform.localPosition = visualPosition;
+            transform.localRotation = Quaternion.Euler(0, 0, layoutTargetRotation);
         }
     }
     
@@ -389,6 +434,16 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
         
         Vector3 targetPos = layoutTargetPosition + hoverOffset;
         
+        // Optimierung: Wenn sehr nah am Ziel, direkt setzen ohne Animation
+        float distance = Vector3.Distance(transform.localPosition, targetPos);
+        if (distance < 2f)
+        {
+            transform.localPosition = targetPos;
+            transform.localRotation = Quaternion.Euler(0, 0, layoutTargetRotation);
+            visualPosition = targetPos;
+            return;
+        }
+        
         if (positionAnimationId >= 0)
         {
             LeanTween.cancel(positionAnimationId);
@@ -397,6 +452,7 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
         if (duration <= 0f)
         {
             transform.localPosition = targetPos;
+            transform.localRotation = Quaternion.Euler(0, 0, layoutTargetRotation);
             visualPosition = targetPos;
         }
         else
@@ -406,6 +462,17 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
                 .setOnComplete(() => {
                     positionAnimationId = -1;
                     visualPosition = targetPos;
+                }).id;
+            
+            // Also animate rotation
+            if (rotationAnimationId >= 0)
+            {
+                LeanTween.cancel(rotationAnimationId);
+            }
+            rotationAnimationId = LeanTween.rotateLocal(gameObject, new Vector3(0, 0, layoutTargetRotation), duration)
+                .setEase(layoutEaseType)
+                .setOnComplete(() => {
+                    rotationAnimationId = -1;
                 }).id;
         }
     }
@@ -482,27 +549,45 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
         needsIndexRestore = true;
         
         // Calculate hover offset - minimal for arc layout
-        hoverOffset = Vector3.up * 20f; // Fixed small offset for arc layout
+        // ENTFERNT: Hover-Offset verursacht Flackern!
+        // Stattdessen verwenden wir nur Scale-Animationen
+        hoverOffset = Vector3.zero; // KEIN Position-Offset mehr!
         
-        // Animate position
-        Vector3 targetPos = layoutTargetPosition + hoverOffset;
-        
+        // KEINE Position-Animation mehr - nur Scale!
+        // Dies verhindert das Flackern durch Positions-Feedback-Loop
         CancelAllAnimations();
         
-        positionAnimationId = LeanTween.moveLocal(gameObject, targetPos, hoverAnimDuration)
-            .setEase(hoverEaseType)
-            .setOnComplete(() => {
-                positionAnimationId = -1;
-                visualPosition = targetPos;
-                TransitionToState(HoverState.Hovered);
-            }).id;
+        // Direkt zu Hovered state nach Scale-Animation
+        visualPosition = layoutTargetPosition; // Behalte Layout-Position
         
-        // Animate scale
-        scaleAnimationId = LeanTween.scale(gameObject, Vector3.one * hoverScaleAmount, hoverAnimDuration)
-            .setEase(hoverEaseType)
-            .setOnComplete(() => {
-                scaleAnimationId = -1;
-            }).id;
+        // HOVER FIX: Only scale the visual container, not the card itself
+        if (visualContainer != null)
+        {
+            Vector3 currentScale = visualContainer.localScale;
+            scaleAnimationId = LeanTween.scale(visualContainer.gameObject, Vector3.one * hoverScaleAmount, hoverAnimDuration)
+                .setFrom(currentScale)
+                .setEase(hoverEaseType)
+                .setOnComplete(() => {
+                    scaleAnimationId = -1;
+                    TransitionToState(HoverState.Hovered);
+                }).id;
+        }
+        else
+        {
+            // Fallback: scale the whole card if no visual container
+            Vector3 currentScale = transform.localScale;
+            scaleAnimationId = LeanTween.scale(gameObject, Vector3.one * hoverScaleAmount, hoverAnimDuration)
+                .setFrom(currentScale)
+                .setEase(hoverEaseType)
+                .setOnComplete(() => {
+                    scaleAnimationId = -1;
+                    TransitionToState(HoverState.Hovered);
+                }).id;
+        }
+            
+        // KEINE Rotation beim Hover - Karten sind schon bei 0°
+        // LeanTween.rotateLocal(gameObject, Vector3.zero, hoverAnimDuration)
+        //     .setEase(hoverEaseType);
     }
     
     /// <summary>
@@ -515,7 +600,15 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
         // Ensure we're at the correct position
         visualPosition = layoutTargetPosition + hoverOffset;
         transform.localPosition = visualPosition;
-        transform.localScale = Vector3.one * hoverScaleAmount;
+        // HOVER FIX: Scale visual container, not the card
+        if (visualContainer != null)
+        {
+            visualContainer.localScale = Vector3.one * hoverScaleAmount;
+        }
+        else
+        {
+            transform.localScale = Vector3.one * hoverScaleAmount;
+        }
     }
     
     /// <summary>
@@ -546,13 +639,34 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
                 TransitionToState(HoverState.None);
             }).id;
         
-        // Animate scale
-        scaleAnimationId = LeanTween.scale(gameObject, Vector3.one, exitAnimDuration)
-            .setEase(exitEaseType)
-            .setOnComplete(() => {
-                scaleAnimationId = -1;
-                transform.localScale = Vector3.one; // Force exact scale
-            }).id;
+        // HOVER FIX: Animate visual container back to normal scale
+        if (visualContainer != null)
+        {
+            Vector3 currentScale = visualContainer.localScale;
+            scaleAnimationId = LeanTween.scale(visualContainer.gameObject, Vector3.one, exitAnimDuration)
+                .setFrom(currentScale)
+                .setEase(exitEaseType)
+                .setOnComplete(() => {
+                    scaleAnimationId = -1;
+                    visualContainer.localScale = Vector3.one; // Force exact scale
+                }).id;
+        }
+        else
+        {
+            // Fallback: scale the whole card if no visual container
+            Vector3 currentScale = transform.localScale;
+            scaleAnimationId = LeanTween.scale(gameObject, Vector3.one, exitAnimDuration)
+                .setFrom(currentScale)
+                .setEase(exitEaseType)
+                .setOnComplete(() => {
+                    scaleAnimationId = -1;
+                    transform.localScale = Vector3.one; // Force exact scale
+                }).id;
+        }
+            
+        // KEINE Rotation beim Exit - Karten bleiben bei 0°
+        // LeanTween.rotateLocal(gameObject, new Vector3(0, 0, originalRotation), exitAnimDuration)
+        //     .setEase(exitEaseType);
     }
     
     /// <summary>
@@ -570,12 +684,21 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
             return;
         }
         
+        // CRITICAL: Block ALL hover during touch/fanning
+        if (hovered && handController != null && handController.IsTouchActive())
+        {
+            Debug.Log($"[CardUI] Blocking hover during touch/fanning for '{cardData?.cardName}'");
+            return;
+        }
+        
         // Block hover during drag
         if (hovered && handController != null && handController.IsDragActive())
         {
             Debug.Log($"[CardUI] Blocking hover during drag for '{cardData?.cardName}'");
             return;
         }
+        
+        Debug.Log($"[HOVER] SetHovered({hovered}) for card '{cardData?.cardName}' - current state: {currentHoverState}");
         
         // Determine target state
         targetHoverState = hovered ? HoverState.Hovered : HoverState.None;
@@ -623,10 +746,20 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
         transform.SetAsLastSibling();
         needsIndexRestore = true;
         
-        hoverOffset = Vector3.up * 20f; // Fixed small offset for arc layout
+        // ENTFERNT: Hover-Offset verursacht Flackern!
+        // Stattdessen verwenden wir nur Scale-Animationen
+        hoverOffset = Vector3.zero; // KEIN Position-Offset mehr!
         visualPosition = layoutTargetPosition + hoverOffset;
         transform.localPosition = visualPosition;
-        transform.localScale = Vector3.one * hoverScaleAmount;
+        // HOVER FIX: Scale visual container, not the card
+        if (visualContainer != null)
+        {
+            visualContainer.localScale = Vector3.one * hoverScaleAmount;
+        }
+        else
+        {
+            transform.localScale = Vector3.one * hoverScaleAmount;
+        }
         
         // Force canvas update
         Canvas.ForceUpdateCanvases();
@@ -680,6 +813,8 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
         }
         
         transform.localScale = Vector3.one;
+        
+        // KEINE Rotation - Karten bleiben immer bei 0°
         
         if (highlightEffect != null)
             highlightEffect.SetActive(false);
@@ -808,6 +943,13 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
     
     public void OnPointerEnter(PointerEventData eventData)
     {
+        // Don't hover if mouse button is pressed (this would be a drag/click)
+        if (Input.GetMouseButton(0)) 
+        {
+            Debug.Log($"[HOVER] OnPointerEnter BLOCKED - mouse button is pressed");
+            return;
+        }
+        
         if (HandController.IsGlobalTouchActive) return;
         if (handController != null && handController.IsTouchActive()) return;
         if (Input.touchCount > 0) return;
@@ -815,18 +957,179 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
         if (!Input.mousePresent) return;
         if (handController != null && handController.IsDragActive()) return;
         
+        Debug.Log($"[HOVER] OnPointerEnter - Card: {cardData?.cardName}, Time: {Time.time:F3}, MousePos: {eventData.position}");
+        
+        // HOVER FIX: Simple time-based debounce
+        float timeSinceLastEnter = Time.time - lastPointerEnterTime;
+        if (timeSinceLastEnter < 0.1f)
+        {
+            Debug.Log($"[HOVER] OnPointerEnter BLOCKED - too fast ({timeSinceLastEnter:F3}s)");
+            return;
+        }
+        
+        lastPointerEnterTime = Time.time;
+        isPointerInside = true;
+        isPointerOver = true;
+        lastKnownPointerPosition = eventData.position;
+        
+        // Immediate hover
         SetHovered(true);
     }
     
     public void OnPointerExit(PointerEventData eventData)
     {
+        // Don't process exit if mouse button is pressed
+        if (Input.GetMouseButton(0)) 
+        {
+            Debug.Log($"[HOVER] OnPointerExit BLOCKED - mouse button is pressed");
+            return;
+        }
+        
         if (HandController.IsGlobalTouchActive) return;
         if (handController != null && handController.IsTouchActive()) return;
         if (Input.touchCount > 0) return;
         if (isDragging) return;
         if (handController != null && handController.IsDragActive()) return;
         
-        SetHovered(false);
+        Debug.Log($"[HOVER] OnPointerExit - Card: {cardData?.cardName}, Time: {Time.time:F3}, MousePos: {eventData.position}");
+        
+        // HOVER FIX: Ignore exit if we're currently animating
+        if (isAnimating)
+        {
+            Debug.Log($"[HOVER] OnPointerExit IGNORED - currently animating");
+            return;
+        }
+        
+        // HOVER FIX: Smart exit detection
+        // Only exit if pointer moved significantly or we're not in a hover state
+        if (currentHoverState == HoverState.Hovered || currentHoverState == HoverState.EnteringHover)
+        {
+            // During hover, require significant movement before exiting
+            float pointerMovement = Vector2.Distance(eventData.position, lastKnownPointerPosition);
+            if (pointerMovement < 20f) // Pixels
+            {
+                Debug.Log($"[HOVER] OnPointerExit DELAYED - small movement ({pointerMovement:F1}px)");
+                StartCoroutine(DelayedPointerCheck(eventData.position));
+                return;
+            }
+        }
+        
+        isPointerInside = false;
+        isPointerOver = false;
+        lastKnownPointerPosition = eventData.position;
+        
+        // Delayed exit to prevent flicker
+        StartCoroutine(DelayedExitHover());
+    }
+    
+    private IEnumerator DelayedPointerCheck(Vector2 checkPosition)
+    {
+        yield return new WaitForSeconds(0.05f);
+        
+        // Re-check if pointer is still over card
+        PointerEventData pointerData = new PointerEventData(EventSystem.current)
+        {
+            position = checkPosition
+        };
+        
+        List<RaycastResult> results = new List<RaycastResult>();
+        EventSystem.current.RaycastAll(pointerData, results);
+        
+        bool stillOverCard = false;
+        foreach (var result in results)
+        {
+            if (result.gameObject == gameObject)
+            {
+                stillOverCard = true;
+                break;
+            }
+        }
+        
+        if (!stillOverCard && isPointerOver)
+        {
+            isPointerInside = false;
+            isPointerOver = false;
+            SetHovered(false);
+        }
+    }
+    
+    private IEnumerator DelayedExitHover()
+    {
+        yield return new WaitForSeconds(0.02f); // Very short delay
+        
+        // Only exit if pointer is still marked as outside
+        if (!isPointerOver && !isPointerInside)
+        {
+            SetHovered(false);
+        }
+
+    }
+    
+    private void CreateFixedHoverArea()
+    {
+        // APPROACH 1: Create a visual container that we can scale without affecting hover detection
+        
+        // Create visual container for all card visuals
+        GameObject visualContainerObj = new GameObject("VisualContainer");
+        visualContainerObj.transform.SetParent(transform, false);
+        visualContainerObj.layer = gameObject.layer;
+        
+        RectTransform visualRect = visualContainerObj.AddComponent<RectTransform>();
+        visualRect.anchorMin = Vector2.zero;
+        visualRect.anchorMax = Vector2.one;
+        visualRect.offsetMin = Vector2.zero;
+        visualRect.offsetMax = Vector2.zero;
+        
+        visualContainer = visualContainerObj.transform;
+        
+        // Move all existing children (except self) to visual container
+        List<Transform> children = new List<Transform>();
+        foreach (Transform child in transform)
+        {
+            if (child != visualContainer)
+            {
+                children.Add(child);
+            }
+        }
+        
+        foreach (Transform child in children)
+        {
+            child.SetParent(visualContainer, true);
+        }
+        
+        // The main card keeps its Image component for hover detection at fixed size
+        Image mainImage = GetComponent<Image>();
+        if (mainImage != null)
+        {
+            mainImage.raycastTarget = true; // Keep raycasting on main card
+            Debug.Log($"[HOVER FIX] Created visual container for scaling, main card stays fixed size for: {cardData?.cardName}");
+        }
+    }
+    
+    // Proxy component to forward hover events from fixed area to card
+    private class HoverProxy : MonoBehaviour, IPointerEnterHandler, IPointerExitHandler, IPointerClickHandler
+    {
+        private CardUI parentCard;
+        
+        public void Initialize(CardUI card)
+        {
+            parentCard = card;
+        }
+        
+        public void OnPointerEnter(PointerEventData eventData)
+        {
+            parentCard.OnPointerEnter(eventData);
+        }
+        
+        public void OnPointerExit(PointerEventData eventData)
+        {
+            parentCard.OnPointerExit(eventData);
+        }
+        
+        public void OnPointerClick(PointerEventData eventData)
+        {
+            parentCard.OnPointerClick(eventData);
+        }
     }
     
     private void ShakeCard()
@@ -936,6 +1239,8 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
         
         CreateBorderSprite();
     }
+    
+
     
     private void CreateBorderSprite()
     {
@@ -1093,7 +1398,13 @@ public class CardUI : MonoBehaviour, IPointerClickHandler, IPointerEnterHandler,
     
     public void SetOriginalRotation(float rotation)
     {
-        // Store original rotation if needed
+        originalRotation = rotation;
+        layoutTargetRotation = rotation;
+    }
+    
+    public float GetOriginalRotation()
+    {
+        return originalRotation;
     }
     
     public void UpdateBasePosition(Vector3 newPosition)

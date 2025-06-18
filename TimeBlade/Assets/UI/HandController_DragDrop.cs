@@ -230,7 +230,10 @@ public partial class HandController : MonoBehaviour
     {
         Debug.Log($"[HandController] *** DISABLING ALL HOVER EFFECTS *** Drag is active, preventing hover on all cards except dragged card");
         
-        foreach (var cardObj in activeCardUIs)
+        // Deduplizierung der Liste für saubere Verarbeitung
+        var uniqueCards = new HashSet<GameObject>(activeCardUIs);
+        
+        foreach (var cardObj in uniqueCards)
         {
             if (cardObj != null && cardObj != draggedCard)
             {
@@ -249,7 +252,10 @@ public partial class HandController : MonoBehaviour
     {
         Debug.Log($"[HandController] *** RE-ENABLING ALL HOVER EFFECTS *** Drag ended, restoring normal hover behavior");
         
-        foreach (var cardObj in activeCardUIs)
+        // Deduplizierung der Liste für saubere Verarbeitung
+        var uniqueCards = new HashSet<GameObject>(activeCardUIs);
+        
+        foreach (var cardObj in uniqueCards)
         {
             if (cardObj != null)
             {

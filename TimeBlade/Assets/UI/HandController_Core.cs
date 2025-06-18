@@ -42,6 +42,12 @@ public partial class HandController : MonoBehaviour
     [Tooltip("Kartenbreite für Parallax-Scrolling")]
     [SerializeField] private float parallaxCardWidth = 200f;
     
+    [Header("Performance Settings")]
+    [Tooltip("Frame-Rate für Animationen (0.016 = 60fps, 0.008 = 120fps)")]
+    [SerializeField] private float animationFrameTime = 0.016f;
+    [Tooltip("Minimale Bewegung für Updates in Pixel")]
+    [SerializeField] private float movementThreshold = 1f;
+    
     [Header("Canvas-Einstellungen")]
     [SerializeField] private Canvas parentCanvas;
     [SerializeField] private Camera uiCamera;
@@ -63,7 +69,7 @@ public partial class HandController : MonoBehaviour
     [SerializeField] private bool logStartup = true;
     [SerializeField] private bool logHandUpdates = false;
     [SerializeField] private bool logTouchEvents = false;
-    [SerializeField] private bool logCardPositions = false;
+    [SerializeField] private bool logCardPositions = true; // Temporär aktiviert für Rotation-Debug
     [SerializeField] private bool logParallaxDetails = false; // Deaktiviert für weniger Spam
     
     [Header("Parallax Hand-Verschiebung")]
