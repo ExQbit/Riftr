@@ -6,8 +6,8 @@ import { Ionicons } from '@expo/vector-icons';
 import { useTheme } from 'react-native-paper';
 
 // Import screens
-import NewHomeScreen from '../screens/NewHomeScreen';
 import HomeScreen from '../screens/HomeScreen';
+import PackSelectionScreen from '../screens/HomeScreen.old';
 import CollectionScreen from '../screens/CollectionScreen';
 import DatabaseScreen from '../screens/DatabaseScreen';
 import DecksScreen from '../screens/DecksScreen';
@@ -95,7 +95,7 @@ function TabNavigator() {
     >
       <Tab.Screen
         name="Home"
-        component={NewHomeScreen}
+        component={HomeScreen}
         options={{
           title: 'Home',
           headerTitle: 'Riftbound',
@@ -201,7 +201,7 @@ export default function Navigation() {
         />
         <Stack.Screen
           name="PackSelection"
-          component={HomeScreen}
+          component={PackSelectionScreen}
           options={{
             title: 'Packs öffnen',
             headerBackTitle: 'Zurück',
