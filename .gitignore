@@ -44,3 +44,6 @@ Thumbs.db
 .classpath
 .settings/
 .gradle/
+
+# Local private files (not uploaded to GitHub)
+.local/
