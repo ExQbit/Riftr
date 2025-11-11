@@ -1,246 +1,371 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   View,
   StyleSheet,
   ScrollView,
   TouchableOpacity,
   Dimensions,
+  Image,
+  Animated,
 } from 'react-native';
 import {
   Text,
-  Card,
+  useTheme,
+  Surface,
   Title,
   Paragraph,
-  useTheme,
-  Button,
+  Card,
+  ProgressBar,
   Chip,
-  Surface,
+  FAB,
 } from 'react-native-paper';
 import { useNavigation } from '@react-navigation/native';
 import { StackNavigationProp } from '@react-navigation/stack';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Ionicons } from '@expo/vector-icons';
-import { usePackStore, useStatsStore } from '../store';
-import { PACK_CONFIG, COLORS } from '../constants';
 import { RootStackParamList } from '../navigation';
+import {
+  useCollectionStore,
+  useStatsStore,
+  usePointsStore,
+  usePackStore,
+  useFeaturedCardsStore,
+} from '../store';
+import { mockCards } from '../data/mockCards';
+import { Card as CardType, FeaturedCard } from '../types';
+import { COLORS } from '../constants';
 import * as Haptics from 'expo-haptics';
 
 type NavigationProp = StackNavigationProp<RootStackParamList, 'MainTabs'>;
 
 const { width } = Dimensions.get('window');
-const CARD_WIDTH = (width - 48) / 2;
+const CARD_WIDTH = width - 32;
 
 export default function HomeScreen() {
   const theme = useTheme();
   const navigation = useNavigation<NavigationProp>();
-  const { currency, spendCurrency, canClaimDaily, claimDailyBonus, lastClaimDate } = usePackStore();
-  const { stats, incrementPacksOpened } = useStatsStore();
 
-  const handlePackPress = async (packType: keyof typeof PACK_CONFIG) => {
-    const packConfig = PACK_CONFIG[packType];
+  const { getCollectionStats } = useCollectionStore();
+  const { stats } = useStatsStore();
+  const { points } = usePointsStore();
+  const { currency } = usePackStore();
+  const { currentFeaturedCard, setFeaturedCards, updateCurrentFeaturedCard } =
+    useFeaturedCardsStore();
 
-    if (packConfig.cost > 0 && !spendCurrency(packConfig.cost)) {
-      // Not enough currency
-      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
-      return;
-    }
+  const collectionStats = getCollectionStats();
+  const [fadeAnim] = useState(new Animated.Value(0));
 
+  // Initialize featured cards on mount
+  useEffect(() => {
+    initializeFeaturedCards();
+    updateCurrentFeaturedCard();
+
+    Animated.timing(fadeAnim, {
+      toValue: 1,
+      duration: 800,
+      useNativeDriver: true,
+    }).start();
+  }, []);
+
+  const initializeFeaturedCards = () => {
+    // Sample featured cards with mechanics and lore
+    const featured: FeaturedCard[] = [
+      {
+        cardId: 'RB-001',
+        title: 'Mechanik: Hexcore',
+        description:
+          'Hexcore-Karten erhalten zusätzliche Effekte basierend auf deiner aktuellen Energie. Je mehr Energie du hast, desto stärker werden diese Karten!',
+        type: 'mechanic',
+        startDate: new Date().toISOString(),
+        endDate: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+      },
+      {
+        cardId: 'RB-004',
+        title: 'Die Geschichte von Jinx',
+        description:
+          'Jinx war einst als Powder bekannt, bis eine Tragödie ihr Leben für immer veränderte. Ihre chaotische Energie spiegelt sich in ihren explosiven Karten wider.',
+        type: 'lore',
+        startDate: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+        endDate: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString(),
+      },
+    ];
+
+    setFeaturedCards(featured);
+  };
+
+  const handleCardPress = (cardId: string) => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    navigation.navigate('CardDetail', { cardId });
+  };
+
+  const handleOpenPacks = () => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    navigation.navigate('PackOpening', { packType });
+    // Navigate to pack opening (keep old HomeScreen for this)
+    navigation.navigate('PackOpening', { packType: 'foundations_booster' });
   };
 
-  const handleClaimDaily = () => {
-    const success = claimDailyBonus();
-    if (success) {
-      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-    } else {
-      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
-    }
+  const handleScanCard = () => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    navigation.navigate('CardScanner');
   };
 
-  const getTimeUntilNextClaim = (): string => {
-    if (!lastClaimDate) return '';
-
-    const lastClaim = new Date(lastClaimDate);
-    const now = new Date();
-    const nextClaim = new Date(lastClaim.getTime() + 24 * 60 * 60 * 1000);
-    const msRemaining = nextClaim.getTime() - now.getTime();
-
-    if (msRemaining <= 0) return '';
-
-    const hours = Math.floor(msRemaining / (1000 * 60 * 60));
-    const minutes = Math.floor((msRemaining % (1000 * 60 * 60)) / (1000 * 60));
-
-    return `Available in ${hours}h ${minutes}m`;
+  const getFeaturedCardData = (): CardType | null => {
+    if (!currentFeaturedCard) return null;
+    return mockCards.find((card) => card.id === currentFeaturedCard.cardId) || null;
   };
 
-  const canClaim = canClaimDaily();
-
-  const PackCard = ({
-    packType,
-    config,
-  }: {
-    packType: keyof typeof PACK_CONFIG;
-    config: typeof PACK_CONFIG[keyof typeof PACK_CONFIG];
-  }) => {
-    const isAffordable = currency >= config.cost || config.cost === 0;
-    const gradientColors = getPackGradient(packType);
-
-    return (
-      <TouchableOpacity
-        style={styles.packCard}
-        onPress={() => handlePackPress(packType)}
-        disabled={!isAffordable}
-      >
-        <LinearGradient
-          colors={gradientColors}
-          style={[
-            styles.packGradient,
-            !isAffordable && styles.disabledPack,
-          ]}
-          start={{ x: 0, y: 0 }}
-          end={{ x: 1, y: 1 }}
-        >
-          <View style={styles.packContent}>
-            <Ionicons
-              name="cube"
-              size={48}
-              color="#FFFFFF"
-              style={styles.packIcon}
-            />
-            <Title style={styles.packTitle}>{config.name}</Title>
-            <Paragraph style={styles.packDescription}>
-              {config.cards} Cards
-            </Paragraph>
-            
-            <View style={styles.packDetails}>
-              {packType === 'starter' && (
-                <Chip
-                  mode="flat"
-                  style={[styles.guaranteeChip, { backgroundColor: COLORS.legendary }]}
-                  textStyle={{ color: '#FFFFFF' }}
-                >
-                  1x Champion
-                </Chip>
-              )}
-              {packType !== 'starter' && (
-                <Chip
-                  mode="flat"
-                  style={[styles.guaranteeChip, { backgroundColor: COLORS.rare }]}
-                  textStyle={{ color: '#FFFFFF' }}
-                >
-                  {`${config.legendaryChance! * 100}% Legendary`}
-                </Chip>
-              )}
-            </View>
-
-            <Button
-              mode="contained"
-              style={styles.packButton}
-              labelStyle={{ color: '#FFFFFF' }}
-              disabled={!isAffordable}
-            >
-              {config.cost === 0 ? 'Open Free' : `Open - ${config.cost} 💎`}
-            </Button>
-          </View>
-        </LinearGradient>
-      </TouchableOpacity>
-    );
-  };
+  const featuredCard = getFeaturedCardData();
 
   return (
-    <ScrollView style={[styles.container, { backgroundColor: theme.colors.background }]}>
-      {/* Header Stats */}
-      <Surface style={[styles.header, { backgroundColor: theme.colors.surface }]}>
-        <View style={styles.statsRow}>
-          <View style={styles.statItem}>
-            <Text style={[styles.statLabel, { color: theme.colors.onSurfaceVariant }]}>
-              Currency
-            </Text>
-            <Text style={[styles.statValue, { color: theme.colors.primary }]}>
-              {currency} 💎
+    <View style={[styles.container, { backgroundColor: theme.colors.background }]}>
+      <ScrollView showsVerticalScrollIndicator={false}>
+        {/* Header with Greeting */}
+        <Animated.View style={[styles.header, { opacity: fadeAnim }]}>
+          <View>
+            <Title style={[styles.greeting, { color: theme.colors.onBackground }]}>
+              Willkommen zurück!
+            </Title>
+            <Paragraph style={{ color: theme.colors.onSurfaceVariant }}>
+              Deine Riftbound Sammlung
+            </Paragraph>
+          </View>
+          <View style={styles.currencyBadge}>
+            <Ionicons name="diamond" size={20} color={COLORS.secondary} />
+            <Text style={[styles.currencyText, { color: theme.colors.onBackground }]}>
+              {currency}
             </Text>
           </View>
-          <View style={styles.statItem}>
-            <Text style={[styles.statLabel, { color: theme.colors.onSurfaceVariant }]}>
-              Packs Opened
-            </Text>
-            <Text style={[styles.statValue, { color: theme.colors.onSurface }]}>
-              {stats.totalPacksOpened}
-            </Text>
-          </View>
-          <View style={styles.statItem}>
-            <Text style={[styles.statLabel, { color: theme.colors.onSurfaceVariant }]}>
-              Collection
-            </Text>
-            <Text style={[styles.statValue, { color: theme.colors.onSurface }]}>
-              {stats.uniqueCards}/50
-            </Text>
-          </View>
-        </View>
-      </Surface>
+        </Animated.View>
 
-      {/* Daily Bonus */}
-      <Card style={[styles.dailyBonus, { backgroundColor: theme.colors.primaryContainer }]}>
-        <Card.Content>
-          <Title style={{ color: theme.colors.onPrimaryContainer }}>
-            {canClaim ? 'Daily Bonus Available!' : 'Daily Bonus Claimed'}
+        {/* Collection Progress Card */}
+        <Animated.View style={{ opacity: fadeAnim }}>
+          <Card style={[styles.progressCard, { backgroundColor: theme.colors.surface }]}>
+            <LinearGradient
+              colors={[theme.colors.primary + '20', theme.colors.surface]}
+              style={styles.progressGradient}
+            >
+              <Card.Content>
+                <View style={styles.progressHeader}>
+                  <View>
+                    <Title style={{ color: theme.colors.onSurface }}>Deine Sammlung</Title>
+                    <Paragraph style={{ color: theme.colors.onSurfaceVariant }}>
+                      {collectionStats.uniqueCards} von 50 Karten
+                    </Paragraph>
+                  </View>
+                  <View style={styles.completionBadge}>
+                    <Text style={[styles.completionText, { color: theme.colors.primary }]}>
+                      {collectionStats.completionRate.toFixed(0)}%
+                    </Text>
+                  </View>
+                </View>
+
+                <ProgressBar
+                  progress={collectionStats.completionRate / 100}
+                  color={theme.colors.primary}
+                  style={styles.progressBar}
+                />
+
+                <View style={styles.statsRow}>
+                  <View style={styles.statItem}>
+                    <Ionicons name="albums" size={24} color={theme.colors.primary} />
+                    <Text style={[styles.statValue, { color: theme.colors.onSurface }]}>
+                      {collectionStats.totalCards}
+                    </Text>
+                    <Text style={[styles.statLabel, { color: theme.colors.onSurfaceVariant }]}>
+                      Gesamt
+                    </Text>
+                  </View>
+
+                  <View style={styles.statItem}>
+                    <Ionicons name="cube" size={24} color={theme.colors.secondary} />
+                    <Text style={[styles.statValue, { color: theme.colors.onSurface }]}>
+                      {stats.totalPacksOpened}
+                    </Text>
+                    <Text style={[styles.statLabel, { color: theme.colors.onSurfaceVariant }]}>
+                      Packs
+                    </Text>
+                  </View>
+
+                  <View style={styles.statItem}>
+                    <Ionicons name="star" size={24} color={COLORS.secondary} />
+                    <Text style={[styles.statValue, { color: theme.colors.onSurface }]}>
+                      {points.totalPoints}
+                    </Text>
+                    <Text style={[styles.statLabel, { color: theme.colors.onSurfaceVariant }]}>
+                      Punkte
+                    </Text>
+                  </View>
+                </View>
+              </Card.Content>
+            </LinearGradient>
+          </Card>
+        </Animated.View>
+
+        {/* Featured Card Showcase */}
+        {featuredCard && currentFeaturedCard && (
+          <Animated.View style={{ opacity: fadeAnim }}>
+            <Card style={[styles.featuredCard, { backgroundColor: theme.colors.surface }]}>
+              <Card.Content>
+                <View style={styles.featuredHeader}>
+                  <Chip
+                    icon={
+                      currentFeaturedCard.type === 'mechanic'
+                        ? 'cog'
+                        : currentFeaturedCard.type === 'lore'
+                        ? 'book'
+                        : 'star'
+                    }
+                    style={{ backgroundColor: theme.colors.primaryContainer }}
+                  >
+                    {currentFeaturedCard.type === 'mechanic'
+                      ? 'Mechanik'
+                      : currentFeaturedCard.type === 'lore'
+                      ? 'Lore'
+                      : 'Spotlight'}
+                  </Chip>
+                  <Text style={[styles.featuredDate, { color: theme.colors.onSurfaceVariant }]}>
+                    Heute
+                  </Text>
+                </View>
+
+                <TouchableOpacity
+                  onPress={() => handleCardPress(featuredCard.id)}
+                  activeOpacity={0.8}
+                >
+                  <LinearGradient
+                    colors={[COLORS.primary + '30', COLORS.accent + '30']}
+                    style={styles.featuredCardDisplay}
+                    start={{ x: 0, y: 0 }}
+                    end={{ x: 1, y: 1 }}
+                  >
+                    <Image
+                      source={{ uri: featuredCard.imageUrl }}
+                      style={styles.featuredCardImage}
+                      resizeMode="contain"
+                    />
+                  </LinearGradient>
+
+                  <View style={styles.featuredContent}>
+                    <Title style={{ color: theme.colors.onSurface, marginBottom: 8 }}>
+                      {currentFeaturedCard.title}
+                    </Title>
+                    <Paragraph style={{ color: theme.colors.onSurfaceVariant }}>
+                      {currentFeaturedCard.description}
+                    </Paragraph>
+
+                    <View style={styles.featuredCardInfo}>
+                      <Text style={[styles.cardName, { color: theme.colors.primary }]}>
+                        {featuredCard.name}
+                      </Text>
+                      <Chip
+                        style={{
+                          backgroundColor: COLORS[featuredCard.rarity as keyof typeof COLORS],
+                        }}
+                        textStyle={{ color: '#FFFFFF' }}
+                      >
+                        {featuredCard.rarity.toUpperCase()}
+                      </Chip>
+                    </View>
+                  </View>
+                </TouchableOpacity>
+              </Card.Content>
+            </Card>
+          </Animated.View>
+        )}
+
+        {/* Quick Actions */}
+        <Animated.View style={{ opacity: fadeAnim }}>
+          <Title style={[styles.sectionTitle, { color: theme.colors.onBackground }]}>
+            Schnellzugriff
           </Title>
-          <Paragraph style={{ color: theme.colors.onPrimaryContainer }}>
-            {canClaim
-              ? 'Claim your free 100 💎 and bonus pack'
-              : getTimeUntilNextClaim() || 'Come back tomorrow!'}
-          </Paragraph>
-          <Button
-            mode="contained"
-            style={styles.claimButton}
-            onPress={handleClaimDaily}
-            disabled={!canClaim}
-          >
-            {canClaim ? 'Claim Now' : 'Already Claimed'}
-          </Button>
-        </Card.Content>
-      </Card>
 
-      {/* Pack Selection */}
-      <Title style={[styles.sectionTitle, { color: theme.colors.onBackground }]}>
-        Available Packs
-      </Title>
-      
-      <View style={styles.packsGrid}>
-        <PackCard packType="starter" config={PACK_CONFIG.starter} />
-        <PackCard packType="foundations_booster" config={PACK_CONFIG.foundations_booster} />
-      </View>
-      
-      <View style={styles.packsGrid}>
-        <PackCard packType="expansion_booster" config={PACK_CONFIG.expansion_booster} />
-        <View style={styles.packCard}>
-          <Surface style={[styles.comingSoon, { backgroundColor: theme.colors.surfaceVariant }]}>
-            <Ionicons name="lock-closed" size={48} color={theme.colors.onSurfaceVariant} />
-            <Text style={{ color: theme.colors.onSurfaceVariant, marginTop: 8 }}>
-              More Packs
-            </Text>
-            <Text style={{ color: theme.colors.onSurfaceVariant, fontSize: 12 }}>
-              Coming Soon
-            </Text>
-          </Surface>
-        </View>
-      </View>
-    </ScrollView>
+          <View style={styles.quickActions}>
+            <TouchableOpacity
+              style={[styles.actionCard, { backgroundColor: theme.colors.primaryContainer }]}
+              onPress={handleOpenPacks}
+            >
+              <LinearGradient
+                colors={[COLORS.primary, COLORS.primary + '80']}
+                style={styles.actionGradient}
+              >
+                <Ionicons name="cube" size={32} color="#FFFFFF" />
+                <Text style={styles.actionText}>Packs öffnen</Text>
+              </LinearGradient>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={[styles.actionCard, { backgroundColor: theme.colors.secondaryContainer }]}
+              onPress={() => navigation.navigate('Collection' as any)}
+            >
+              <LinearGradient
+                colors={[COLORS.secondary, COLORS.secondary + '80']}
+                style={styles.actionGradient}
+              >
+                <Ionicons name="albums" size={32} color="#FFFFFF" />
+                <Text style={styles.actionText}>Sammlung</Text>
+              </LinearGradient>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={[styles.actionCard, { backgroundColor: theme.colors.tertiaryContainer }]}
+              onPress={() => navigation.navigate('Decks' as any)}
+            >
+              <LinearGradient
+                colors={[COLORS.accent, COLORS.accent + '80']}
+                style={styles.actionGradient}
+              >
+                <Ionicons name="layers" size={32} color="#FFFFFF" />
+                <Text style={styles.actionText}>Decks</Text>
+              </LinearGradient>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={[styles.actionCard, { backgroundColor: theme.colors.surface }]}
+              onPress={handleScanCard}
+            >
+              <LinearGradient
+                colors={[theme.colors.surface, theme.colors.surfaceVariant]}
+                style={styles.actionGradient}
+              >
+                <Ionicons name="scan" size={32} color={theme.colors.primary} />
+                <Text style={[styles.actionText, { color: theme.colors.onSurface }]}>
+                  Scannen
+                </Text>
+              </LinearGradient>
+            </TouchableOpacity>
+          </View>
+        </Animated.View>
+
+        {/* Daily Streak */}
+        {points.dailyStreak > 0 && (
+          <Animated.View style={{ opacity: fadeAnim }}>
+            <Card style={[styles.streakCard, { backgroundColor: theme.colors.errorContainer }]}>
+              <Card.Content style={styles.streakContent}>
+                <Ionicons name="flame" size={40} color={COLORS.error} />
+                <View style={styles.streakInfo}>
+                  <Title style={{ color: theme.colors.onErrorContainer }}>
+                    {points.dailyStreak} Tage Streak!
+                  </Title>
+                  <Paragraph style={{ color: theme.colors.onErrorContainer }}>
+                    Mach weiter so und sammle täglich Punkte
+                  </Paragraph>
+                </View>
+              </Card.Content>
+            </Card>
+          </Animated.View>
+        )}
+      </ScrollView>
+
+      {/* Floating Scan Button */}
+      <FAB
+        icon="scan"
+        style={[styles.fab, { backgroundColor: theme.colors.primary }]}
+        onPress={handleScanCard}
+        color="#FFFFFF"
+        label="Scannen"
+      />
+    </View>
   );
-}
-
-function getPackGradient(packType: keyof typeof PACK_CONFIG): string[] {
-  switch (packType) {
-    case 'starter':
-      return [COLORS.secondary, COLORS.primary];
-    case 'foundations_booster':
-      return [COLORS.primary, '#0B5394'];
-    case 'expansion_booster':
-      return [COLORS.accent, '#4B0082'];
-    default:
-      return [COLORS.primary, COLORS.secondary];
-  }
 }
 
 const styles = StyleSheet.create({
@@ -248,8 +373,61 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   header: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
     padding: 16,
-    elevation: 2,
+    paddingTop: 24,
+  },
+  greeting: {
+    fontSize: 28,
+    fontWeight: 'bold',
+  },
+  currencyBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 20,
+    backgroundColor: COLORS.secondary + '20',
+  },
+  currencyText: {
+    fontSize: 16,
+    fontWeight: 'bold',
+  },
+  progressCard: {
+    marginHorizontal: 16,
+    marginBottom: 16,
+    elevation: 4,
+    borderRadius: 16,
+    overflow: 'hidden',
+  },
+  progressGradient: {
+    padding: 16,
+  },
+  progressHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 16,
+  },
+  completionBadge: {
+    width: 60,
+    height: 60,
+    borderRadius: 30,
+    backgroundColor: COLORS.primary + '20',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  completionText: {
+    fontSize: 18,
+    fontWeight: 'bold',
+  },
+  progressBar: {
+    height: 8,
+    borderRadius: 4,
+    marginBottom: 16,
   },
   statsRow: {
     flexDirection: 'row',
@@ -257,81 +435,104 @@ const styles = StyleSheet.create({
   },
   statItem: {
     alignItems: 'center',
-  },
-  statLabel: {
-    fontSize: 12,
-    marginBottom: 4,
+    gap: 4,
   },
   statValue: {
     fontSize: 20,
     fontWeight: 'bold',
   },
-  dailyBonus: {
-    margin: 16,
-    elevation: 4,
+  statLabel: {
+    fontSize: 12,
   },
-  claimButton: {
-    marginTop: 12,
-  },
-  sectionTitle: {
-    fontSize: 24,
-    fontWeight: 'bold',
+  featuredCard: {
     marginHorizontal: 16,
-    marginTop: 16,
-    marginBottom: 8,
+    marginBottom: 16,
+    elevation: 4,
+    borderRadius: 16,
   },
-  packsGrid: {
+  featuredHeader: {
     flexDirection: 'row',
-    paddingHorizontal: 16,
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  featuredDate: {
+    fontSize: 12,
+  },
+  featuredCardDisplay: {
+    height: 200,
+    borderRadius: 12,
+    justifyContent: 'center',
+    alignItems: 'center',
     marginBottom: 16,
   },
-  packCard: {
-    width: CARD_WIDTH,
-    height: CARD_WIDTH * 1.4,
-    marginHorizontal: 8,
+  featuredCardImage: {
+    width: '60%',
+    height: '90%',
   },
-  packGradient: {
-    flex: 1,
-    borderRadius: 12,
-    padding: 16,
+  featuredContent: {
+    marginTop: 8,
+  },
+  featuredCardInfo: {
+    flexDirection: 'row',
     justifyContent: 'space-between',
-    elevation: 4,
-  },
-  disabledPack: {
-    opacity: 0.5,
-  },
-  packContent: {
-    flex: 1,
     alignItems: 'center',
-    justifyContent: 'space-between',
+    marginTop: 12,
   },
-  packIcon: {
-    marginBottom: 8,
+  cardName: {
+    fontSize: 16,
+    fontWeight: 'bold',
   },
-  packTitle: {
-    color: '#FFFFFF',
-    fontSize: 18,
-    textAlign: 'center',
+  sectionTitle: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    marginHorizontal: 16,
+    marginBottom: 12,
   },
-  packDescription: {
-    color: '#FFFFFF',
-    opacity: 0.9,
-    textAlign: 'center',
+  quickActions: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    paddingHorizontal: 8,
+    gap: 8,
+    marginBottom: 16,
   },
-  packDetails: {
-    marginVertical: 8,
-  },
-  guaranteeChip: {
-    marginVertical: 4,
-  },
-  packButton: {
-    width: '100%',
-  },
-  comingSoon: {
-    flex: 1,
+  actionCard: {
+    width: (width - 40) / 2,
+    height: 120,
     borderRadius: 12,
-    alignItems: 'center',
-    justifyContent: 'center',
+    overflow: 'hidden',
     elevation: 2,
+  },
+  actionGradient: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    gap: 8,
+  },
+  actionText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: 'bold',
+  },
+  streakCard: {
+    marginHorizontal: 16,
+    marginBottom: 24,
+    elevation: 2,
+    borderRadius: 12,
+  },
+  streakContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 16,
+  },
+  streakInfo: {
+    flex: 1,
+  },
+  fab: {
+    position: 'absolute',
+    margin: 16,
+    right: 0,
+    bottom: 0,
+    elevation: 8,
   },
 });
