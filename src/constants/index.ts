@@ -201,6 +201,10 @@ export const STORAGE_KEYS = {
   packHistory: '@riftbound_pack_history',
   currency: '@riftbound_currency',
   firstLaunch: '@riftbound_first_launch',
+  points: '@riftbound_points',
+  pricing: '@riftbound_pricing',
+  featuredCards: '@riftbound_featured_cards',
+  community: '@riftbound_community',
 };
 
 // Legal Text

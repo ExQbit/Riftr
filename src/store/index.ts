@@ -1,7 +1,20 @@
 import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { Card, CollectionEntry, Deck, UserSettings, UserStats, BoosterPack } from '../types';
+import {
+  Card,
+  CollectionEntry,
+  Deck,
+  UserSettings,
+  UserStats,
+  BoosterPack,
+  CardPrice,
+  PointTransaction,
+  PointsStats,
+  FeaturedCard,
+  CommunityStats,
+  LeaderboardEntry
+} from '../types';
 import { STORAGE_KEYS } from '../constants';
 
 // Collection Store
@@ -439,13 +452,245 @@ export const useFirstLaunchStore = create<FirstLaunchStore>()(
   persist(
     (set) => ({
       isFirstLaunch: true,
-      
+
       setFirstLaunchComplete: () => {
         set({ isFirstLaunch: false });
       },
     }),
     {
       name: STORAGE_KEYS.firstLaunch,
+      storage: createJSONStorage(() => AsyncStorage),
+    }
+  )
+);
+
+// Points Tracker Store
+interface PointsStore {
+  points: PointsStats;
+  addPoints: (amount: number, reason: string) => void;
+  spendPoints: (amount: number, reason: string) => boolean;
+  updateDailyStreak: () => void;
+  resetPoints: () => void;
+}
+
+const defaultPoints: PointsStats = {
+  totalPoints: 0,
+  pointsEarned: 0,
+  pointsSpent: 0,
+  transactions: [],
+  dailyStreak: 0,
+  lastActivity: new Date().toISOString(),
+};
+
+export const usePointsStore = create<PointsStore>()(
+  persist(
+    (set, get) => ({
+      points: defaultPoints,
+
+      addPoints: (amount, reason) => {
+        const transaction: PointTransaction = {
+          id: Date.now().toString(),
+          type: 'earn',
+          amount,
+          reason,
+          date: new Date().toISOString(),
+        };
+
+        set((state) => ({
+          points: {
+            ...state.points,
+            totalPoints: state.points.totalPoints + amount,
+            pointsEarned: state.points.pointsEarned + amount,
+            transactions: [transaction, ...state.points.transactions].slice(0, 100),
+            lastActivity: new Date().toISOString(),
+          },
+        }));
+      },
+
+      spendPoints: (amount, reason) => {
+        const state = get();
+        if (state.points.totalPoints < amount) {
+          return false;
+        }
+
+        const transaction: PointTransaction = {
+          id: Date.now().toString(),
+          type: 'spend',
+          amount,
+          reason,
+          date: new Date().toISOString(),
+        };
+
+        set({
+          points: {
+            ...state.points,
+            totalPoints: state.points.totalPoints - amount,
+            pointsSpent: state.points.pointsSpent + amount,
+            transactions: [transaction, ...state.points.transactions].slice(0, 100),
+            lastActivity: new Date().toISOString(),
+          },
+        });
+
+        return true;
+      },
+
+      updateDailyStreak: () => {
+        set((state) => {
+          const lastActivity = new Date(state.points.lastActivity);
+          const now = new Date();
+          const hoursSinceLastActivity = (now.getTime() - lastActivity.getTime()) / (1000 * 60 * 60);
+
+          let newStreak = state.points.dailyStreak;
+          if (hoursSinceLastActivity >= 24 && hoursSinceLastActivity < 48) {
+            newStreak += 1;
+          } else if (hoursSinceLastActivity >= 48) {
+            newStreak = 1;
+          }
+
+          return {
+            points: {
+              ...state.points,
+              dailyStreak: newStreak,
+              lastActivity: new Date().toISOString(),
+            },
+          };
+        });
+      },
+
+      resetPoints: () => {
+        set({ points: defaultPoints });
+      },
+    }),
+    {
+      name: STORAGE_KEYS.points,
+      storage: createJSONStorage(() => AsyncStorage),
+    }
+  )
+);
+
+// Card Pricing Store
+interface PricingStore {
+  prices: Map<string, CardPrice>;
+  updatePrice: (cardId: string, price: Omit<CardPrice, 'cardId'>) => void;
+  getPrice: (cardId: string) => CardPrice | undefined;
+  clearPrices: () => void;
+}
+
+export const usePricingStore = create<PricingStore>()(
+  persist(
+    (set, get) => ({
+      prices: new Map(),
+
+      updatePrice: (cardId, priceData) => {
+        set((state) => {
+          const newPrices = new Map(state.prices);
+          newPrices.set(cardId, {
+            ...priceData,
+            cardId,
+          });
+          return { prices: newPrices };
+        });
+      },
+
+      getPrice: (cardId) => {
+        const state = get();
+        return state.prices.get(cardId);
+      },
+
+      clearPrices: () => {
+        set({ prices: new Map() });
+      },
+    }),
+    {
+      name: STORAGE_KEYS.pricing,
+      storage: createJSONStorage(() => AsyncStorage),
+      partialize: (state) => ({
+        prices: Object.fromEntries(state.prices),
+      }),
+      onRehydrateStorage: () => (state) => {
+        if (state && state.prices) {
+          state.prices = new Map(Object.entries(state.prices as any));
+        }
+      },
+    }
+  )
+);
+
+// Featured Cards Store
+interface FeaturedCardsStore {
+  featuredCards: FeaturedCard[];
+  currentFeaturedCard: FeaturedCard | null;
+  setFeaturedCards: (cards: FeaturedCard[]) => void;
+  updateCurrentFeaturedCard: () => void;
+}
+
+export const useFeaturedCardsStore = create<FeaturedCardsStore>()(
+  persist(
+    (set, get) => ({
+      featuredCards: [],
+      currentFeaturedCard: null,
+
+      setFeaturedCards: (cards) => {
+        set({ featuredCards: cards });
+        get().updateCurrentFeaturedCard();
+      },
+
+      updateCurrentFeaturedCard: () => {
+        const state = get();
+        const now = new Date();
+
+        const currentCard = state.featuredCards.find((card) => {
+          const start = new Date(card.startDate);
+          const end = new Date(card.endDate);
+          return now >= start && now <= end;
+        });
+
+        set({ currentFeaturedCard: currentCard || null });
+      },
+    }),
+    {
+      name: STORAGE_KEYS.featuredCards,
+      storage: createJSONStorage(() => AsyncStorage),
+    }
+  )
+);
+
+// Community Stats Store (Read-only, fetched from backend)
+interface CommunityStore {
+  stats: CommunityStats | null;
+  leaderboard: LeaderboardEntry[];
+  updateCommunityStats: (stats: CommunityStats) => void;
+  updateLeaderboard: (leaderboard: LeaderboardEntry[]) => void;
+}
+
+const defaultCommunityStats: CommunityStats = {
+  totalUsers: 0,
+  totalCardsCollected: 0,
+  mostCollectedCard: '',
+  rarityDistribution: {
+    common: 0,
+    uncommon: 0,
+    rare: 0,
+    legendary: 0,
+  },
+};
+
+export const useCommunityStore = create<CommunityStore>()(
+  persist(
+    (set) => ({
+      stats: defaultCommunityStats,
+      leaderboard: [],
+
+      updateCommunityStats: (stats) => {
+        set({ stats });
+      },
+
+      updateLeaderboard: (leaderboard) => {
+        set({ leaderboard });
+      },
+    }),
+    {
+      name: STORAGE_KEYS.community,
       storage: createJSONStorage(() => AsyncStorage),
     }
   )

@@ -126,3 +126,65 @@ export interface UserStats {
   favoriteCard?: string;
   lastPackOpened?: string;
 }
+
+// Card Pricing Interface
+export interface CardPrice {
+  cardId: string;
+  normalPrice: number;
+  foilPrice: number;
+  currency: 'USD' | 'EUR';
+  source: 'tcgplayer' | 'cardmarket' | 'manual';
+  lastUpdated: string;
+  trend: 'up' | 'down' | 'stable';
+}
+
+// Point Tracker Interface
+export interface PointTransaction {
+  id: string;
+  type: 'earn' | 'spend';
+  amount: number;
+  reason: string;
+  date: string;
+}
+
+export interface PointsStats {
+  totalPoints: number;
+  pointsEarned: number;
+  pointsSpent: number;
+  transactions: PointTransaction[];
+  dailyStreak: number;
+  lastActivity: string;
+}
+
+// Featured Card Interface
+export interface FeaturedCard {
+  cardId: string;
+  title: string;
+  description: string; // Mechanik-Erklärung oder Lore
+  type: 'mechanic' | 'lore' | 'spotlight';
+  startDate: string;
+  endDate: string;
+}
+
+// Community Stats Interface
+export interface CommunityStats {
+  totalUsers: number;
+  totalCardsCollected: number;
+  mostCollectedCard: string;
+  rarityDistribution: {
+    common: number;
+    uncommon: number;
+    rare: number;
+    legendary: number;
+  };
+}
+
+// Leaderboard Entry
+export interface LeaderboardEntry {
+  rank: number;
+  username: string;
+  uniqueCards: number;
+  totalCards: number;
+  completionRate: number;
+  avatar?: string;
+}

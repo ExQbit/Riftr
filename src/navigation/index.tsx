@@ -5,24 +5,26 @@ import { createStackNavigator } from '@react-navigation/stack';
 import { Ionicons } from '@expo/vector-icons';
 import { useTheme } from 'react-native-paper';
 
-// Import screens (will be created next)
+// Import screens
+import NewHomeScreen from '../screens/NewHomeScreen';
 import HomeScreen from '../screens/HomeScreen';
 import CollectionScreen from '../screens/CollectionScreen';
 import DatabaseScreen from '../screens/DatabaseScreen';
 import DecksScreen from '../screens/DecksScreen';
+import ProfileScreen from '../screens/ProfileScreen';
 import SettingsScreen from '../screens/SettingsScreen';
 import CardDetailScreen from '../screens/CardDetailScreen';
 import PackOpeningScreen from '../screens/PackOpeningScreen';
 import DeckBuilderScreen from '../screens/DeckBuilderScreen';
+import CardScannerScreen from '../screens/CardScannerScreen';
 import ApiTestScreen from '../screens/ApiTestScreen';
 
 // Type definitions for navigation
 export type RootTabParamList = {
   Home: undefined;
   Collection: undefined;
-  Database: undefined;
   Decks: undefined;
-  Settings: undefined;
+  Profile: undefined;
 };
 
 export type RootStackParamList = {
@@ -30,6 +32,10 @@ export type RootStackParamList = {
   CardDetail: { cardId: string };
   PackOpening: { packType: 'starter' | 'foundations_booster' | 'expansion_booster' };
   DeckBuilder: { deckId?: string };
+  CardScanner: undefined;
+  Settings: undefined;
+  Database: undefined;
+  PackSelection: undefined;
   ApiTest: undefined;
 };
 
@@ -53,28 +59,33 @@ function TabNavigator() {
             case 'Collection':
               iconName = focused ? 'albums' : 'albums-outline';
               break;
-            case 'Database':
-              iconName = focused ? 'search' : 'search-outline';
-              break;
             case 'Decks':
               iconName = focused ? 'layers' : 'layers-outline';
               break;
-            case 'Settings':
-              iconName = focused ? 'settings' : 'settings-outline';
+            case 'Profile':
+              iconName = focused ? 'person' : 'person-outline';
               break;
           }
 
           return <Ionicons name={iconName} size={size} color={color} />;
         },
         tabBarActiveTintColor: theme.colors.primary,
-        tabBarInactiveTintColor: theme.colors.onSurface,
+        tabBarInactiveTintColor: theme.colors.onSurfaceVariant,
         tabBarStyle: {
           backgroundColor: theme.colors.surface,
           borderTopColor: theme.colors.surfaceVariant,
           borderTopWidth: 1,
+          height: 60,
+          paddingBottom: 8,
+          paddingTop: 8,
+        },
+        tabBarLabelStyle: {
+          fontSize: 12,
+          fontWeight: '600',
         },
         headerStyle: {
           backgroundColor: theme.colors.surface,
+          elevation: 0,
         },
         headerTintColor: theme.colors.onSurface,
         headerTitleStyle: {
@@ -82,30 +93,37 @@ function TabNavigator() {
         },
       })}
     >
-      <Tab.Screen 
-        name="Home" 
-        component={HomeScreen} 
-        options={{ title: 'Booster Packs' }}
+      <Tab.Screen
+        name="Home"
+        component={NewHomeScreen}
+        options={{
+          title: 'Home',
+          headerTitle: 'Riftbound',
+        }}
       />
-      <Tab.Screen 
-        name="Collection" 
+      <Tab.Screen
+        name="Collection"
         component={CollectionScreen}
-        options={{ title: 'My Collection' }}
+        options={{
+          title: 'Sammlung',
+          headerTitle: 'Meine Sammlung',
+        }}
       />
-      <Tab.Screen 
-        name="Database" 
-        component={DatabaseScreen}
-        options={{ title: 'Card Database' }}
-      />
-      <Tab.Screen 
-        name="Decks" 
+      <Tab.Screen
+        name="Decks"
         component={DecksScreen}
-        options={{ title: 'My Decks' }}
+        options={{
+          title: 'Decks',
+          headerTitle: 'Meine Decks',
+        }}
       />
-      <Tab.Screen 
-        name="Settings" 
-        component={SettingsScreen}
-        options={{ title: 'Settings' }}
+      <Tab.Screen
+        name="Profile"
+        component={ProfileScreen}
+        options={{
+          title: 'Profil',
+          headerTitle: 'Mein Profil',
+        }}
       />
     </Tab.Navigator>
   );
@@ -136,17 +154,58 @@ export default function Navigation() {
         <Stack.Screen
           name="CardDetail"
           component={CardDetailScreen}
-          options={{ title: 'Card Details' }}
+          options={{
+            title: 'Kartendetails',
+            headerBackTitle: 'Zurück',
+          }}
         />
         <Stack.Screen
           name="PackOpening"
           component={PackOpeningScreen}
-          options={{ title: 'Opening Pack' }}
+          options={{
+            title: 'Pack öffnen',
+            headerBackTitle: 'Zurück',
+          }}
         />
         <Stack.Screen
           name="DeckBuilder"
           component={DeckBuilderScreen}
-          options={{ title: 'Deck Builder' }}
+          options={{
+            title: 'Deck Builder',
+            headerBackTitle: 'Zurück',
+          }}
+        />
+        <Stack.Screen
+          name="CardScanner"
+          component={CardScannerScreen}
+          options={{
+            title: 'Karte scannen',
+            headerBackTitle: 'Zurück',
+          }}
+        />
+        <Stack.Screen
+          name="Settings"
+          component={SettingsScreen}
+          options={{
+            title: 'Einstellungen',
+            headerBackTitle: 'Zurück',
+          }}
+        />
+        <Stack.Screen
+          name="Database"
+          component={DatabaseScreen}
+          options={{
+            title: 'Kartendatenbank',
+            headerBackTitle: 'Zurück',
+          }}
+        />
+        <Stack.Screen
+          name="PackSelection"
+          component={HomeScreen}
+          options={{
+            title: 'Packs öffnen',
+            headerBackTitle: 'Zurück',
+          }}
         />
         <Stack.Screen
           name="ApiTest"
