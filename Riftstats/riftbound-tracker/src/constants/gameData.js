@@ -9,7 +9,7 @@ export const RUNE_COLORS = {
   'Mind': { color: '#2E86AB', gradient: 'from-blue-500 to-blue-600', name: 'Mind', icon: '/runes/Mind.webp' },
   'Chaos': { color: '#7B68EE', gradient: 'from-purple-500 to-purple-600', name: 'Chaos', icon: '/runes/Chaos.webp' },
   'Calm': { color: '#2D936C', gradient: 'from-green-500 to-green-600', name: 'Calm', icon: '/runes/Calm.webp' },
-  'Body': { color: '#FF8C42', gradient: 'from-riftbound-500 to-riftbound-600', name: 'Body', icon: '/runes/Body.webp' },
+  'Body': { color: '#FF8C42', gradient: 'from-amber-500 to-amber-600', name: 'Body', icon: '/runes/Body.webp' },
   'Order': { color: '#D4AF37', gradient: 'from-yellow-500 to-yellow-600', name: 'Order', icon: '/runes/Order.webp' },
   'Colorless': { color: '#6C757D', gradient: 'from-gray-500 to-gray-600', name: 'Colorless', icon: '' }
 };

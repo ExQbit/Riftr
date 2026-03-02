@@ -81,6 +81,18 @@ const CardsTab = React.memo(function CardsTab({ allCards }) {
 
   return (
     <div className="space-y-4">
+      {/* Gold Ornament Header */}
+      <div className="text-center pt-3 pb-1">
+        <div className="flex items-center justify-center gap-3 mb-2">
+          <div className="h-px w-12 bg-gradient-to-r from-transparent to-amber-500/50" />
+          <div className="w-1.5 h-1.5 rotate-45 bg-amber-500/60" />
+          <div className="h-px w-12 bg-gradient-to-l from-transparent to-amber-500/50" />
+        </div>
+        <h2 className="text-xs font-black uppercase tracking-[0.3em] bg-gradient-to-r from-amber-200 via-yellow-100 to-amber-200 bg-clip-text text-transparent">
+          Knowledge Is Power
+        </h2>
+      </div>
+
       {/* Search */}
       <div className="relative">
         <Search className="absolute left-4 top-3.5 text-slate-500" size={18} />
@@ -89,7 +101,7 @@ const CardsTab = React.memo(function CardsTab({ allCards }) {
           placeholder="Search cards..."
           value={searchQuery}
           onChange={e => setSearchQuery(e.target.value)}
-          className="w-full bg-slate-900 border border-slate-800 rounded-xl py-3 pl-12 pr-4 text-sm focus:ring-2 ring-riftbound-600 outline-none"
+          className="w-full bg-slate-900 border border-slate-800 rounded-xl py-3 pl-12 pr-4 text-sm focus:ring-2 ring-amber-500/40 outline-none"
         />
       </div>
 
@@ -132,7 +144,7 @@ const CardsTab = React.memo(function CardsTab({ allCards }) {
                 }
                 return next;
               })}
-              className={`p-1.5 rounded-full transition-all active:scale-95 ${isActive ? 'ring-2 ring-white bg-slate-800' : 'opacity-40'}`}
+              className={`p-1.5 rounded-full transition-all active:scale-95 ${isActive ? 'ring-2 ring-amber-400/80 bg-amber-500/10' : 'opacity-40'}`}
             >
               <img src={RUNE_COLORS[domain].icon} alt={domain} className="w-10 h-10" style={{ translate: offset }} />
             </button>
@@ -148,9 +160,9 @@ const CardsTab = React.memo(function CardsTab({ allCards }) {
             <button
               key={cost}
               onClick={() => setCostFilter(prev => prev === cost ? '' : cost)}
-              className={`w-10 h-10 rounded-full text-xs font-black flex items-center justify-center transition-all active:scale-95 ${
+              className={`w-11 h-11 rounded-full text-xs font-black flex items-center justify-center transition-all active:scale-95 ${
                 isActive
-                  ? 'bg-riftbound-500 text-white ring-2 ring-riftbound-300'
+                  ? 'bg-amber-500 text-white ring-2 ring-amber-300'
                   : 'bg-slate-800 text-slate-500 opacity-60'
               }`}
             >
@@ -160,8 +172,12 @@ const CardsTab = React.memo(function CardsTab({ allCards }) {
         })}
       </div>
 
-      {/* Results count */}
-      <p className="text-[10px] text-slate-500 font-bold px-1">{filteredCards.length} cards</p>
+      {/* Results divider */}
+      <div className="flex items-center gap-2 px-1">
+        <Search size={12} className="text-amber-500/50" />
+        <span className="text-[10px] font-bold uppercase tracking-[0.15em] text-amber-500/40">{filteredCards.length} Cards</span>
+        <div className="h-px flex-1 bg-gradient-to-r from-amber-500/15 to-transparent" />
+      </div>
 
       {/* Card Grid */}
       <div className="grid grid-cols-3 gap-2">

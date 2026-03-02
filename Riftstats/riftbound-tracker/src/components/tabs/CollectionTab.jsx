@@ -122,19 +122,31 @@ export default function CollectionTab({ allCards, collection, addCard, removeCar
 
   const pillClass = (isActive) =>
     `px-4 py-2 rounded-full text-xs font-bold whitespace-nowrap transition-all active:scale-95 ${
-      isActive ? 'bg-riftbound-600 text-white' : 'bg-slate-900 text-slate-400 border border-slate-800'
+      isActive ? 'bg-amber-600 text-white' : 'bg-slate-900 text-slate-400 border border-slate-800'
     }`;
 
   return (
     <div className="space-y-4 pb-24">
+      {/* Gold Ornament Header */}
+      <div className="text-center pt-3 pb-1">
+        <div className="flex items-center justify-center gap-3 mb-2">
+          <div className="h-px w-12 bg-gradient-to-r from-transparent to-amber-500/50" />
+          <div className="w-1.5 h-1.5 rotate-45 bg-amber-500/60" />
+          <div className="h-px w-12 bg-gradient-to-l from-transparent to-amber-500/50" />
+        </div>
+        <h2 className="text-xs font-black uppercase tracking-[0.3em] bg-gradient-to-r from-amber-200 via-yellow-100 to-amber-200 bg-clip-text text-transparent">
+          Claim Your Legacy
+        </h2>
+      </div>
+
       {/* ===== COLLECTION STATS ===== */}
-      <div className="bg-slate-900 border border-slate-800 rounded-3xl p-6">
+      <div className="bg-slate-900 border border-amber-500/10 rounded-3xl p-6">
         <div className="flex items-center gap-5">
           {/* Progress Ring — same size as Stats WinRateRing (140px) */}
           <div className="relative flex-shrink-0" style={{ width: 140, height: 140 }}>
             <svg width={140} height={140} className="transform -rotate-90">
               <circle cx={70} cy={70} r={60} stroke="rgba(255,255,255,0.05)" strokeWidth={10} fill="none" />
-              <circle cx={70} cy={70} r={60} stroke="#7c3aed" strokeWidth={10} fill="none"
+              <circle cx={70} cy={70} r={60} stroke="#d97706" strokeWidth={10} fill="none"
                 strokeLinecap="round"
                 strokeDasharray={2 * Math.PI * 60}
                 strokeDashoffset={2 * Math.PI * 60 - (parseFloat(stats.pct) / 100) * 2 * Math.PI * 60}
@@ -155,7 +167,7 @@ export default function CollectionTab({ allCards, collection, addCard, removeCar
             </div>
             <div>
               <p className="text-[10px] font-black text-slate-500 uppercase mb-0.5">Total Copies</p>
-              <p className="text-lg font-black text-riftbound-400">{stats.totalCopies}</p>
+              <p className="text-lg font-black text-amber-400">{stats.totalCopies}</p>
             </div>
           </div>
         </div>
@@ -167,7 +179,7 @@ export default function CollectionTab({ allCards, collection, addCard, removeCar
               <div key={s.id} className="flex items-center gap-2">
                 <span className="text-[10px] font-bold text-slate-400 w-16 truncate">{s.id}</span>
                 <div className="flex-1 bg-slate-800 rounded-full h-2 overflow-hidden">
-                  <div className="h-2 rounded-full bg-riftbound-500 transition-all duration-500"
+                  <div className="h-2 rounded-full bg-amber-500 transition-all duration-500"
                     style={{ width: `${s.pct}%` }} />
                 </div>
                 <span className="text-[10px] font-bold text-slate-500 w-20 text-right">
@@ -179,7 +191,13 @@ export default function CollectionTab({ allCards, collection, addCard, removeCar
         )}
       </div>
 
-      {/* ===== OWNERSHIP FILTER ===== */}
+      {/* Ownership divider */}
+      <div className="flex items-center gap-2 px-1">
+        <BookOpen size={12} className="text-amber-500/50" />
+        <span className="text-[10px] font-bold uppercase tracking-[0.15em] text-amber-500/40">Ownership</span>
+        <div className="h-px flex-1 bg-gradient-to-r from-amber-500/15 to-transparent" />
+      </div>
+
       <div className="flex gap-2 overflow-x-auto pb-1 no-scrollbar">
         <button onClick={() => setOwnershipFilter('all')} className={pillClass(ownershipFilter === 'all')}>
           All ({allCards.length})
@@ -200,7 +218,7 @@ export default function CollectionTab({ allCards, collection, addCard, removeCar
           placeholder="Search cards..."
           value={searchQuery}
           onChange={e => setSearchQuery(e.target.value)}
-          className="w-full bg-slate-900 border border-slate-800 rounded-xl py-3 pl-12 pr-4 text-sm focus:ring-2 ring-riftbound-600 outline-none"
+          className="w-full bg-slate-900 border border-slate-800 rounded-xl py-3 pl-12 pr-4 text-sm focus:ring-2 ring-amber-500/40 outline-none"
         />
       </div>
 
@@ -243,7 +261,7 @@ export default function CollectionTab({ allCards, collection, addCard, removeCar
                 }
                 return next;
               })}
-              className={`p-1.5 rounded-full transition-all active:scale-95 ${isActive ? 'ring-2 ring-white bg-slate-800' : 'opacity-40'}`}
+              className={`p-1.5 rounded-full transition-all active:scale-95 ${isActive ? 'ring-2 ring-amber-400/80 bg-amber-500/10' : 'opacity-40'}`}
             >
               <img src={RUNE_COLORS[domain].icon} alt={domain} className="w-10 h-10" style={{ translate: offset }} />
             </button>
@@ -259,9 +277,9 @@ export default function CollectionTab({ allCards, collection, addCard, removeCar
             <button
               key={cost}
               onClick={() => setCostFilter(prev => prev === cost ? '' : cost)}
-              className={`w-10 h-10 rounded-full text-xs font-black flex items-center justify-center transition-all active:scale-95 ${
+              className={`w-11 h-11 rounded-full text-xs font-black flex items-center justify-center transition-all active:scale-95 ${
                 isActive
-                  ? 'bg-riftbound-500 text-white ring-2 ring-riftbound-300'
+                  ? 'bg-amber-500 text-white ring-2 ring-amber-300'
                   : 'bg-slate-800 text-slate-500 opacity-60'
               }`}
             >
@@ -271,10 +289,12 @@ export default function CollectionTab({ allCards, collection, addCard, removeCar
         })}
       </div>
 
-      {/* ===== RESULTS COUNT ===== */}
-      <p className="text-[10px] text-slate-500 font-bold px-1">
-        {filteredCards.length} cards · {ownedInFilter} owned
-      </p>
+      {/* Results divider */}
+      <div className="flex items-center gap-2 px-1">
+        <Package size={12} className="text-amber-500/50" />
+        <span className="text-[10px] font-bold uppercase tracking-[0.15em] text-amber-500/40">{filteredCards.length} Cards · {ownedInFilter} Owned</span>
+        <div className="h-px flex-1 bg-gradient-to-r from-amber-500/15 to-transparent" />
+      </div>
 
       {/* ===== CARD GRID ===== */}
       <div className="grid grid-cols-3 gap-2">
@@ -285,11 +305,8 @@ export default function CollectionTab({ allCards, collection, addCard, removeCar
             quantity={getQuantity(card.id)}
             isEditing={editingCard === card.id}
             onTap={() => {
-              if (editingCard === card.id) {
-                setEditingCard(null);
-              } else {
-                setEditingCard(card.id);
-              }
+              if (editingCard && editingCard !== card.id) { setEditingCard(null); return; }
+              setEditingCard(editingCard === card.id ? null : card.id);
             }}
             onLongPress={() => setPreviewCard(card)}
             onAdd={() => addCard(card.id)}
@@ -311,11 +328,12 @@ function CollectionCardItem({ card, quantity, isEditing, onTap, onLongPress, onA
 
   return (
     <div
-      className={`relative ${isLandscape ? 'col-span-2' : ''}`}
+      id={`col-card-${card.id}`}
+      className={`relative overflow-hidden rounded-xl ${isLandscape ? 'col-span-2' : ''}`}
       style={{ touchAction: 'manipulation' }}
       {...handlers}
     >
-      <div className={`${CARD_CONTAINER} ${aspect}`}>
+      <div className={`relative ${aspect} ${isEditing ? 'ring-2 ring-amber-400/80 rounded-xl' : ''}`}>
         <img
           src={card.media?.image_url}
           alt={card.name}
@@ -325,8 +343,8 @@ function CollectionCardItem({ card, quantity, isEditing, onTap, onLongPress, onA
         />
 
         {/* Quantity badge */}
-        <div className={`absolute top-1 right-1 font-black text-xs rounded-full w-6 h-6 flex items-center justify-center pointer-events-none ${
-          isOwned ? 'bg-riftbound-600 text-white' : 'bg-slate-800/80 text-slate-500 border border-slate-600'
+        <div className={`absolute bottom-1 left-1 font-black text-[10px] rounded-md px-1.5 py-0.5 flex items-center justify-center pointer-events-none ${
+          isOwned ? 'bg-amber-600 text-white' : 'bg-slate-800/80 text-slate-500 border border-slate-600'
         }`}>
           {quantity}
         </div>
@@ -336,8 +354,8 @@ function CollectionCardItem({ card, quantity, isEditing, onTap, onLongPress, onA
           <div
             className="absolute inset-0 bg-black/60 rounded-xl flex items-center justify-center gap-3 animate-in fade-in duration-150"
             onTouchStart={(e) => e.stopPropagation()}
-            onTouchEnd={(e) => e.stopPropagation()}
-            onClick={(e) => e.stopPropagation()}
+            onTouchEnd={(e) => { e.stopPropagation(); e.preventDefault(); onTap(); }}
+            onClick={(e) => { e.stopPropagation(); onTap(); }}
           >
             <button
               onTouchEnd={(e) => { e.stopPropagation(); e.preventDefault(); onRemove(); }}
@@ -348,11 +366,10 @@ function CollectionCardItem({ card, quantity, isEditing, onTap, onLongPress, onA
                   : 'bg-slate-700 text-slate-500'
               }`}
             >−</button>
-            <span className="text-2xl font-black text-white min-w-[28px] text-center">{quantity}</span>
             <button
               onTouchEnd={(e) => { e.stopPropagation(); e.preventDefault(); onAdd(); }}
               onClick={(e) => { e.stopPropagation(); onAdd(); }}
-              className="bg-riftbound-600 active:bg-riftbound-500 active:scale-110 text-white font-black rounded-lg px-4 py-2 text-lg transition-transform"
+              className="bg-amber-600 active:bg-amber-500 active:scale-110 text-white font-black rounded-lg px-4 py-2 text-lg transition-transform"
             >+</button>
           </div>
         )}

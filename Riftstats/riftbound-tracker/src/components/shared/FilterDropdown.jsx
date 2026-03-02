@@ -60,7 +60,7 @@ export default function FilterDropdown({ label, value, options, onChange }) {
         onClick={() => setIsOpen(!isOpen)}
         className={`flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-bold whitespace-nowrap transition-all flex-shrink-0 ${
           hasValue
-            ? 'bg-riftbound-600 text-white'
+            ? 'bg-amber-600 text-white'
             : 'bg-slate-900 text-slate-400 border border-slate-800'
         }`}
       >
@@ -88,7 +88,7 @@ export default function FilterDropdown({ label, value, options, onChange }) {
           <button
             onClick={() => { onChange(''); setIsOpen(false); }}
             className={`w-full text-left px-4 py-2.5 text-xs font-bold transition-all ${
-              !hasValue ? 'text-riftbound-500 bg-slate-700/50' : 'text-slate-300 hover:bg-slate-700'
+              !hasValue ? 'text-amber-400 bg-slate-700/50' : 'text-slate-300 hover:bg-slate-700'
             }`}
           >
             All
@@ -98,7 +98,7 @@ export default function FilterDropdown({ label, value, options, onChange }) {
               key={opt.value}
               onClick={() => { onChange(opt.value); setIsOpen(false); }}
               className={`w-full text-left px-4 py-2.5 text-xs font-bold transition-all ${
-                value === opt.value ? 'text-riftbound-500 bg-slate-700/50' : 'text-slate-300 hover:bg-slate-700'
+                value === opt.value ? 'text-amber-400 bg-slate-700/50' : 'text-slate-300 hover:bg-slate-700'
               }`}
             >
               {opt.label}{opt.count !== undefined ? ` (${opt.count})` : ''}
