@@ -8,18 +8,23 @@ export function computeStats(matches) {
   const sorted = [...matches].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
   const sortedDesc = [...sorted].reverse();
 
+  const wr = (w, total) => total > 0 ? (w / total * 100).toFixed(1) : '0.0';
+
   // --- CORE ---
   const wins = matches.filter(m => m.result === 'win').length;
-  const losses = matches.length - wins;
-  const winRate = (wins / matches.length * 100).toFixed(1);
+  const losses = matches.filter(m => m.result === 'loss').length;
+  const draws = matches.filter(m => m.result === 'draw').length;
+  const winRate = wr(wins, matches.length);
 
   // --- STREAKS ---
   let currentStreak = 0;
   let currentStreakType = null;
   let bestWinStreak = 0;
   let bestLossStreak = 0;
+  let bestDrawStreak = 0;
   let tempWin = 0;
   let tempLoss = 0;
+  let tempDraw = 0;
 
   for (const m of sortedDesc) {
     if (currentStreakType === null) {
@@ -36,24 +41,34 @@ export function computeStats(matches) {
     if (m.result === 'win') {
       tempWin++;
       tempLoss = 0;
+      tempDraw = 0;
       if (tempWin > bestWinStreak) bestWinStreak = tempWin;
-    } else {
+    } else if (m.result === 'loss') {
       tempLoss++;
       tempWin = 0;
+      tempDraw = 0;
       if (tempLoss > bestLossStreak) bestLossStreak = tempLoss;
+    } else {
+      tempDraw++;
+      tempWin = 0;
+      tempLoss = 0;
+      if (tempDraw > bestDrawStreak) bestDrawStreak = tempDraw;
     }
   }
 
   // --- RECENT FORM ---
   const recentForm = (n) => {
     const recent = sortedDesc.slice(0, n);
-    if (recent.length === 0) return { wins: 0, losses: 0, total: 0, winRate: '0.0', results: [] };
+    if (recent.length === 0) return { wins: 0, losses: 0, draws: 0, total: 0, winRate: '0.0', results: [] };
     const w = recent.filter(m => m.result === 'win').length;
+    const l = recent.filter(m => m.result === 'loss').length;
+    const d = recent.length - w - l;
     return {
       wins: w,
-      losses: recent.length - w,
+      losses: l,
+      draws: d,
       total: recent.length,
-      winRate: (w / recent.length * 100).toFixed(1),
+      winRate: wr(w, recent.length),
       results: recent.map(m => m.result),
     };
   };
@@ -97,12 +112,13 @@ export function computeStats(matches) {
   }
 
   // --- FIRST vs SECOND ---
+  // --- FIRST vs SECOND ---
   const firstMatches = matches.filter(m => m.isFirst);
   const secondMatches = matches.filter(m => !m.isFirst);
   const firstWins = firstMatches.filter(m => m.result === 'win').length;
   const secondWins = secondMatches.filter(m => m.result === 'win').length;
-  const firstWR = firstMatches.length > 0 ? (firstWins / firstMatches.length * 100).toFixed(1) : '0.0';
-  const secondWR = secondMatches.length > 0 ? (secondWins / secondMatches.length * 100).toFixed(1) : '0.0';
+  const firstWR = wr(firstWins, firstMatches.length);
+  const secondWR = wr(secondWins, secondMatches.length);
 
   const firstScored = firstMatches.filter(m => m.myScore !== undefined);
   const secondScored = secondMatches.filter(m => m.myScore !== undefined);
@@ -119,7 +135,7 @@ export function computeStats(matches) {
       deckMap[key] = {
         name: m.deckName || 'Unknown',
         legendName: m.legendName || '',
-        wins: 0, losses: 0, total: 0,
+        wins: 0, losses: 0, draws: 0, total: 0,
         firstWins: 0, firstTotal: 0,
         secondWins: 0, secondTotal: 0,
         totalMyScore: 0, totalOppScore: 0, scoredGames: 0,
@@ -130,7 +146,8 @@ export function computeStats(matches) {
     const d = deckMap[key];
     d.total++;
     if (m.result === 'win') d.wins++;
-    else d.losses++;
+    else if (m.result === 'loss') d.losses++;
+    else d.draws++;
 
     if (m.isFirst) {
       d.firstTotal++;
@@ -147,10 +164,11 @@ export function computeStats(matches) {
     }
 
     const opp = m.opponent || 'Unknown';
-    if (!d.matchups[opp]) d.matchups[opp] = { wins: 0, losses: 0, total: 0, recentResults: [] };
+    if (!d.matchups[opp]) d.matchups[opp] = { wins: 0, losses: 0, draws: 0, total: 0, recentResults: [] };
     d.matchups[opp].total++;
     if (m.result === 'win') d.matchups[opp].wins++;
-    else d.matchups[opp].losses++;
+    else if (m.result === 'loss') d.matchups[opp].losses++;
+    else d.matchups[opp].draws++;
     if (d.matchups[opp].recentResults.length < 10) d.matchups[opp].recentResults.push(m.result);
   });
 
@@ -163,16 +181,16 @@ export function computeStats(matches) {
 
   const deckStats = Object.values(deckMap).map(d => ({
     ...d,
-    winRate: d.total > 0 ? (d.wins / d.total * 100).toFixed(1) : '0.0',
-    firstWR: d.firstTotal > 0 ? (d.firstWins / d.firstTotal * 100).toFixed(1) : '-',
-    secondWR: d.secondTotal > 0 ? (d.secondWins / d.secondTotal * 100).toFixed(1) : '-',
+    winRate: wr(d.wins, d.total),
+    firstWR: d.firstTotal > 0 ? wr(d.firstWins, d.firstTotal) : '-',
+    secondWR: d.secondTotal > 0 ? wr(d.secondWins, d.secondTotal) : '-',
     avgMyScore: d.scoredGames > 0 ? (d.totalMyScore / d.scoredGames).toFixed(1) : '-',
     avgOppScore: d.scoredGames > 0 ? (d.totalOppScore / d.scoredGames).toFixed(1) : '-',
     avgDiff: d.scoredGames > 0 ? ((d.totalMyScore - d.totalOppScore) / d.scoredGames).toFixed(1) : '-',
     matchups: Object.entries(d.matchups)
       .map(([opp, data]) => ({
         opponent: opp, ...data,
-        winRate: data.total > 0 ? (data.wins / data.total * 100).toFixed(1) : '0.0',
+        winRate: wr(data.wins, data.total),
       }))
       .sort((a, b) => b.total - a.total),
   })).sort((a, b) => b.total - a.total);
@@ -183,7 +201,7 @@ export function computeStats(matches) {
     const opp = m.opponent || 'Unknown';
     if (!matchupMap[opp]) {
       matchupMap[opp] = {
-        wins: 0, losses: 0, total: 0,
+        wins: 0, losses: 0, draws: 0, total: 0,
         firstWins: 0, firstTotal: 0,
         secondWins: 0, secondTotal: 0,
         recentResults: [],
@@ -193,11 +211,12 @@ export function computeStats(matches) {
     const mu = matchupMap[opp];
     mu.total++;
     if (m.result === 'win') mu.wins++;
-    else mu.losses++;
-    if (m.isFirst) {
+    else if (m.result === 'loss') mu.losses++;
+    else mu.draws++;
+    if (m.isFirst === true) {
       mu.firstTotal++;
       if (m.result === 'win') mu.firstWins++;
-    } else {
+    } else if (m.isFirst === false) {
       mu.secondTotal++;
       if (m.result === 'win') mu.secondWins++;
     }
@@ -207,7 +226,7 @@ export function computeStats(matches) {
     if (!mu.decks[deckKey]) {
       mu.decks[deckKey] = {
         name: deckName, legendName: m.legendName || null,
-        wins: 0, losses: 0, total: 0,
+        wins: 0, losses: 0, draws: 0, total: 0,
         firstWins: 0, firstTotal: 0,
         secondWins: 0, secondTotal: 0,
         totalMyScore: 0, totalOppScore: 0, scoredGames: 0,
@@ -217,7 +236,8 @@ export function computeStats(matches) {
     const dd = mu.decks[deckKey];
     dd.total++;
     if (m.result === 'win') dd.wins++;
-    else dd.losses++;
+    else if (m.result === 'loss') dd.losses++;
+    else dd.draws++;
     if (m.isFirst) { dd.firstTotal++; if (m.result === 'win') dd.firstWins++; }
     else { dd.secondTotal++; if (m.result === 'win') dd.secondWins++; }
     if (m.myScore !== undefined && m.oppScore !== undefined) {
@@ -238,14 +258,14 @@ export function computeStats(matches) {
 
   const matchupStats = Object.entries(matchupMap).map(([opp, d]) => ({
     opponent: opp, ...d,
-    winRate: d.total > 0 ? (d.wins / d.total * 100).toFixed(1) : '0.0',
-    firstWR: d.firstTotal > 0 ? (d.firstWins / d.firstTotal * 100).toFixed(1) : '-',
-    secondWR: d.secondTotal > 0 ? (d.secondWins / d.secondTotal * 100).toFixed(1) : '-',
+    winRate: wr(d.wins, d.total),
+    firstWR: d.firstTotal > 0 ? wr(d.firstWins, d.firstTotal) : '-',
+    secondWR: d.secondTotal > 0 ? wr(d.secondWins, d.secondTotal) : '-',
     deckBreakdown: Object.values(d.decks).map(dd => ({
       ...dd,
-      winRate: dd.total > 0 ? (dd.wins / dd.total * 100).toFixed(1) : '0.0',
-      firstWR: dd.firstTotal > 0 ? (dd.firstWins / dd.firstTotal * 100).toFixed(1) : '-',
-      secondWR: dd.secondTotal > 0 ? (dd.secondWins / dd.secondTotal * 100).toFixed(1) : '-',
+      winRate: wr(dd.wins, dd.total),
+      firstWR: dd.firstTotal > 0 ? wr(dd.firstWins, dd.firstTotal) : '-',
+      secondWR: dd.secondTotal > 0 ? wr(dd.secondWins, dd.secondTotal) : '-',
       avgMyScore: dd.scoredGames > 0 ? (dd.totalMyScore / dd.scoredGames).toFixed(1) : '-',
       avgOppScore: dd.scoredGames > 0 ? (dd.totalOppScore / dd.scoredGames).toFixed(1) : '-',
       avgDiff: dd.scoredGames > 0 ? ((dd.totalMyScore - dd.totalOppScore) / dd.scoredGames).toFixed(1) : '-',
@@ -256,15 +276,16 @@ export function computeStats(matches) {
   const formatMap = {};
   matches.forEach(m => {
     const fmt = m.format || 'bo1';
-    if (!formatMap[fmt]) formatMap[fmt] = { wins: 0, losses: 0, total: 0 };
+    if (!formatMap[fmt]) formatMap[fmt] = { wins: 0, losses: 0, draws: 0, total: 0 };
     formatMap[fmt].total++;
     if (m.result === 'win') formatMap[fmt].wins++;
-    else formatMap[fmt].losses++;
+    else if (m.result === 'loss') formatMap[fmt].losses++;
+    else formatMap[fmt].draws++;
   });
   const formatStats = Object.entries(formatMap).map(([fmt, d]) => ({
     format: fmt,
     ...d,
-    winRate: d.total > 0 ? (d.wins / d.total * 100).toFixed(1) : '0.0',
+    winRate: wr(d.wins, d.total),
   })).sort((a, b) => a.format.localeCompare(b.format));
 
   // --- BF CHOSEN STATS ---
@@ -272,9 +293,9 @@ export function computeStats(matches) {
   const bfChosenGames = allGamesFlat.filter(g => g.bfChosen);
   const bfRandomGames = allGamesFlat.filter(g => !g.bfChosen);
   const bfChosenWR = bfChosenGames.length > 0
-    ? (bfChosenGames.filter(g => g.result === 'win').length / bfChosenGames.length * 100).toFixed(1) : null;
+    ? wr(bfChosenGames.filter(g => g.result === 'win').length, bfChosenGames.length) : null;
   const bfRandomWR = bfRandomGames.length > 0
-    ? (bfRandomGames.filter(g => g.result === 'win').length / bfRandomGames.length * 100).toFixed(1) : null;
+    ? wr(bfRandomGames.filter(g => g.result === 'win').length, bfRandomGames.length) : null;
   const bfStats = (bfChosenGames.length > 0 || bfRandomGames.length > 0) ? {
     chosenWR: bfChosenWR, chosenTotal: bfChosenGames.length,
     randomWR: bfRandomWR, randomTotal: bfRandomGames.length,
@@ -298,8 +319,8 @@ export function computeStats(matches) {
   });
 
   return {
-    winRate, total: matches.length, wins, losses,
-    currentStreak, currentStreakType, bestWinStreak, bestLossStreak,
+    winRate, total: matches.length, wins, losses, draws,
+    currentStreak, currentStreakType, bestWinStreak, bestLossStreak, bestDrawStreak,
     last5, last10, last20,
     scoreStats,
     firstWR, firstTotal: firstMatches.length, firstWins,

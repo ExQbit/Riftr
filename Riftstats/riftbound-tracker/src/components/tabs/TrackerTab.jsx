@@ -49,11 +49,12 @@ export default function TrackerTab({ onSaveMatch, onFullscreenChange }) {
   const [vsReady, setVsReady] = useState(false);
   const [myScore, setMyScore] = useState(0);
   const [oppScore, setOppScore] = useState(0);
-  const [pendingResult, setPendingResult] = useState(null); // 'win' or 'loss' — shown on VS overview before saving
+  const [pendingResult, setPendingResult] = useState(null); // 'win', 'loss', or 'draw' — shown on VS overview before saving
   const [isFlipping, setIsFlipping] = useState(false);
   const [games, setGames] = useState([]); // completed games in current series
   const [roundAnnounce, setRoundAnnounce] = useState(false); // true = show round badge full, then fade
   const longPressTimer = React.useRef(null);
+  const wasFlipped = React.useRef(false); // prevent tap after long-press
 
   useEffect(() => {
     onFullscreenChange?.(step === 'opponent' || step === 'battle');
@@ -219,7 +220,7 @@ export default function TrackerTab({ onSaveMatch, onFullscreenChange }) {
     // Series results
     const seriesMyWins = allGames.filter(g => g.result === 'win').length;
     const seriesOppWins = allGames.filter(g => g.result === 'loss').length;
-    const seriesResult = seriesMyWins >= seriesOppWins ? 'win' : 'loss';
+    const seriesResult = seriesMyWins > seriesOppWins ? 'win' : seriesMyWins < seriesOppWins ? 'loss' : 'draw';
     const format = allGames.length === 1 ? 'bo1' : allGames.length === 2 ? 'bo2' : 'bo3';
 
     await onSaveMatch({
@@ -547,12 +548,12 @@ export default function TrackerTab({ onSaveMatch, onFullscreenChange }) {
             </button>
           )}
 
-          {/* 1ST/2ND or WIN/LOSS diagonal banner on opponent */}
+          {/* 1ST/2ND or WIN/LOSS/DRAW diagonal banner on opponent */}
           {hasOpponent && !isBattle && (
             <div className="absolute z-20" style={{ pointerEvents: 'none', top: 0, right: 0, overflow: 'hidden', width: '150px', height: '150px' }}>
-              <div className={`absolute font-black text-[14px] tracking-widest text-white text-center ${pendingResult ? (pendingResult === 'win' ? 'bg-rose-500' : 'bg-emerald-500') : (!isFirst ? 'bg-emerald-500' : 'bg-amber-500')}`}
+              <div className={`absolute font-black text-[14px] tracking-widest text-white text-center ${pendingResult ? (pendingResult === 'win' ? 'bg-rose-500' : pendingResult === 'loss' ? 'bg-emerald-500' : 'bg-amber-500') : (!isFirst ? 'bg-emerald-500' : 'bg-amber-500')}`}
                 style={{ width: '210px', top: '35px', right: '-42px', transform: 'rotate(45deg) scaleY(-1) scaleX(-1)', padding: '6px 0', boxShadow: '0 2px 8px rgba(0,0,0,0.4)' }}>
-                {pendingResult ? (pendingResult === 'win' ? 'LOSS' : 'WIN') : (!isFirst ? '1ST' : '2ND')}
+                {pendingResult ? (pendingResult === 'win' ? 'LOSS' : pendingResult === 'loss' ? 'WIN' : 'DRAW') : (!isFirst ? '1ST' : '2ND')}
               </div>
             </div>
           )}
@@ -565,7 +566,7 @@ export default function TrackerTab({ onSaveMatch, onFullscreenChange }) {
                   className="w-14 h-14 rounded-full bg-black/50 backdrop-blur-sm border border-white/20 flex items-center justify-center active:scale-90 transition-all">
                   <Minus size={24} className="text-white/80" />
                 </button>}
-                <span className="text-7xl font-black tabular-nums drop-shadow-[0_4px_12px_rgba(0,0,0,0.8)] min-w-[80px] text-center" style={pendingResult ? { color: pendingResult === 'win' ? '#f43f5e' : '#10b981', textShadow: `0 0 20px ${pendingResult === 'win' ? 'rgba(244,63,94,0.4)' : 'rgba(16,185,129,0.4)'}, -2px -2px 0 rgba(0,0,0,0.7), 2px -2px 0 rgba(0,0,0,0.7), -2px 2px 0 rgba(0,0,0,0.7), 2px 2px 0 rgba(0,0,0,0.7)` } : { color: 'white' }}>{oppScore}</span>
+                <span className="text-7xl font-black tabular-nums drop-shadow-[0_4px_12px_rgba(0,0,0,0.8)] min-w-[80px] text-center" style={pendingResult ? { color: pendingResult === 'win' ? '#f43f5e' : pendingResult === 'loss' ? '#10b981' : '#f59e0b', textShadow: `0 0 20px ${pendingResult === 'win' ? 'rgba(244,63,94,0.4)' : pendingResult === 'loss' ? 'rgba(16,185,129,0.4)' : 'rgba(245,158,11,0.4)'}, -2px -2px 0 rgba(0,0,0,0.7), 2px -2px 0 rgba(0,0,0,0.7), -2px 2px 0 rgba(0,0,0,0.7), 2px 2px 0 rgba(0,0,0,0.7)` } : { color: 'white' }}>{oppScore}</span>
                 {!pendingResult && <button onClick={() => setOppScore(s => s + 1)}
                   className="w-14 h-14 rounded-full bg-black/50 backdrop-blur-sm border border-white/20 flex items-center justify-center active:scale-90 transition-all">
                   <Plus size={24} className="text-white/80" />
@@ -587,12 +588,12 @@ export default function TrackerTab({ onSaveMatch, onFullscreenChange }) {
             </button>
           ) : <div className="w-full h-full bg-slate-900" />}
 
-          {/* 1ST/2ND or WIN/LOSS diagonal banner on your legend */}
+          {/* 1ST/2ND or WIN/LOSS/DRAW diagonal banner on your legend */}
           {hasOpponent && !isBattle && (
             <div className="absolute z-20" style={{ pointerEvents: 'none', bottom: 0, left: 0, overflow: 'hidden', width: '150px', height: '150px' }}>
-              <div className={`absolute font-black text-[14px] tracking-widest text-white text-center ${pendingResult ? (pendingResult === 'win' ? 'bg-emerald-500' : 'bg-rose-500') : (isFirst ? 'bg-emerald-500' : 'bg-amber-500')}`}
+              <div className={`absolute font-black text-[14px] tracking-widest text-white text-center ${pendingResult ? (pendingResult === 'win' ? 'bg-emerald-500' : pendingResult === 'loss' ? 'bg-rose-500' : 'bg-amber-500') : (isFirst ? 'bg-emerald-500' : 'bg-amber-500')}`}
                 style={{ width: '210px', bottom: '35px', left: '-42px', transform: 'rotate(45deg)', padding: '6px 0', boxShadow: '0 2px 8px rgba(0,0,0,0.4)' }}>
-                {pendingResult ? (pendingResult === 'win' ? 'WIN' : 'LOSS') : (isFirst ? '1ST' : '2ND')}
+                {pendingResult ? (pendingResult === 'win' ? 'WIN' : pendingResult === 'loss' ? 'LOSS' : 'DRAW') : (isFirst ? '1ST' : '2ND')}
               </div>
             </div>
           )}
@@ -605,7 +606,7 @@ export default function TrackerTab({ onSaveMatch, onFullscreenChange }) {
                   className="w-14 h-14 rounded-full bg-black/50 backdrop-blur-sm border border-white/20 flex items-center justify-center active:scale-90 transition-all">
                   <Minus size={24} className="text-white/80" />
                 </button>}
-                <span className="text-7xl font-black tabular-nums drop-shadow-[0_4px_12px_rgba(0,0,0,0.8)] min-w-[80px] text-center" style={pendingResult ? { color: pendingResult === 'win' ? '#10b981' : '#f43f5e', textShadow: `0 0 20px ${pendingResult === 'win' ? 'rgba(16,185,129,0.4)' : 'rgba(244,63,94,0.4)'}, -2px -2px 0 rgba(0,0,0,0.7), 2px -2px 0 rgba(0,0,0,0.7), -2px 2px 0 rgba(0,0,0,0.7), 2px 2px 0 rgba(0,0,0,0.7)` } : { color: 'white' }}>{myScore}</span>
+                <span className="text-7xl font-black tabular-nums drop-shadow-[0_4px_12px_rgba(0,0,0,0.8)] min-w-[80px] text-center" style={pendingResult ? { color: pendingResult === 'win' ? '#10b981' : pendingResult === 'loss' ? '#f43f5e' : '#f59e0b', textShadow: `0 0 20px ${pendingResult === 'win' ? 'rgba(16,185,129,0.4)' : pendingResult === 'loss' ? 'rgba(244,63,94,0.4)' : 'rgba(245,158,11,0.4)'}, -2px -2px 0 rgba(0,0,0,0.7), 2px -2px 0 rgba(0,0,0,0.7), -2px 2px 0 rgba(0,0,0,0.7), 2px 2px 0 rgba(0,0,0,0.7)` } : { color: 'white' }}>{myScore}</span>
                 {!pendingResult && <button onClick={() => setMyScore(s => s + 1)}
                   className="w-14 h-14 rounded-full bg-black/50 backdrop-blur-sm border border-white/20 flex items-center justify-center active:scale-90 transition-all">
                   <Plus size={24} className="text-white/80" />
@@ -637,14 +638,19 @@ export default function TrackerTab({ onSaveMatch, onFullscreenChange }) {
               ...(isFlipping ? { animation: 'coin-flip 0.8s ease-in-out' } : {}),
               perspective: '600px'
             }}
-            onClick={() => !isFlipping && setIsFirst(f => !f)}
+            onClick={() => {
+              if (isFlipping || wasFlipped.current) { wasFlipped.current = false; return; }
+              setIsFirst(f => !f);
+            }}
             onTouchStart={() => {
+              wasFlipped.current = false;
               longPressTimer.current = setTimeout(() => {
+                wasFlipped.current = true;
                 setIsFlipping(true);
                 const flips = 6 + Math.floor(Math.random() * 4);
                 let i = 0;
                 const iv = setInterval(() => {
-                  setIsFirst(f => !f);
+                  setIsFirst(f => f === true ? false : true);
                   i++;
                   if (i >= flips) {
                     clearInterval(iv);
@@ -659,6 +665,31 @@ export default function TrackerTab({ onSaveMatch, onFullscreenChange }) {
               if (longPressTimer.current) { clearTimeout(longPressTimer.current); longPressTimer.current = null; }
             }}
             onTouchCancel={() => {
+              if (longPressTimer.current) { clearTimeout(longPressTimer.current); longPressTimer.current = null; }
+            }}
+            onMouseDown={() => {
+              wasFlipped.current = false;
+              longPressTimer.current = setTimeout(() => {
+                wasFlipped.current = true;
+                setIsFlipping(true);
+                const flips = 6 + Math.floor(Math.random() * 4);
+                let i = 0;
+                const iv = setInterval(() => {
+                  setIsFirst(f => f === true ? false : true);
+                  i++;
+                  if (i >= flips) {
+                    clearInterval(iv);
+                    setIsFirst(Math.random() < 0.5);
+                    setTimeout(() => setIsFlipping(false), 200);
+                  }
+                }, 80);
+                longPressTimer.current = null;
+              }, 500);
+            }}
+            onMouseUp={() => {
+              if (longPressTimer.current) { clearTimeout(longPressTimer.current); longPressTimer.current = null; }
+            }}
+            onMouseLeave={() => {
               if (longPressTimer.current) { clearTimeout(longPressTimer.current); longPressTimer.current = null; }
             }}
           >
@@ -713,7 +744,7 @@ export default function TrackerTab({ onSaveMatch, onFullscreenChange }) {
               overflow: 'visible',
               animation: 'vs-slam 0.5s cubic-bezier(0.34,1.56,0.64,1) forwards, vs-idle 3s ease-in-out 0.5s infinite'
             }}
-            onClick={() => setPendingResult(r => r === 'win' ? 'loss' : 'win')}
+            onClick={() => setPendingResult(r => r === 'win' ? 'loss' : r === 'loss' ? 'draw' : 'win')}
           >
             <img src="/finish-badge.png?v=2" alt="FINISH" style={{ width: '80vw', maxWidth: 'none', position: 'absolute', left: '50%', top: '50%', transform: 'translate(-50%, -50%)' }} className="pointer-events-none select-none" draggable={false} />
           </button>
@@ -730,11 +761,11 @@ export default function TrackerTab({ onSaveMatch, onFullscreenChange }) {
           style={{ transform: 'translateX(-50%) rotate(180deg)' }}>
           {/* Completed games — inverted colors for opponent */}
           {games.map((g, i) => (
-            <div key={i} className={`w-3 h-3 rounded-full ${g.result === 'win' ? 'bg-rose-500' : 'bg-emerald-500'}`} />
+            <div key={i} className={`w-3 h-3 rounded-full ${g.result === 'win' ? 'bg-rose-500' : g.result === 'loss' ? 'bg-emerald-500' : 'bg-amber-500'}`} />
           ))}
           {/* Current game dot */}
           {pendingResult ? (
-            <div className={`w-3 h-3 rounded-full transition-colors ${pendingResult === 'win' ? 'bg-rose-500' : 'bg-emerald-500'}`} />
+            <div className={`w-3 h-3 rounded-full transition-colors ${pendingResult === 'win' ? 'bg-rose-500' : pendingResult === 'loss' ? 'bg-emerald-500' : 'bg-amber-500'}`} />
           ) : (
             <div className="w-3 h-3 rounded-full bg-white/30 border border-white/50" />
           )}
@@ -750,11 +781,11 @@ export default function TrackerTab({ onSaveMatch, onFullscreenChange }) {
         <div className="absolute bottom-[env(safe-area-inset-bottom,12px)] left-1/2 -translate-x-1/2 z-30 mb-2 flex items-center gap-2 bg-black/60 backdrop-blur-sm border border-white/10 rounded-full px-3 py-1.5">
           {/* Completed games */}
           {games.map((g, i) => (
-            <div key={i} className={`w-3 h-3 rounded-full ${g.result === 'win' ? 'bg-emerald-500' : 'bg-rose-500'}`} />
+            <div key={i} className={`w-3 h-3 rounded-full ${g.result === 'win' ? 'bg-emerald-500' : g.result === 'loss' ? 'bg-rose-500' : 'bg-amber-500'}`} />
           ))}
           {/* Current game dot */}
           {pendingResult ? (
-            <div className={`w-3 h-3 rounded-full transition-colors ${pendingResult === 'win' ? 'bg-emerald-500' : 'bg-rose-500'}`} />
+            <div className={`w-3 h-3 rounded-full transition-colors ${pendingResult === 'win' ? 'bg-emerald-500' : pendingResult === 'loss' ? 'bg-rose-500' : 'bg-amber-500'}`} />
           ) : (
             <div className="w-3 h-3 rounded-full bg-white/30 border border-white/50" />
           )}
@@ -812,7 +843,7 @@ export default function TrackerTab({ onSaveMatch, onFullscreenChange }) {
       {/* ===== FINISH BUTTON — small round (Battle, bottom-right) ===== */}
       {isBattle && (
         <button onClick={() => {
-          const result = myScore > oppScore ? 'win' : myScore < oppScore ? 'loss' : 'win';
+          const result = myScore > oppScore ? 'win' : myScore < oppScore ? 'loss' : 'draw';
           setPendingResult(result);
           setStep('opponent');
         }}

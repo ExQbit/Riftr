@@ -106,9 +106,11 @@ export function generateDemoData(allCards, cardLookup) {
     // Build games array based on format
     const games = [];
     if (format === 'bo1') {
+      const myS = result === 'win' ? 1 : result === 'draw' ? 0 : 0;
+      const oppS = result === 'loss' ? 1 : 0;
       games.push({
-        myScore: result === 'win' ? 1 : 0,
-        oppScore: result === 'win' ? 0 : 1,
+        myScore: myS,
+        oppScore: oppS,
         result,
         isFirst,
         bfChosen: false,
@@ -185,6 +187,7 @@ export function generateDemoData(allCards, cardLookup) {
     makeMatch(demoDeck1, 'Lux',           'win',  'bo3', 5,  false, ''),
     makeMatch(demoDeck1, 'Azir',          'loss', 'bo1', 6,  true,  ''),
     makeMatch(demoDeck1, 'Jinx',          'win',  'bo1', 7,  false, 'Mirror match'),
+    makeMatch(demoDeck1, 'Kai\'Sa',       'draw', 'bo1', 8,  true,  'Time ran out'),
 
     // Ahri Control matches
     makeMatch(demoDeck2, 'Viktor',        'win',  'bo1', 0,  false, ''),
@@ -196,6 +199,7 @@ export function generateDemoData(allCards, cardLookup) {
     makeMatch(demoDeck2, 'Ahri',          'win',  'bo1', 9,  false, ''),
     makeMatch(demoDeck2, 'Teemo',         'loss', 'bo1', 11, true,  'Mushroom lethal on turn 7'),
     makeMatch(demoDeck2, 'Jinx',          'win',  'bo1', 13, false, ''),
+    makeMatch(demoDeck2, 'Lux',           'draw', 'bo1', 10, true,  'Both at 0-0, agreed draw'),
   ];
 
   // Compute stats

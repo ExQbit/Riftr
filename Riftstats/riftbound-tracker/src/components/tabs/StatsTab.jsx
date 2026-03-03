@@ -1,7 +1,7 @@
 import React, { useState, useMemo, useRef, useCallback } from 'react';
 import {
   Download, Trash2, Swords, Target, ChevronDown,
-  MessageSquare, Trash, X, Check, Flame, TrendingDown,
+  MessageSquare, Trash, X, Check, Flame, TrendingDown, Minus,
   Zap, Shield, BarChart3
 } from 'lucide-react';
 import { RUNE_COLORS } from '../../constants/gameData';
@@ -43,7 +43,7 @@ function FormDots({ results, max = 10 }) {
   return (
     <div className="flex gap-1 items-center">
       {dots.map((r, i) => (
-        <div key={i} className={`w-2.5 h-2.5 rounded-full ${r === 'win' ? 'bg-emerald-500' : 'bg-rose-500'}`}
+        <div key={i} className={`w-2.5 h-2.5 rounded-full ${r === 'win' ? 'bg-emerald-500' : r === 'loss' ? 'bg-rose-500' : 'bg-amber-500'}`}
           style={{ opacity: 1 - (i * 0.06) }} />
       ))}
     </div>
@@ -149,7 +149,7 @@ function WinRateTimeline({ timeline }) {
       <div className="flex items-center justify-between mb-3">
         {active ? (
           <div className="flex items-center gap-2">
-            <div className={`w-2 h-2 rounded-full ${active.result === 'win' ? 'bg-emerald-500' : 'bg-rose-500'}`} />
+            <div className={`w-2 h-2 rounded-full ${active.result === 'win' ? 'bg-emerald-500' : active.result === 'loss' ? 'bg-rose-500' : 'bg-amber-500'}`} />
             <span className="text-xs font-bold text-white">#{active.index}</span>
             <span className="text-[10px] text-slate-400">vs {active.opponent}</span>
             <span className={`text-xs font-black ${activeVal >= 50 ? 'text-emerald-400' : 'text-rose-400'}`}>
@@ -215,7 +215,7 @@ function WinRateTimeline({ timeline }) {
           return (
             <circle key={i} cx={x} cy={y}
               r={isActive ? 5 : (timeline.length <= 30 ? 3 : 0)}
-              fill={t.result === 'win' ? '#10b981' : '#f43f5e'}
+              fill={t.result === 'win' ? '#10b981' : t.result === 'loss' ? '#f43f5e' : '#f59e0b'}
               stroke={isActive ? 'white' : 'none'}
               strokeWidth={isActive ? 2 : 0}
               opacity={isActive ? 1 : 0.7}
@@ -289,6 +289,7 @@ export default function StatsTab() {
     let filtered = sortedMatches;
     if (historyFilter === 'wins') filtered = filtered.filter(m => m.result === 'win');
     if (historyFilter === 'losses') filtered = filtered.filter(m => m.result === 'loss');
+    if (historyFilter === 'draws') filtered = filtered.filter(m => m.result === 'draw');
     if (historyDeckFilter !== 'all') filtered = filtered.filter(m => (m.deckId || m.deckName) === historyDeckFilter);
     return filtered;
   }, [sortedMatches, historyFilter, historyDeckFilter]);
@@ -372,22 +373,22 @@ export default function StatsTab() {
           bfWinData[g.battlefieldId] = {
             name: bfCard?.name || 'Unknown',
             image: bfCard?.media?.image_url,
-            wins: 0, losses: 0, total: 0, opponents: {},
+            wins: 0, losses: 0, draws: 0, total: 0, opponents: {},
           };
         }
         const bf = bfWinData[g.battlefieldId];
         bf.total++;
-        if (g.result === 'win') bf.wins++; else bf.losses++;
+        if (g.result === 'win') bf.wins++; else if (g.result === 'loss') bf.losses++; else bf.draws++;
         const opp = m.opponent;
-        if (!bf.opponents[opp]) bf.opponents[opp] = { wins: 0, losses: 0, total: 0, decks: {} };
+        if (!bf.opponents[opp]) bf.opponents[opp] = { wins: 0, losses: 0, draws: 0, total: 0, decks: {} };
         const oppData = bf.opponents[opp];
         oppData.total++;
-        if (g.result === 'win') oppData.wins++; else oppData.losses++;
+        if (g.result === 'win') oppData.wins++; else if (g.result === 'loss') oppData.losses++; else oppData.draws++;
         const deckName = m.deckName || 'Unknown';
-        if (!oppData.decks[deckName]) oppData.decks[deckName] = { wins: 0, losses: 0, total: 0, legendName: m.legendName };
+        if (!oppData.decks[deckName]) oppData.decks[deckName] = { wins: 0, losses: 0, draws: 0, total: 0, legendName: m.legendName };
         const dd = oppData.decks[deckName];
         dd.total++;
-        if (g.result === 'win') dd.wins++; else dd.losses++;
+        if (g.result === 'win') dd.wins++; else if (g.result === 'loss') dd.losses++; else dd.draws++;
       });
     });
     return Object.entries(bfWinData).filter(([, d]) => d.total > 0)
@@ -467,6 +468,10 @@ export default function StatsTab() {
                 <span className="text-emerald-400">{stats.wins}W</span>
                 <span className="text-slate-600 mx-1">–</span>
                 <span className="text-rose-400">{stats.losses}L</span>
+                {stats.draws > 0 && <>
+                  <span className="text-slate-600 mx-1">–</span>
+                  <span className="text-amber-400">{stats.draws}D</span>
+                </>}
               </p>
             </div>
             <div>
@@ -474,11 +479,13 @@ export default function StatsTab() {
               <div className="flex items-center gap-1.5">
                 {stats.currentStreakType === 'win' ? (
                   <Flame size={14} className="text-emerald-400" />
-                ) : (
+                ) : stats.currentStreakType === 'loss' ? (
                   <TrendingDown size={14} className="text-rose-400" />
+                ) : (
+                  <Minus size={14} className="text-amber-400" />
                 )}
-                <span className={`text-lg font-black ${stats.currentStreakType === 'win' ? 'text-emerald-400' : 'text-rose-400'}`}>
-                  {stats.currentStreak}{stats.currentStreakType === 'win' ? 'W' : 'L'}
+                <span className={`text-lg font-black ${stats.currentStreakType === 'win' ? 'text-emerald-400' : stats.currentStreakType === 'loss' ? 'text-rose-400' : 'text-amber-400'}`}>
+                  {stats.currentStreak}{stats.currentStreakType === 'win' ? 'W' : stats.currentStreakType === 'loss' ? 'L' : 'D'}
                 </span>
                 <span className="text-[10px] text-slate-600 ml-1">Best: {stats.bestWinStreak}W</span>
               </div>
@@ -1136,6 +1143,10 @@ export default function StatsTab() {
               className={`px-4 py-2 rounded-full text-xs font-bold whitespace-nowrap transition-all active:scale-95 ${historyFilter === 'losses' ? 'bg-rose-600/20 text-rose-400 border border-rose-600/30' : 'bg-slate-900 text-slate-400 border border-slate-800'}`}>
               Losses
             </button>
+            <button onClick={() => setHistoryFilter('draws')}
+              className={`px-4 py-2 rounded-full text-xs font-bold whitespace-nowrap transition-all active:scale-95 ${historyFilter === 'draws' ? 'bg-amber-600/20 text-amber-400 border border-amber-600/30' : 'bg-slate-900 text-slate-400 border border-slate-800'}`}>
+              Draws
+            </button>
             {deckNames.length > 1 && (
               <select value={historyDeckFilter} onChange={e => setHistoryDeckFilter(e.target.value)}
                 className="px-4 py-2 rounded-full text-xs font-bold bg-slate-900 text-slate-400 border border-slate-800 outline-none">
@@ -1151,6 +1162,7 @@ export default function StatsTab() {
             const isExpanded = expandedMatch === match.id;
             const isEditing = editingNotes === match.id;
             const isWin = match.result === 'win';
+            const isDraw = match.result === 'draw';
             const hasNotes = match.notes && match.notes.trim().length > 0;
             const hasScore = match.myScore !== undefined && match.oppScore !== undefined;
 
@@ -1175,7 +1187,7 @@ export default function StatsTab() {
                               <span className="text-slate-600 text-[9px] font-bold text-center leading-tight">No<br/>Legend</span>
                             </div>
                           )}
-                          <div className={`absolute -top-1 -right-1 w-3.5 h-3.5 rounded-full border-2 border-slate-900 ${isWin ? 'bg-emerald-500' : 'bg-rose-500'}`} />
+                          <div className={`absolute -top-1 -right-1 w-3.5 h-3.5 rounded-full border-2 border-slate-900 ${isWin ? 'bg-emerald-500' : isDraw ? 'bg-amber-500' : 'bg-rose-500'}`} />
                           <span className={`absolute bottom-0 left-0 text-[8px] font-black px-1 py-0.5 rounded-tr-md rounded-bl-lg ${
                             match.isFirst ? 'bg-blue-600 text-white' : 'bg-orange-600 text-white'
                           }`}>{match.isFirst ? '1ST' : '2ND'}</span>
@@ -1211,12 +1223,12 @@ export default function StatsTab() {
                   <div className="text-right flex-shrink-0">
                     {hasScore && (
                       <p className="text-sm font-black">
-                        <span className={isWin ? 'text-emerald-400' : 'text-white'}>{match.myScore}</span>
+                        <span className={isWin ? 'text-emerald-400' : isDraw ? 'text-amber-400' : 'text-white'}>{match.myScore}</span>
                         <span className="text-slate-600 mx-1">:</span>
-                        <span className={!isWin ? 'text-rose-400' : 'text-white'}>{match.oppScore}</span>
+                        <span className={!isWin && !isDraw ? 'text-rose-400' : 'text-white'}>{match.oppScore}</span>
                       </p>
                     )}
-                    <p className={`text-xs font-black ${isWin ? 'text-emerald-400' : 'text-rose-400'}`}>{isWin ? 'WIN' : 'LOSS'}</p>
+                    <p className={`text-xs font-black ${isWin ? 'text-emerald-400' : isDraw ? 'text-amber-400' : 'text-rose-400'}`}>{isWin ? 'WIN' : isDraw ? 'DRAW' : 'LOSS'}</p>
                   </div>
                   {/* Opponent Legend Card (right side) */}
                   {(() => {
@@ -1261,7 +1273,7 @@ export default function StatsTab() {
                         <div className="flex gap-2">
                           {match.games.map((g, gi) => (
                             <div key={gi} className="flex-1 flex items-center gap-1.5 bg-slate-800/50 rounded-lg px-2.5 py-1.5">
-                              <div className={`w-1.5 h-6 rounded-full ${g.result === 'win' ? 'bg-emerald-500' : 'bg-rose-500'}`} />
+                              <div className={`w-1.5 h-6 rounded-full ${g.result === 'win' ? 'bg-emerald-500' : g.result === 'loss' ? 'bg-rose-500' : 'bg-amber-500'}`} />
                               <span className="text-[10px] font-bold text-slate-400">G{gi + 1}</span>
                               <span className={`text-[10px] font-black px-1 rounded ${
                                 g.isFirst ? 'text-blue-400' : 'text-orange-400'
@@ -1332,8 +1344,8 @@ export default function StatsTab() {
                                         {assignedGames.map(g => (
                                           <div key={g.num} className="flex items-center gap-1">
                                             <span className="text-xs font-black text-white">G{g.num}</span>
-                                            <span className={`text-[10px] font-black ${g.result === 'win' ? 'text-emerald-400' : 'text-rose-400'}`}>
-                                              {g.result === 'win' ? 'WIN' : 'LOSS'}
+                                            <span className={`text-[10px] font-black ${g.result === 'win' ? 'text-emerald-400' : g.result === 'loss' ? 'text-rose-400' : 'text-amber-400'}`}>
+                                              {g.result === 'win' ? 'WIN' : g.result === 'loss' ? 'LOSS' : 'DRAW'}
                                             </span>
                                           </div>
                                         ))}
