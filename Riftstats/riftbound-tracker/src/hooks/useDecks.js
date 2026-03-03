@@ -3,14 +3,25 @@ import { db, appId } from '../constants/firebase';
 import { collection, doc, addDoc, deleteDoc, setDoc, updateDoc, onSnapshot } from 'firebase/firestore';
 // Note: publishDeck removed — now handled by usePublicDecks hook
 
+const CACHE_KEY = (uid) => `riftstats_${uid}_decks`;
+
 export default function useDecks(user, allCards, cardLookup, ui) {
   const [savedDecks, setSavedDecks] = useState([]);
 
   useEffect(() => {
     if (!user) return;
+
+    // Load cached data immediately
+    try {
+      const cached = localStorage.getItem(CACHE_KEY(user.uid));
+      if (cached) setSavedDecks(JSON.parse(cached));
+    } catch { /* ignore corrupt cache */ }
+
     const ref = collection(db, `artifacts/${appId}/users/${user.uid}/decks`);
     return onSnapshot(ref, (snap) => {
-      setSavedDecks(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+      const data = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      setSavedDecks(data);
+      try { localStorage.setItem(CACHE_KEY(user.uid), JSON.stringify(data)); } catch { /* quota */ }
     });
   }, [user]);
 

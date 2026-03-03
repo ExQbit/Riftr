@@ -5,7 +5,7 @@ export default function LegendFilterModal({ isOpen, onClose, allCards, activeFil
   if (!isOpen) return null;
 
   const legends = allCards
-    .filter(card => card.type === 'Legend')
+    .filter(card => card.classification?.type === 'Legend')
     .sort((a, b) => a.name.localeCompare(b.name));
 
   const btnClass = (isActive) =>

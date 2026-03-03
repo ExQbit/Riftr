@@ -4,6 +4,8 @@ import FilterDropdown from '../shared/FilterDropdown';
 import CardPreview, { useLongPress } from '../shared/CardPreview';
 import { CARD_CONTAINER, CARD_IMAGE, CARD_ASPECT_PORTRAIT, CARD_ASPECT_LANDSCAPE } from '../../constants/design';
 import { RUNE_COLORS } from '../../constants/gameData';
+import { useGameData } from '../../contexts/AppContexts';
+import { useAppData } from '../../contexts/AppContexts';
 
 const parseKeywords = (text) => {
   if (!text) return [];
@@ -13,7 +15,9 @@ const parseKeywords = (text) => {
   )];
 };
 
-export default function CollectionTab({ allCards, collection, addCard, removeCard, getQuantity, stats: collectionStats }) {
+export default function CollectionTab() {
+  const { allCards } = useGameData();
+  const { collection, addCard, removeCard, getQuantity, collectionStats } = useAppData();
   const [searchQuery, setSearchQuery] = useState('');
   const [ownershipFilter, setOwnershipFilter] = useState('all'); // all | owned | missing
   const [typeFilter, setTypeFilter] = useState('');

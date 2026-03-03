@@ -24,8 +24,15 @@ import StatsTab from './components/tabs/StatsTab';
 import DeckBuilderTab from './components/tabs/DeckBuilderTab';
 import SocialTab from './components/tabs/SocialTab';
 
+// --- Design System ---
+import { PAGE_PADDING } from './constants/design';
+
+// --- Contexts ---
+import { GameProvider, DataProvider } from './contexts/AppContexts';
+
 // --- Demo ---
 import { generateDemoData } from './data/demoData';
+import { computeStats } from './utils/computeStats';
 
 export default function App() {
   return (
@@ -121,7 +128,10 @@ function AppContent() {
 
   // --- Effective data (demo or real) ---
   const effectiveMatches = isDemoMode && demoData ? demoData.demoMatches : matches;
-  const effectiveStats = isDemoMode && demoData ? demoData.demoStats : stats;
+  const effectiveStats = useMemo(() => {
+    if (isDemoMode && demoData) return computeStats(demoData.demoMatches);
+    return stats;
+  }, [isDemoMode, demoData, stats]);
   const effectiveDecks = isDemoMode && demoData ? demoData.demoDecks : savedDecks;
   const effectiveCollection = isDemoMode && demoData ? demoData.demoCollection : collection;
   const effectiveGetQuantity = useCallback((cardId) => {
@@ -137,7 +147,7 @@ function AppContent() {
     return collectionStats;
   }, [isDemoMode, demoData, collectionStats]);
 
-  // Demo collection mutators — update demoData state so +/- buttons work
+  // Demo collection mutators
   const demoAddCard = useCallback((cardId) => {
     setDemoData(prev => {
       if (!prev) return prev;
@@ -156,7 +166,7 @@ function AppContent() {
     });
   }, []);
 
-  // Demo deck mutators — allow creating, editing, deleting decks in demo mode
+  // Demo deck mutators
   const demoSaveDeck = useCallback(async (deckData, editingDeckId) => {
     if (!deckData.name?.trim()) return;
     setDemoData(prev => {
@@ -220,14 +230,133 @@ function AppContent() {
     });
   }, []);
 
-  // No-op wrappers for demo mode
+  // Demo match mutators
+  const demoSaveMatch = useCallback(async (matchData) => {
+    setDemoData(prev => {
+      if (!prev) return prev;
+      const id = `demo-match-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const newMatch = {
+        ...matchData,
+        id,
+        notes: '',
+        timestamp: new Date().toISOString(),
+      };
+      return { ...prev, demoMatches: [...prev.demoMatches, newMatch] };
+    });
+  }, []);
+
+  const demoUpdateNotes = useCallback(async (matchId, notes) => {
+    if (!matchId) return;
+    setDemoData(prev => {
+      if (!prev) return prev;
+      const demoMatches = prev.demoMatches.map(m =>
+        m.id === matchId ? { ...m, notes } : m
+      );
+      return { ...prev, demoMatches };
+    });
+  }, []);
+
+  const demoUpdateGames = useCallback(async (matchId, games) => {
+    if (!matchId) return;
+    setDemoData(prev => {
+      if (!prev) return prev;
+      const demoMatches = prev.demoMatches.map(m =>
+        m.id === matchId ? { ...m, games } : m
+      );
+      return { ...prev, demoMatches };
+    });
+  }, []);
+
+  const demoDeleteMatch = useCallback(async (matchId) => {
+    if (!matchId) return;
+    setDemoData(prev => {
+      if (!prev) return prev;
+      return { ...prev, demoMatches: prev.demoMatches.filter(m => m.id !== matchId) };
+    });
+  }, []);
+
+  const demoClearAll = useCallback(async () => {
+    setDemoData(prev => {
+      if (!prev) return prev;
+      return { ...prev, demoMatches: [] };
+    });
+  }, []);
+
+  const demoExportCSV = useCallback(() => {
+    if (!demoData || demoData.demoMatches.length === 0) return;
+    const demoMatches = demoData.demoMatches;
+    const headers = 'Date,Deck,Legend,Opponent,Start,My Score,Opp Score,Result,Notes\n';
+    const rows = demoMatches.map(m =>
+      `${new Date(m.timestamp).toLocaleDateString()},${m.deckName || 'Unknown'},${m.legendName || ''},${m.opponent},${m.isFirst ? '1st' : '2nd'},${m.myScore ?? '-'},${m.oppScore ?? '-'},${m.result},"${(m.notes || '').replace(/"/g, '""')}"`
+    ).join('\n');
+    const blob = new Blob([headers + rows], { type: 'text/csv' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'riftbound_demo_stats.csv';
+    a.click();
+  }, [demoData]);
+
+  // Effective mutators (demo or real)
   const noop = useCallback(() => {}, []);
-  const effectiveSaveMatch = isDemoMode ? noop : saveMatch;
-  const effectiveUpdateNotes = isDemoMode ? noop : updateMatchNotes;
-  const effectiveUpdateGames = isDemoMode ? noop : updateMatchGames;
-  const effectiveDeleteMatch = isDemoMode ? noop : deleteMatch;
-  const effectiveClearAll = isDemoMode ? noop : clearAll;
-  const effectiveExportCSV = isDemoMode ? noop : exportCSV;
+  const effectiveSaveMatch = isDemoMode ? demoSaveMatch : saveMatch;
+  const effectiveUpdateNotes = isDemoMode ? demoUpdateNotes : updateMatchNotes;
+  const effectiveUpdateGames = isDemoMode ? demoUpdateGames : updateMatchGames;
+  const effectiveDeleteMatch = isDemoMode ? demoDeleteMatch : deleteMatch;
+  const effectiveClearAll = isDemoMode ? demoClearAll : clearAll;
+  const effectiveExportCSV = isDemoMode ? demoExportCSV : exportCSV;
+
+  // --- Build context data (all demo-aware) ---
+  const appData = useMemo(() => ({
+    user, isDemoMode,
+    // Matches
+    matches: effectiveMatches,
+    matchStats: effectiveStats,
+    saveMatch: effectiveSaveMatch,
+    updateMatchNotes: effectiveUpdateNotes,
+    updateMatchGames: effectiveUpdateGames,
+    deleteMatch: effectiveDeleteMatch,
+    clearAll: effectiveClearAll,
+    exportCSV: effectiveExportCSV,
+    // Decks
+    savedDecks: effectiveDecks,
+    saveDeck: isDemoMode ? demoSaveDeck : saveDeck,
+    deleteDeck: isDemoMode ? demoDeleteDeck : deleteDeck,
+    duplicateDeck: isDemoMode ? demoDuplicateDeck : duplicateDeck,
+    updateDeckMeta: isDemoMode ? demoUpdateDeckMeta : updateDeckMeta,
+    validateDeck,
+    publishDeck: isDemoMode ? noop : handlePublishDeck,
+    // Collection
+    collection: effectiveCollection,
+    collectionStats: effectiveCollectionStats,
+    addCard: isDemoMode ? demoAddCard : addCard,
+    removeCard: isDemoMode ? demoRemoveCard : removeCard,
+    getQuantity: effectiveGetQuantity,
+    // Public / Social
+    publicDecks,
+    myPublishedDeckNames,
+    myFollowing,
+    follow: isDemoMode ? noop : follow,
+    unfollow: isDemoMode ? noop : unfollow,
+    isFollowing,
+    getFollowerCount,
+    // Actions
+    activateDemo,
+    logout,
+  }), [
+    user, isDemoMode,
+    effectiveMatches, effectiveStats,
+    effectiveSaveMatch, effectiveUpdateNotes, effectiveUpdateGames,
+    effectiveDeleteMatch, effectiveClearAll, effectiveExportCSV,
+    effectiveDecks, saveDeck, deleteDeck, duplicateDeck, updateDeckMeta,
+    demoSaveDeck, demoDeleteDeck, demoDuplicateDeck, demoUpdateDeckMeta,
+    validateDeck, handlePublishDeck, noop,
+    effectiveCollection, effectiveCollectionStats,
+    addCard, removeCard, getQuantity, effectiveGetQuantity,
+    demoAddCard, demoRemoveCard,
+    publicDecks, myPublishedDeckNames, myFollowing,
+    follow, unfollow, isFollowing, getFollowerCount,
+    activateDemo, logout,
+  ]);
 
   // --- Loading ---
   if (authLoading) {
@@ -262,104 +391,23 @@ function AppContent() {
   };
 
   const hideNav = deckEditMode || trackerFullscreen;
-  const hidePadding = trackerFullscreen || activeTab === 'deckbuilder'; // tracker + deckbuilder handle own padding
+  const hidePadding = trackerFullscreen || activeTab === 'deckbuilder';
 
-  // --- Render active tab ---
+  // --- Render active tab (only tab-specific props remain) ---
   const renderTab = () => {
     switch (activeTab) {
       case 'cards':
-        return <CardsTab allCards={allCards} />;
-
+        return <CardsTab />;
       case 'collection':
-        return (
-          <CollectionTab
-            allCards={allCards}
-            collection={effectiveCollection}
-            addCard={isDemoMode ? demoAddCard : addCard}
-            removeCard={isDemoMode ? demoRemoveCard : removeCard}
-            getQuantity={effectiveGetQuantity}
-            stats={effectiveCollectionStats}
-          />
-        );
-
+        return <CollectionTab />;
       case 'tracker':
-        return (
-          <TrackerTab
-            allCards={allCards}
-            cardLookup={cardLookup}
-            savedDecks={effectiveDecks}
-            validateDeck={validateDeck}
-            onSaveMatch={handleSaveMatch}
-            onFullscreenChange={setTrackerFullscreen}
-            onActivateDemo={activateDemo}
-            isDemoMode={isDemoMode}
-          />
-        );
-
+        return <TrackerTab onSaveMatch={handleSaveMatch} onFullscreenChange={setTrackerFullscreen} />;
       case 'stats':
-        return (
-          <StatsTab
-            stats={effectiveStats}
-            matches={effectiveMatches}
-            allCards={allCards}
-            savedDecks={effectiveDecks}
-            updateMatchNotes={effectiveUpdateNotes}
-            updateMatchGames={effectiveUpdateGames}
-            deleteMatch={effectiveDeleteMatch}
-            exportCSV={effectiveExportCSV}
-            clearAll={effectiveClearAll}
-            onActivateDemo={activateDemo}
-            isDemoMode={isDemoMode}
-          />
-        );
-
+        return <StatsTab />;
       case 'deckbuilder':
-        return (
-          <DeckBuilderTab
-            key={deckResetKey}
-            allCards={allCards}
-            cardLookup={cardLookup}
-            savedDecks={isDemoMode ? effectiveDecks : savedDecks}
-            saveDeck={isDemoMode ? demoSaveDeck : saveDeck}
-            deleteDeck={isDemoMode ? demoDeleteDeck : deleteDeck}
-            duplicateDeck={isDemoMode ? demoDuplicateDeck : duplicateDeck}
-            onPublishDeck={isDemoMode ? noop : handlePublishDeck}
-            updateDeckMeta={isDemoMode ? demoUpdateDeckMeta : updateDeckMeta}
-            validateDeck={validateDeck}
-            onEditModeChange={setDeckEditMode}
-            getQuantity={getQuantity}
-            publicDecks={publicDecks}
-            myPublishedDeckNames={myPublishedDeckNames}
-            user={user}
-            stats={effectiveStats}
-            follow={isDemoMode ? noop : follow}
-            unfollow={isDemoMode ? noop : unfollow}
-            isFollowing={isFollowing}
-            getFollowerCount={getFollowerCount}
-            myFollowing={myFollowing}
-          />
-        );
-
+        return <DeckBuilderTab key={deckResetKey} onEditModeChange={setDeckEditMode} />;
       case 'social':
-        return (
-          <SocialTab
-            user={user}
-            allCards={allCards}
-            cardLookup={cardLookup}
-            publicDecks={publicDecks}
-            savedDecks={isDemoMode ? effectiveDecks : savedDecks}
-            stats={effectiveStats}
-            myFollowing={myFollowing}
-            follow={isDemoMode ? noop : follow}
-            unfollow={isDemoMode ? noop : unfollow}
-            isFollowing={isFollowing}
-            getFollowerCount={getFollowerCount}
-            getQuantity={effectiveGetQuantity}
-            onTabChange={handleTabChange}
-            logout={logout}
-          />
-        );
-
+        return <SocialTab onTabChange={handleTabChange} />;
       default:
         return null;
     }
@@ -367,32 +415,36 @@ function AppContent() {
 
   // --- Main App ---
   return (
-    <div className={`min-h-screen bg-slate-950 text-slate-100 select-none ${hideNav ? '' : 'pb-24'}`}>
-      <LandscapeOverlay />
+    <GameProvider allCards={allCards} cardLookup={cardLookup}>
+      <DataProvider value={appData}>
+        <div className={`min-h-screen bg-slate-950 text-slate-100 select-none ${hideNav ? '' : 'pb-24'}`}>
+          <LandscapeOverlay />
 
-      {/* Demo Mode Banner */}
-      {isDemoMode && (
-        <div className="sticky top-0 z-[100] bg-amber-500/10 border-b border-amber-500/30 px-4 py-2.5 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <Zap size={14} className="text-amber-400" />
-            <span className="text-xs font-bold text-amber-300">Demo Mode</span>
-            <span className="text-[10px] text-amber-400/70">Viewing sample data</span>
-          </div>
-          <button
-            onClick={deactivateDemo}
-            className="flex items-center gap-1 px-2.5 py-1 rounded-full bg-amber-500/20 text-amber-300 text-[10px] font-bold active:scale-95 transition-all"
-          >
-            <X size={12} />
-            Exit Demo
-          </button>
+          {/* Demo Mode Banner */}
+          {isDemoMode && (
+            <div className="sticky top-0 z-[100] bg-amber-500/10 border-b border-amber-500/30 px-4 py-2.5 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Zap size={14} className="text-amber-400" />
+                <span className="text-xs font-bold text-amber-300">Demo Mode</span>
+                <span className="text-[10px] text-amber-400/70">Viewing sample data</span>
+              </div>
+              <button
+                onClick={deactivateDemo}
+                className="flex items-center gap-1 px-2.5 py-1 rounded-full bg-amber-500/20 text-amber-300 text-[10px] font-bold active:scale-95 transition-all"
+              >
+                <X size={12} />
+                Exit Demo
+              </button>
+            </div>
+          )}
+
+          <main className={hidePadding ? '' : PAGE_PADDING}>
+            {renderTab()}
+          </main>
+          <BottomNav activeTab={activeTab} onTabChange={handleTabChange} hidden={hideNav} />
+          <ProModal isOpen={showProModal} onClose={() => setShowProModal(false)} />
         </div>
-      )}
-
-      <main className={hidePadding ? '' : 'max-w-full mx-auto px-2 py-4'}>
-        {renderTab()}
-      </main>
-      <BottomNav activeTab={activeTab} onTabChange={handleTabChange} hidden={hideNav} />
-      <ProModal isOpen={showProModal} onClose={() => setShowProModal(false)} />
-    </div>
+      </DataProvider>
+    </GameProvider>
   );
 }

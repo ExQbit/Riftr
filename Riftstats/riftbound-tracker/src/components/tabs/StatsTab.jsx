@@ -5,6 +5,8 @@ import {
   Zap, Shield, BarChart3
 } from 'lucide-react';
 import { RUNE_COLORS } from '../../constants/gameData';
+import { useGameData } from '../../contexts/AppContexts';
+import { useAppData } from '../../contexts/AppContexts';
 
 // ========================================
 // SVG Win Rate Ring
@@ -244,7 +246,13 @@ function WinRateTimeline({ timeline }) {
 // ========================================
 // MAIN STATS TAB
 // ========================================
-export default function StatsTab({ stats, matches, allCards = [], savedDecks = [], updateMatchNotes, updateMatchGames, deleteMatch, exportCSV, clearAll, onActivateDemo, isDemoMode }) {
+export default function StatsTab() {
+  const { allCards } = useGameData();
+  const {
+    matchStats: stats, matches, savedDecks,
+    updateMatchNotes, updateMatchGames, deleteMatch,
+    exportCSV, clearAll, activateDemo: onActivateDemo, isDemoMode,
+  } = useAppData();
   const [activeSection, setActiveSection] = useState('overview');
   const [expandedMatch, setExpandedMatch] = useState(null);
   const [editingNotes, setEditingNotes] = useState(null);
@@ -293,6 +301,98 @@ export default function StatsTab({ stats, matches, allCards = [], savedDecks = [
     });
     return [...names.entries()];
   }, [matches]);
+
+  // --- Showcase data (memoized) ---
+  const showcaseData = useMemo(() => {
+    if (!stats || stats.total === 0) return null;
+
+    const resolveCard = (legendName, opponent, deckName) => {
+      let cardImg = null, cardDomains = [];
+      if (opponent) {
+        const legend = legendByShortName.get(opponent);
+        cardImg = legend?.media?.image_url;
+        cardDomains = legend?.classification?.domain || [];
+      } else if (legendName) {
+        const sn = legendName.includes(',') ? legendName.split(',')[0].trim() : legendName;
+        const legend = legendByShortName.get(sn) || allCards.find(c => c.name === legendName && c.classification?.type === 'Legend');
+        cardImg = legend?.media?.image_url;
+        cardDomains = legend?.classification?.domain || [];
+      } else if (deckName) {
+        const sd = savedDecks.find(s => s.name === deckName);
+        const legend = sd?.legendData || (sd?.legend ? allCards.find(c => c.id === sd.legend) : null);
+        cardImg = legend?.media?.image_url;
+        cardDomains = legend?.classification?.domain || [];
+      }
+      return { cardImg, cardDomains };
+    };
+
+    const legendAgg = {};
+    (stats.deckStats || []).forEach(d => {
+      const ln = d.legendName || 'Unknown';
+      if (!legendAgg[ln]) legendAgg[ln] = { legendName: ln, wins: 0, losses: 0, total: 0 };
+      legendAgg[ln].wins += d.wins;
+      legendAgg[ln].losses += d.losses;
+      legendAgg[ln].total += d.total;
+    });
+    const legendStats = Object.values(legendAgg)
+      .map(l => ({ ...l, winRate: l.total > 0 ? (l.wins / l.total * 100).toFixed(1) : '0.0' }))
+      .sort((a, b) => b.total - a.total);
+    const mostPlayed = legendStats[0] || null;
+
+    const eligible = (stats.matchupStats || []).filter(m => m.total >= 1);
+    const bestMatchup = eligible.length > 0 ? eligible.reduce((best, m) => parseFloat(m.winRate) > parseFloat(best.winRate) ? m : best) : null;
+    const worstMatchup = eligible.length > 0 ? eligible.reduce((worst, m) => parseFloat(m.winRate) < parseFloat(worst.winRate) ? m : worst) : null;
+    const mostFaced = eligible.length > 0 ? eligible[0] : null;
+
+    const bestDeck = stats.deckStats?.length > 0 ? stats.deckStats.reduce((best, d) => parseFloat(d.winRate) > parseFloat(best.winRate) ? d : best) : null;
+    const biggestWin = stats.scoreStats?.biggestWin || null;
+
+    const mpCard = mostPlayed ? resolveCard(mostPlayed.legendName, null, null) : null;
+    const mpName = mostPlayed?.legendName?.includes(',') ? mostPlayed.legendName.split(',')[0].trim() : mostPlayed?.legendName;
+    const bmCard = bestMatchup ? resolveCard(null, bestMatchup.opponent, null) : null;
+    const nmCard = worstMatchup && worstMatchup !== bestMatchup && parseFloat(worstMatchup.winRate) < 100 ? resolveCard(null, worstMatchup.opponent, null) : null;
+    const mfCard = mostFaced && mostFaced !== bestMatchup && mostFaced !== worstMatchup ? resolveCard(null, mostFaced.opponent, null) : null;
+    const bdCard = bestDeck ? resolveCard(bestDeck.legendName, null, bestDeck.name) : null;
+    const bwCard = biggestWin ? resolveCard(null, biggestWin.opponent, null) : null;
+
+    return { mostPlayed, mpCard, mpName, bestMatchup, bmCard, worstMatchup, nmCard, mostFaced, mfCard, bestDeck, bdCard, biggestWin, bwCard };
+  }, [stats, legendByShortName, allCards, savedDecks]);
+
+  // --- Battlefield aggregation data (memoized) ---
+  const bfEntries = useMemo(() => {
+    if (!matches || matches.length === 0) return [];
+    const bfWinData = {};
+    matches.forEach(m => {
+      if (!m.games) return;
+      const deck = savedDecks.find(sd => sd.id === m.deckId || sd.name === m.deckName);
+      m.games.forEach(g => {
+        if (!g.battlefieldId) return;
+        if (!bfWinData[g.battlefieldId]) {
+          const bfCard = deck?.battlefields?.find(b => b.id === g.battlefieldId);
+          bfWinData[g.battlefieldId] = {
+            name: bfCard?.name || 'Unknown',
+            image: bfCard?.media?.image_url,
+            wins: 0, losses: 0, total: 0, opponents: {},
+          };
+        }
+        const bf = bfWinData[g.battlefieldId];
+        bf.total++;
+        if (g.result === 'win') bf.wins++; else bf.losses++;
+        const opp = m.opponent;
+        if (!bf.opponents[opp]) bf.opponents[opp] = { wins: 0, losses: 0, total: 0, decks: {} };
+        const oppData = bf.opponents[opp];
+        oppData.total++;
+        if (g.result === 'win') oppData.wins++; else oppData.losses++;
+        const deckName = m.deckName || 'Unknown';
+        if (!oppData.decks[deckName]) oppData.decks[deckName] = { wins: 0, losses: 0, total: 0, legendName: m.legendName };
+        const dd = oppData.decks[deckName];
+        dd.total++;
+        if (g.result === 'win') dd.wins++; else dd.losses++;
+      });
+    });
+    return Object.entries(bfWinData).filter(([, d]) => d.total > 0)
+      .sort((a, b) => b[1].total - a[1].total);
+  }, [matches, savedDecks]);
 
   // EMPTY STATE
   if (!matches || matches.length === 0) {
@@ -411,55 +511,9 @@ export default function StatsTab({ stats, matches, allCards = [], savedDecks = [
       {/* ===== SHOWCASE SECTION ===== */}
       {activeSection === 'showcase' && (
         <div className="space-y-3">
-          {stats.total > 0 ? (() => {
-            // --- Resolve card helper ---
-            const resolveCard = (legendName, opponent, deckName) => {
-              let cardImg = null, cardDomains = [];
-              if (opponent) {
-                const legend = legendByShortName.get(opponent);
-                cardImg = legend?.media?.image_url;
-                cardDomains = legend?.classification?.domain || [];
-              } else if (legendName) {
-                const sn = legendName.includes(',') ? legendName.split(',')[0].trim() : legendName;
-                const legend = legendByShortName.get(sn) || allCards.find(c => c.name === legendName && c.classification?.type === 'Legend');
-                cardImg = legend?.media?.image_url;
-                cardDomains = legend?.classification?.domain || [];
-              } else if (deckName) {
-                const sd = savedDecks.find(s => s.name === deckName);
-                const legend = sd?.legendData || (sd?.legend ? allCards.find(c => c.id === sd.legend) : null);
-                cardImg = legend?.media?.image_url;
-                cardDomains = legend?.classification?.domain || [];
-              }
-              return { cardImg, cardDomains };
-            };
+          {showcaseData ? (() => {
+            const { mostPlayed, mpCard, mpName, bestMatchup, bmCard, worstMatchup, nmCard, mostFaced, mfCard, bestDeck, bdCard, biggestWin, bwCard } = showcaseData;
 
-            // --- Eigene Legenden aggregiert ---
-            const legendAgg = {};
-            (stats.deckStats || []).forEach(d => {
-              const ln = d.legendName || 'Unknown';
-              if (!legendAgg[ln]) legendAgg[ln] = { legendName: ln, wins: 0, losses: 0, total: 0 };
-              legendAgg[ln].wins += d.wins;
-              legendAgg[ln].losses += d.losses;
-              legendAgg[ln].total += d.total;
-            });
-            const legendStats = Object.values(legendAgg)
-              .map(l => ({ ...l, winRate: l.total > 0 ? (l.wins / l.total * 100).toFixed(1) : '0.0' }))
-              .sort((a, b) => b.total - a.total);
-            const mostPlayed = legendStats[0] || null;
-
-            // --- Opponents ---
-            const eligible = (stats.matchupStats || []).filter(m => m.total >= 1);
-            const bestMatchup = eligible.length > 0 ? eligible.reduce((best, m) => parseFloat(m.winRate) > parseFloat(best.winRate) ? m : best) : null;
-            const worstMatchup = eligible.length > 0 ? eligible.reduce((worst, m) => parseFloat(m.winRate) < parseFloat(worst.winRate) ? m : worst) : null;
-            const mostFaced = eligible.length > 0 ? eligible[0] : null; // already sorted by total
-
-            // --- Best Deck ---
-            const bestDeck = stats.deckStats?.length > 0 ? stats.deckStats.reduce((best, d) => parseFloat(d.winRate) > parseFloat(best.winRate) ? d : best) : null;
-
-            // --- Biggest Win ---
-            const biggestWin = stats.scoreStats?.biggestWin || null;
-
-            // --- Showcase Card Component (consistent with Decks/Matchups style) ---
             const ShowcaseCard = ({ label, cardImg, title, wr, sub }) => {
               const wrNum = parseFloat(wr);
               return (
@@ -487,25 +541,6 @@ export default function StatsTab({ stats, matches, allCards = [], savedDecks = [
                 </div>
               );
             };
-
-            // --- Most Played Legend ---
-            const mpCard = mostPlayed ? resolveCard(mostPlayed.legendName, null, null) : null;
-            const mpName = mostPlayed?.legendName?.includes(',') ? mostPlayed.legendName.split(',')[0].trim() : mostPlayed?.legendName;
-
-            // --- Best Matchup ---
-            const bmCard = bestMatchup ? resolveCard(null, bestMatchup.opponent, null) : null;
-
-            // --- Nemesis ---
-            const nmCard = worstMatchup && worstMatchup !== bestMatchup && parseFloat(worstMatchup.winRate) < 100 ? resolveCard(null, worstMatchup.opponent, null) : null;
-
-            // --- Most Faced ---
-            const mfCard = mostFaced && mostFaced !== bestMatchup && mostFaced !== worstMatchup ? resolveCard(null, mostFaced.opponent, null) : null;
-
-            // --- Best Deck ---
-            const bdCard = bestDeck ? resolveCard(bestDeck.legendName, null, bestDeck.name) : null;
-
-            // --- Biggest Win ---
-            const bwCard = biggestWin ? resolveCard(null, biggestWin.opponent, null) : null;
 
             return (
               <div className="grid grid-cols-2 gap-3">
@@ -824,47 +859,12 @@ export default function StatsTab({ stats, matches, allCards = [], savedDecks = [
           )}
 
           {/* Per-Battlefield Winrates (Expandable) */}
-          {(() => {
-            const bfWinData = {};
-            matches.forEach(m => {
-              if (!m.games) return;
-              const deck = savedDecks.find(sd => sd.id === m.deckId || sd.name === m.deckName);
-              m.games.forEach(g => {
-                if (!g.battlefieldId) return;
-                if (!bfWinData[g.battlefieldId]) {
-                  const bfCard = deck?.battlefields?.find(b => b.id === g.battlefieldId);
-                  bfWinData[g.battlefieldId] = {
-                    name: bfCard?.name || 'Unknown',
-                    image: bfCard?.media?.image_url,
-                    wins: 0, losses: 0, total: 0, opponents: {},
-                  };
-                }
-                const bf = bfWinData[g.battlefieldId];
-                bf.total++;
-                if (g.result === 'win') bf.wins++; else bf.losses++;
-                // Per-opponent breakdown
-                const opp = m.opponent;
-                if (!bf.opponents[opp]) bf.opponents[opp] = { wins: 0, losses: 0, total: 0, decks: {} };
-                const oppData = bf.opponents[opp];
-                oppData.total++;
-                if (g.result === 'win') oppData.wins++; else oppData.losses++;
-                // Per-deck within opponent
-                const deckName = m.deckName || 'Unknown';
-                if (!oppData.decks[deckName]) oppData.decks[deckName] = { wins: 0, losses: 0, total: 0, legendName: m.legendName };
-                const dd = oppData.decks[deckName];
-                dd.total++;
-                if (g.result === 'win') dd.wins++; else dd.losses++;
-              });
-            });
-            const bfEntries = Object.entries(bfWinData).filter(([, d]) => d.total > 0)
-              .sort((a, b) => b[1].total - a[1].total);
-            if (bfEntries.length === 0) return (
-              <div className="p-8 text-center">
-                <p className="text-slate-500 font-bold text-sm">No battlefield data yet</p>
-                <p className="text-slate-600 text-xs mt-1">Assign battlefields in the Match History</p>
-              </div>
-            );
-            return bfEntries.map(([bfId, data]) => {
+          {bfEntries.length === 0 ? (
+            <div className="p-8 text-center">
+              <p className="text-slate-500 font-bold text-sm">No battlefield data yet</p>
+              <p className="text-slate-600 text-xs mt-1">Assign battlefields in the Match History</p>
+            </div>
+          ) : bfEntries.map(([bfId, data]) => {
               const wr = ((data.wins / data.total) * 100).toFixed(1);
               const wrNum = parseFloat(wr);
               const isExp = expandedBf === bfId;
@@ -965,8 +965,7 @@ export default function StatsTab({ stats, matches, allCards = [], savedDecks = [
                   )}
                 </div>
               );
-            });
-          })()}
+            })}
         </div>
       )}
 

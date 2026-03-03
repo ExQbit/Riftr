@@ -6,6 +6,8 @@ import {
 import { RUNE_COLORS } from '../../constants/gameData';
 import { LegendCardRow } from '../MetaDeckFilters';
 import { getShortLegendName } from '../../utils/metaDeckFilters';
+import { useGameData } from '../../contexts/AppContexts';
+import { useAppData } from '../../contexts/AppContexts';
 
 const LAST_DECK_KEY = 'riftbound-tracker-last-deck';
 const MATCH_CONTEXT_KEY = 'riftbound-tracker-match-context';
@@ -26,7 +28,9 @@ const getChampionName = (card) => {
   return name.includes(',') ? name.split(',')[0].trim() : name;
 };
 
-export default function TrackerTab({ allCards = [], cardLookup, savedDecks = [], validateDeck, onSaveMatch, onFullscreenChange, onActivateDemo, isDemoMode }) {
+export default function TrackerTab({ onSaveMatch, onFullscreenChange }) {
+  const { allCards, cardLookup } = useGameData();
+  const { savedDecks, validateDeck, isDemoMode, activateDemo: onActivateDemo } = useAppData();
   const [step, setStep] = useState('deck');
   const [selectedDeckId, setSelectedDeckId] = useState(() => {
     try { return localStorage.getItem(LAST_DECK_KEY) || null; } catch { return null; }

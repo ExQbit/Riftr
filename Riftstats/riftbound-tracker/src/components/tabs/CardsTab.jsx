@@ -4,6 +4,7 @@ import FilterDropdown from '../shared/FilterDropdown';
 import CardPreview from '../shared/CardPreview';
 import { CARD_CONTAINER, CARD_IMAGE, CARD_ASPECT_PORTRAIT, CARD_ASPECT_LANDSCAPE } from '../../constants/design';
 import { RUNE_COLORS } from '../../constants/gameData';
+import { useGameData } from '../../contexts/AppContexts';
 
 // Extract base keyword from text like "[Hidden]", "[Shield 3]" → "Hidden", "Shield"
 const parseKeywords = (text) => {
@@ -14,7 +15,8 @@ const parseKeywords = (text) => {
   )];
 };
 
-const CardsTab = React.memo(function CardsTab({ allCards }) {
+const CardsTab = React.memo(function CardsTab() {
+  const { allCards } = useGameData();
   const [searchQuery, setSearchQuery] = useState('');
   const [typeFilter, setTypeFilter] = useState('');
   const [domainFilters, setDomainFilters] = useState(new Set());

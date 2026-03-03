@@ -4,23 +4,16 @@ import { t } from '../../constants/i18n';
 import { useUI } from '../shared/UIProvider';
 import useProfile from '../../hooks/useProfile';
 import AuthorProfile from '../shared/AuthorProfile';
+import { useGameData } from '../../contexts/AppContexts';
+import { useAppData } from '../../contexts/AppContexts';
 
-export default function SocialTab({
-  user,
-  allCards,
-  cardLookup,
-  publicDecks,
-  savedDecks,
-  stats,
-  myFollowing,
-  follow,
-  unfollow,
-  isFollowing,
-  getFollowerCount,
-  getQuantity,
-  onTabChange,
-  logout,
-}) {
+export default function SocialTab({ onTabChange }) {
+  const { allCards, cardLookup } = useGameData();
+  const {
+    user, publicDecks, savedDecks, matchStats: stats,
+    myFollowing, follow, unfollow, isFollowing, getFollowerCount,
+    getQuantity, logout,
+  } = useAppData();
   const ui = useUI();
   const { profile, profileLoading, updateProfile, fetchProfiles, profileCache } = useProfile(user);
   const [view, setView] = useState('home'); // 'home' | 'edit-profile' | 'author'

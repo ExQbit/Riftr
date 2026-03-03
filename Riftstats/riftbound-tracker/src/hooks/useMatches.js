@@ -3,14 +3,25 @@ import { db, appId } from '../constants/firebase';
 import { collection, addDoc, deleteDoc, getDocs, doc, onSnapshot, updateDoc } from 'firebase/firestore';
 import { computeStats } from '../utils/computeStats';
 
+const CACHE_KEY = (uid) => `riftstats_${uid}_matches`;
+
 export default function useMatches(user, ui) {
   const [matches, setMatches] = useState([]);
 
   useEffect(() => {
     if (!user) { setMatches([]); return; }
+
+    // Load cached data immediately
+    try {
+      const cached = localStorage.getItem(CACHE_KEY(user.uid));
+      if (cached) setMatches(JSON.parse(cached));
+    } catch { /* ignore corrupt cache */ }
+
     const ref = collection(db, 'artifacts', appId, 'users', user.uid, 'matches');
     return onSnapshot(ref, (snap) => {
-      setMatches(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+      const data = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      setMatches(data);
+      try { localStorage.setItem(CACHE_KEY(user.uid), JSON.stringify(data)); } catch { /* quota */ }
     });
   }, [user]);
 
