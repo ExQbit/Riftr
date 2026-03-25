@@ -2,7 +2,7 @@ import React, { useState, useMemo } from 'react';
 import { Search } from 'lucide-react';
 import FilterDropdown from '../shared/FilterDropdown';
 import CardPreview from '../shared/CardPreview';
-import { CARD_CONTAINER, CARD_IMAGE, CARD_ASPECT_PORTRAIT, CARD_ASPECT_LANDSCAPE } from '../../constants/design';
+import { CARD_CONTAINER, CARD_IMAGE, CARD_ASPECT_PORTRAIT } from '../../constants/design';
 import { RUNE_COLORS } from '../../constants/gameData';
 import { useGameData } from '../../contexts/AppContexts';
 
@@ -195,19 +195,18 @@ const CardsTab = React.memo(function CardsTab() {
 
 function BrowseCardItem({ card, onTap }) {
   const isLandscape = card.orientation === 'landscape';
-  const aspect = isLandscape ? CARD_ASPECT_LANDSCAPE : CARD_ASPECT_PORTRAIT;
 
   return (
     <div
-      className={`relative ${isLandscape ? 'col-span-2' : ''} cursor-pointer active:scale-95 transition-transform`}
+      className="relative cursor-pointer active:scale-95 transition-transform"
       style={{ touchAction: 'manipulation' }}
       onClick={onTap}
     >
-      <div className={`${CARD_CONTAINER} ${aspect}`}>
+      <div className={`${CARD_CONTAINER} ${CARD_ASPECT_PORTRAIT}`}>
         <img
           src={card.media?.image_url}
           alt={card.name}
-          className={CARD_IMAGE}
+          className={`absolute inset-0 w-full h-full object-cover ${isLandscape ? 'rotate-90 scale-[1.4]' : ''}`}
           loading="lazy"
           draggable={false}
         />

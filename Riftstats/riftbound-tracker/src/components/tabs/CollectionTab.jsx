@@ -2,7 +2,7 @@ import React, { useState, useMemo, useEffect } from 'react';
 import { Search, BookOpen, Package, Check } from 'lucide-react';
 import FilterDropdown from '../shared/FilterDropdown';
 import CardPreview, { useLongPress } from '../shared/CardPreview';
-import { CARD_CONTAINER, CARD_IMAGE, CARD_ASPECT_PORTRAIT, CARD_ASPECT_LANDSCAPE } from '../../constants/design';
+import { CARD_CONTAINER, CARD_IMAGE, CARD_ASPECT_PORTRAIT } from '../../constants/design';
 import { RUNE_COLORS } from '../../constants/gameData';
 import { useGameData } from '../../contexts/AppContexts';
 import { useAppData } from '../../contexts/AppContexts';
@@ -327,21 +327,20 @@ export default function CollectionTab() {
 function CollectionCardItem({ card, quantity, isEditing, onTap, onLongPress, onAdd, onRemove }) {
   const handlers = useLongPress(onLongPress, onTap);
   const isLandscape = card.orientation === 'landscape';
-  const aspect = isLandscape ? CARD_ASPECT_LANDSCAPE : CARD_ASPECT_PORTRAIT;
   const isOwned = quantity > 0;
 
   return (
     <div
       id={`col-card-${card.id}`}
-      className={`relative overflow-hidden rounded-xl ${isLandscape ? 'col-span-2' : ''}`}
+      className="relative overflow-hidden rounded-xl"
       style={{ touchAction: 'manipulation' }}
       {...handlers}
     >
-      <div className={`relative ${aspect} ${isEditing ? 'ring-2 ring-amber-400/80 rounded-xl' : ''}`}>
+      <div className={`relative ${CARD_ASPECT_PORTRAIT} overflow-hidden ${isEditing ? 'ring-2 ring-amber-400/80 rounded-xl' : ''}`}>
         <img
           src={card.media?.image_url}
           alt={card.name}
-          className={`${CARD_IMAGE} ${!isOwned ? 'grayscale opacity-40' : ''} transition-all`}
+          className={`absolute inset-0 w-full h-full object-cover ${!isOwned ? 'grayscale opacity-40' : ''} ${isLandscape ? 'rotate-90 scale-[1.4]' : ''} transition-all`}
           loading="lazy"
           draggable={false}
         />
