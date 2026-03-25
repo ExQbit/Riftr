@@ -1,5 +1,7 @@
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import '../theme/app_components.dart';
 import '../theme/app_theme.dart';
 import '../models/card_model.dart';
 import '../services/card_service.dart';
@@ -36,6 +38,7 @@ class CollectionScreenState extends State<CollectionScreen> {
   String? _selectedType;
   String? _selectedRarity;
   String? _selectedSet;
+  String? _selectedKeyword;
   int? _selectedCost;
   Set<String> _selectedDomains = {};
 
@@ -93,6 +96,19 @@ class CollectionScreenState extends State<CollectionScreen> {
         if (qty > 0) _demo.setQuantity(cardId, qty - 1);
       }
     } else {
+      // Block if open orders would be violated
+      final newTotal = _collectionService.getTotalQuantity(cardId) - 1;
+      final warning = _collectionService.canReduce(cardId, newTotal);
+      if (warning != null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(warning),
+            backgroundColor: AppColors.loss,
+            duration: const Duration(seconds: 3),
+          ),
+        );
+        return;
+      }
       _collectionService.decrement(cardId, foil: foil);
     }
   }
@@ -107,6 +123,17 @@ class CollectionScreenState extends State<CollectionScreen> {
 
   void _onCollectionChanged() {
     _applyFilters();
+    // Show toast if listings were auto-adjusted
+    final msg = _collectionService.consumeListingSyncMessage();
+    if (msg != null && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(msg),
+          backgroundColor: AppColors.amber500,
+          duration: const Duration(seconds: 3),
+        ),
+      );
+    }
   }
 
   Future<void> _loadCards() async {
@@ -126,8 +153,15 @@ class CollectionScreenState extends State<CollectionScreen> {
         // Text search
         if (query.isNotEmpty) {
           final nameMatch = card.name.toLowerCase().contains(query);
+          final displayMatch = card.displayName.toLowerCase().contains(query);
           final textMatch = card.textPlain?.toLowerCase().contains(query) ?? false;
-          if (!nameMatch && !textMatch) return false;
+          final cn = query.startsWith('#') ? query.substring(1) : query;
+          final cnNum = cn.replaceAll(RegExp(r'[^0-9]'), '');
+          final cnSuffix = cn.replaceAll(RegExp(r'[0-9]'), '');
+          final cnMatch = cnNum.isNotEmpty && card.collectorNumber != null &&
+              card.collectorNumber!.startsWith(cnNum) &&
+              (cnSuffix.isEmpty || card.collectorNumber!.endsWith(cnSuffix));
+          if (!nameMatch && !displayMatch && !textMatch && !cnMatch) return false;
         }
 
         // Ownership filter (count normal + foil)
@@ -151,6 +185,11 @@ class CollectionScreenState extends State<CollectionScreen> {
           } else {
             if (!card.domains.any((d) => _selectedDomains.contains(d))) return false;
           }
+        }
+
+        // Keyword filter
+        if (_selectedKeyword != null) {
+          if (!card.keywords.contains(_selectedKeyword)) return false;
         }
 
         // Cost filter — React: '6+' means energy >= 6
@@ -202,7 +241,7 @@ class CollectionScreenState extends State<CollectionScreen> {
     final percentage = totalUnique > 0 ? (ownedUnique / totalUnique * 100) : 0.0;
 
     // Per-set breakdown
-    final sets = ['SFD', 'OGS', 'OGN'];
+    final sets = CardService.getBaseSets();
     final setTotals = <String, int>{};
     final setOwned = <String, int>{};
     for (final s in sets) {
@@ -217,8 +256,8 @@ class CollectionScreenState extends State<CollectionScreen> {
       child: Stack(
         children: [
           Container(
-            margin: const EdgeInsets.fromLTRB(12, 4, 12, 8),
-            padding: const EdgeInsets.fromLTRB(24, 24, 24, 12),
+            margin: const EdgeInsets.fromLTRB(AppSpacing.md, AppSpacing.xs, AppSpacing.md, AppSpacing.sm),
+            padding: const EdgeInsets.fromLTRB(AppSpacing.lg, AppSpacing.lg, AppSpacing.lg, AppSpacing.md),
         decoration: BoxDecoration(
           color: AppColors.surface,
           borderRadius: BorderRadius.circular(24),
@@ -240,19 +279,11 @@ class CollectionScreenState extends State<CollectionScreen> {
                         children: [
                           Text(
                             '${percentage.toStringAsFixed(0)}%',
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontSize: 25,
-                              fontWeight: FontWeight.w900,
-                            ),
+                            style: AppTextStyles.displaySmall,
                           ),
-                          const Text(
+                          Text(
                             'COMPLETE',
-                            style: TextStyle(
-                              color: AppColors.textMuted,
-                              fontSize: 10,
-                              fontWeight: FontWeight.bold,
-                            ),
+                            style: AppTextStyles.tiny.copyWith(color: AppColors.textMuted, fontWeight: FontWeight.bold),
                           ),
                         ],
                       ),
@@ -266,32 +297,32 @@ class CollectionScreenState extends State<CollectionScreen> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      const Text(
+                      Text(
                         'UNIQUE CARDS',
-                        style: TextStyle(color: AppColors.textMuted, fontSize: 11, fontWeight: FontWeight.w900, letterSpacing: 0.5),
+                        style: AppTextStyles.small.copyWith(color: AppColors.textMuted, fontWeight: FontWeight.w900, letterSpacing: 0.5),
                       ),
                       const SizedBox(height: 2),
                       RichText(
                         text: TextSpan(
-                          style: const TextStyle(fontSize: 19, fontWeight: FontWeight.w900, color: Colors.white),
+                          style: AppTextStyles.h2.copyWith(fontSize: 19, fontWeight: FontWeight.w900),
                           children: [
                             TextSpan(text: '$ownedUnique '),
                             TextSpan(
                               text: '/ $totalUnique',
-                              style: const TextStyle(color: Color(0xFF475569), fontSize: 15),
+                              style: AppTextStyles.bodyLarge.copyWith(color: AppColors.slate600),
                             ),
                           ],
                         ),
                       ),
-                      const SizedBox(height: 8),
-                      const Text(
+                      const SizedBox(height: AppSpacing.sm),
+                      Text(
                         'TOTAL COPIES',
-                        style: TextStyle(color: AppColors.textMuted, fontSize: 11, fontWeight: FontWeight.w900, letterSpacing: 0.5),
+                        style: AppTextStyles.small.copyWith(color: AppColors.textMuted, fontWeight: FontWeight.w900, letterSpacing: 0.5),
                       ),
                       const SizedBox(height: 2),
                       Text(
                         '$totalCopies',
-                        style: const TextStyle(fontSize: 19, fontWeight: FontWeight.w900, color: AppColors.amber400),
+                        style: AppTextStyles.h2.copyWith(fontSize: 19, fontWeight: FontWeight.w900, color: AppColors.amber400),
                       ),
                     ],
                   ),
@@ -302,39 +333,39 @@ class CollectionScreenState extends State<CollectionScreen> {
             AnimatedCrossFade(
               firstChild: const SizedBox.shrink(),
               secondChild: Padding(
-                padding: const EdgeInsets.only(top: 8),
+                padding: const EdgeInsets.only(top: AppSpacing.sm, right: AppSpacing.xl),
                 child: Column(
                   children: sets.map((s) {
                     final total = setTotals[s] ?? 0;
                     final owned = setOwned[s] ?? 0;
                     final pct = total > 0 ? owned / total : 0.0;
                     return Padding(
-                      padding: const EdgeInsets.only(bottom: 8),
+                      padding: const EdgeInsets.only(bottom: AppSpacing.sm),
                       child: Row(
                         children: [
                           SizedBox(
                             width: 40,
-                            child: Text(s, style: const TextStyle(color: Color(0xFF94A3B8), fontSize: 11, fontWeight: FontWeight.bold)),
+                            child: Text(s, style: AppTextStyles.small.copyWith(fontWeight: FontWeight.bold)),
                           ),
-                          const SizedBox(width: 8),
+                          const SizedBox(width: AppSpacing.sm),
                           Expanded(
                             child: ClipRRect(
-                              borderRadius: BorderRadius.circular(99),
+                              borderRadius: AppRadius.fullBR,
                               child: LinearProgressIndicator(
                                 value: pct,
-                                backgroundColor: const Color(0xFF1E293B),
+                                backgroundColor: AppColors.surfaceLight,
                                 color: AppColors.amber500,
                                 minHeight: 8,
                               ),
                             ),
                           ),
-                          const SizedBox(width: 8),
+                          const SizedBox(width: AppSpacing.sm),
                           SizedBox(
                             width: 80,
                             child: Text(
                               '$owned/$total (${(pct * 100).toStringAsFixed(1)}%)',
                               textAlign: TextAlign.right,
-                              style: const TextStyle(color: AppColors.textMuted, fontSize: 11, fontWeight: FontWeight.bold),
+                              style: AppTextStyles.small.copyWith(color: AppColors.textMuted, fontWeight: FontWeight.bold),
                             ),
                           ),
                         ],
@@ -371,13 +402,13 @@ class CollectionScreenState extends State<CollectionScreen> {
     final missing = total - owned;
 
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.xs),
       child: Row(
         children: [
           _buildPill('All ($total)', 'all'),
-          const SizedBox(width: 8),
+          const SizedBox(width: AppSpacing.sm),
           _buildPill('Owned ($owned)', 'owned'),
-          const SizedBox(width: 8),
+          const SizedBox(width: AppSpacing.sm),
           _buildPill('Missing ($missing)', 'missing'),
         ],
       ),
@@ -385,28 +416,14 @@ class CollectionScreenState extends State<CollectionScreen> {
   }
 
   Widget _buildPill(String label, String value) {
-    final isActive = _ownershipFilter == value;
-    return GestureDetector(
+    return RiftrPill(
+      label: label,
+      isActive: _ownershipFilter == value,
       onTap: () {
+        HapticFeedback.lightImpact();
         setState(() => _ownershipFilter = value);
         _applyFilters();
       },
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8), // px-4 py-2
-        decoration: BoxDecoration(
-          color: isActive ? AppColors.amber600 : AppColors.surface, // bg-amber-600 / bg-slate-900
-          borderRadius: BorderRadius.circular(99), // rounded-full
-          border: isActive ? null : Border.all(color: AppColors.border), // border border-slate-800
-        ),
-        child: Text(
-          label,
-          style: TextStyle(
-            color: isActive ? Colors.white : const Color(0xFF94A3B8), // text-white / text-slate-400
-            fontSize: 13, // text-xs
-            fontWeight: FontWeight.bold,
-          ),
-        ),
-      ),
     );
   }
 
@@ -414,6 +431,7 @@ class CollectionScreenState extends State<CollectionScreen> {
     final types = CardService.getTypes();
     final rarities = CardService.getRarities();
     final sets = CardService.getSets();
+    final keywords = CardService.getKeywords();
     const domains = ['Fury', 'Mind', 'Chaos', 'Calm', 'Body', 'Order'];
 
     return Column(
@@ -422,7 +440,7 @@ class CollectionScreenState extends State<CollectionScreen> {
         SingleChildScrollView(
           controller: _filterScrollController,
           scrollDirection: Axis.horizontal,
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+          padding: const EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: AppSpacing.xs),
           child: Row(
             children: [
               FilterChipDropdown(
@@ -436,7 +454,7 @@ class CollectionScreenState extends State<CollectionScreen> {
                   _applyFilters();
                 },
               ),
-              const SizedBox(width: 8),
+              const SizedBox(width: AppSpacing.sm),
               FilterChipDropdown(
                 label: _selectedRarity ?? 'Rarity',
                 defaultLabel: 'Rarity',
@@ -448,7 +466,7 @@ class CollectionScreenState extends State<CollectionScreen> {
                   _applyFilters();
                 },
               ),
-              const SizedBox(width: 8),
+              const SizedBox(width: AppSpacing.sm),
               FilterChipDropdown(
                 label: _selectedSet ?? 'Set',
                 defaultLabel: 'Set',
@@ -460,6 +478,18 @@ class CollectionScreenState extends State<CollectionScreen> {
                   _applyFilters();
                 },
               ),
+              const SizedBox(width: AppSpacing.sm),
+              FilterChipDropdown(
+                label: _selectedKeyword ?? 'Keyword',
+                defaultLabel: 'Keyword',
+                isActive: _selectedKeyword != null,
+                activeValue: _selectedKeyword,
+                items: keywords,
+                onSelected: (v) {
+                  setState(() => _selectedKeyword = _selectedKeyword == v ? null : v);
+                  _applyFilters();
+                },
+              ),
             ],
           ),
         ),
@@ -468,13 +498,14 @@ class CollectionScreenState extends State<CollectionScreen> {
 
         // Row 2: Domain icons
         Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+          padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.xs),
           child: Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: domains.map((domain) {
               final isActive = _selectedDomains.contains(domain);
               return GestureDetector(
                 onTap: () {
+                  HapticFeedback.lightImpact();
                   setState(() {
                     if (_selectedDomains.contains(domain)) {
                       _selectedDomains.remove(domain);
@@ -487,9 +518,9 @@ class CollectionScreenState extends State<CollectionScreen> {
                   _applyFilters();
                 },
                 child: Container(
-                  padding: const EdgeInsets.all(6),
+                  padding: const EdgeInsets.all(AppSpacing.sm),
                   decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(99),
+                    borderRadius: AppRadius.fullBR,
                     color: isActive ? AppColors.amber400.withValues(alpha: 0.1) : Colors.transparent,
                     border: Border.all(
                       color: isActive ? AppColors.amber400.withValues(alpha: 0.8) : Colors.transparent,
@@ -510,7 +541,7 @@ class CollectionScreenState extends State<CollectionScreen> {
 
         // Row 3: Cost circles
         Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+          padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.xs),
           child: Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: List.generate(7, (i) {
@@ -529,15 +560,14 @@ class CollectionScreenState extends State<CollectionScreen> {
                     height: 44,
                     decoration: BoxDecoration(
                       shape: BoxShape.circle,
-                      color: isActive ? AppColors.amber500 : const Color(0xFF1E293B),
+                      color: isActive ? AppColors.amber500 : AppColors.surfaceLight,
                       border: isActive ? Border.all(color: AppColors.amber300, width: 2) : null,
                     ),
                     child: Center(
                       child: Text(
                         label,
-                        style: TextStyle(
-                          color: isActive ? Colors.white : AppColors.textMuted,
-                          fontSize: 15,
+                        style: AppTextStyles.bodyLarge.copyWith(
+                          color: isActive ? AppColors.textPrimary : AppColors.textMuted,
                           fontWeight: FontWeight.w900,
                         ),
                       ),
@@ -591,22 +621,24 @@ class CollectionScreenState extends State<CollectionScreen> {
                   const GoldOrnamentHeader(title: 'CLAIM YOUR LEGACY'),
                   _buildProgressHeader(),
                   const Padding(
-                    padding: EdgeInsets.symmetric(horizontal: 8),
+                    padding: EdgeInsets.symmetric(horizontal: AppSpacing.sm),
                     child: SectionDivider(icon: Icons.collections_bookmark, label: 'OWNERSHIP'),
                   ),
                   _buildOwnershipPills(),
                   const GoldLine(),
                   Padding(
-                    padding: const EdgeInsets.fromLTRB(12, 4, 12, 4),
+                    padding: const EdgeInsets.fromLTRB(AppSpacing.md, AppSpacing.xs, AppSpacing.md, AppSpacing.xs),
                     child: SizedBox(
-                      height: 36,
+                      height: 48,
                       child: TextField(
+                        autocorrect: false,
+                        enableSuggestions: false,
                         controller: _searchController,
                         onChanged: (_) => _applyFilters(),
-                        style: const TextStyle(color: AppColors.textPrimary, fontSize: 14),
+                        style: AppTextStyles.body,
                         decoration: InputDecoration(
                           hintText: 'Search cards...',
-                          hintStyle: const TextStyle(color: AppColors.textSecondary, fontSize: 14),
+                          hintStyle: AppTextStyles.bodySecondary,
                           prefixIcon: const Icon(Icons.search, color: AppColors.textMuted, size: 18),
                           suffixIcon: _searchController.text.isNotEmpty
                               ? IconButton(
@@ -618,18 +650,18 @@ class CollectionScreenState extends State<CollectionScreen> {
                                 )
                               : null,
                           filled: true,
-                          fillColor: AppColors.surface,
-                          contentPadding: const EdgeInsets.symmetric(horizontal: 12),
-                          border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide(color: AppColors.border)),
-                          enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide(color: AppColors.border)),
-                          focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: const BorderSide(color: AppColors.amber400)),
+                          fillColor: AppColors.surfaceLight,
+                          contentPadding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
+                          border: OutlineInputBorder(borderRadius: AppRadius.baseBR, borderSide: BorderSide.none),
+                          enabledBorder: OutlineInputBorder(borderRadius: AppRadius.baseBR, borderSide: BorderSide.none),
+                          focusedBorder: OutlineInputBorder(borderRadius: AppRadius.baseBR, borderSide: const BorderSide(color: AppColors.amber400)),
                         ),
                       ),
                     ),
                   ),
                   _buildFilterRow(),
                   Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    padding: const EdgeInsets.symmetric(horizontal: AppSpacing.sm),
                     child: SectionDivider(
                       icon: Icons.inventory_2_outlined,
                       label: '${_filtered.length} CARDS · ${_filtered.where((c) => _getTotalQuantity(c.id) > 0).length} OWNED',
@@ -690,7 +722,7 @@ class CollectionScreenState extends State<CollectionScreen> {
               children: [
                 Positioned.fill(
                   child: ClipRRect(
-                    borderRadius: BorderRadius.circular(12),
+                    borderRadius: AppRadius.baseBR,
                     child: card.isBattlefield
                         ? RotatedBox(
                             quarterTurns: 1,
@@ -718,15 +750,15 @@ class CollectionScreenState extends State<CollectionScreen> {
                       padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
                       decoration: BoxDecoration(
                         color: card.isMetal
-                            ? const Color(0xCCB8860B)
-                            : const Color(0xCC7C3AED),
-                        borderRadius: BorderRadius.circular(4),
+                            ? AppColors.foilGold
+                            : AppColors.nonFoilPurple,
+                        borderRadius: BorderRadius.circular(AppRadius.badge),
                       ),
                       child: Text(
                         card.isMetal ? 'METAL' : 'PROMO',
-                        style: const TextStyle(
-                          color: Colors.white,
+                        style: AppTextStyles.micro.copyWith(
                           fontSize: 8,
+                          color: AppColors.textPrimary,
                           fontWeight: FontWeight.w800,
                           letterSpacing: 0.5,
                         ),
@@ -740,9 +772,9 @@ class CollectionScreenState extends State<CollectionScreen> {
                   child: Container(
                     padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                     decoration: BoxDecoration(
-                      color: isOwned ? AppColors.amber600 : const Color(0xFF1E293B).withValues(alpha: 0.8),
+                      color: isOwned ? AppColors.amber600 : AppColors.surfaceLight.withValues(alpha: 0.8),
                       borderRadius: BorderRadius.circular(6), // rounded-md
-                      border: isOwned ? null : Border.all(color: const Color(0xFF475569)),
+                      border: isOwned ? null : Border.all(color: AppColors.slate600),
                     ),
                     child: qty > 0 && foilQty > 0
                         ? Row(
@@ -750,27 +782,18 @@ class CollectionScreenState extends State<CollectionScreen> {
                             children: [
                               Text(
                                 '$qty+$foilQty',
-                                style: const TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 11,
-                                  fontWeight: FontWeight.w900,
-                                ),
+                                style: AppTextStyles.small.copyWith(color: AppColors.textPrimary, fontWeight: FontWeight.w900),
                               ),
-                              const Text(
+                              Text(
                                 '★',
-                                style: TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 9,
-                                  fontWeight: FontWeight.w900,
-                                ),
+                                style: AppTextStyles.micro.copyWith(color: AppColors.textPrimary, fontWeight: FontWeight.w900),
                               ),
                             ],
                           )
                         : Text(
                             '$totalQty',
-                            style: TextStyle(
-                              color: isOwned ? Colors.white : AppColors.textMuted,
-                              fontSize: 11,
+                            style: AppTextStyles.small.copyWith(
+                              color: isOwned ? AppColors.textPrimary : AppColors.textMuted,
                               fontWeight: FontWeight.w900,
                             ),
                           ),
@@ -779,16 +802,15 @@ class CollectionScreenState extends State<CollectionScreen> {
               ],
             ),
           ),
-          const SizedBox(height: 4), // mt-1
+          const SizedBox(height: AppSpacing.xs), // mt-1
           // Name — React: text-xs font-bold, owned=text-white, unowned=text-slate-600
           Text(
             card.displayName,
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
             textAlign: TextAlign.center,
-            style: TextStyle(
-              color: isOwned ? Colors.white : const Color(0xFF475569), // text-white / text-slate-600
-              fontSize: 13, // text-xs
+            style: AppTextStyles.bodySmall.copyWith(
+              color: isOwned ? AppColors.textPrimary : AppColors.slate600,
               fontWeight: FontWeight.bold,
             ),
           ),
@@ -799,12 +821,8 @@ class CollectionScreenState extends State<CollectionScreen> {
 
 
   void _showEditOverlay(RiftCard card) {
-    showModalBottomSheet(
+    showRiftrSheet(
       context: context,
-      backgroundColor: AppColors.surface,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-      ),
       builder: (context) {
         return StatefulBuilder(
           builder: (context, setSheetState) {
@@ -819,28 +837,24 @@ class CollectionScreenState extends State<CollectionScreen> {
             final normalOnly = isOGS;
             final showBothVariants = !foilOnly && !normalOnly;
             return Padding(
-              padding: const EdgeInsets.all(20),
+              padding: const EdgeInsets.fromLTRB(AppSpacing.base, 0, AppSpacing.base, AppSpacing.base),
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   // Card name
                   Text(
                     card.name,
-                    style: const TextStyle(
-                      color: AppColors.textPrimary,
-                      fontSize: 17,
-                      fontWeight: FontWeight.bold,
-                    ),
+                    style: AppTextStyles.subtitle.copyWith(fontSize: 17, fontWeight: FontWeight.bold),
                   ),
                   Text(
                     [card.type, card.rarity, card.setLabel].whereType<String>().join(' · '),
-                    style: const TextStyle(color: AppColors.textSecondary, fontSize: 13),
+                    style: AppTextStyles.bodySmallSecondary,
                   ),
                   const SizedBox(height: 20),
 
                   // Normal +/- controls (only for Common/Uncommon non-promo)
                   if (showBothVariants)
-                    const Text('Normal', style: TextStyle(color: AppColors.textSecondary, fontSize: 12)),
+                    const Text('Normal', style: AppTextStyles.caption),
                   if (!foilOnly)
                     Row(
                       mainAxisAlignment: MainAxisAlignment.center,
@@ -849,25 +863,23 @@ class CollectionScreenState extends State<CollectionScreen> {
                           icon: Icons.remove,
                           onTap: currentQty > 0
                               ? () {
+                                  HapticFeedback.lightImpact();
                                   _decrement(card.id);
                                   setSheetState(() {});
                                 }
                               : null,
                         ),
                         Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 24),
+                          padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
                           child: Text(
                             '$currentQty',
-                            style: const TextStyle(
-                              color: AppColors.textPrimary,
-                              fontSize: 32,
-                              fontWeight: FontWeight.bold,
-                            ),
+                            style: AppTextStyles.display,
                           ),
                         ),
                         _buildCountButton(
                           icon: Icons.add,
                           onTap: () {
+                            HapticFeedback.lightImpact();
                             _increment(card.id);
                             setSheetState(() {});
                           },
@@ -877,9 +889,9 @@ class CollectionScreenState extends State<CollectionScreen> {
 
                   // Foil +/- controls (Common/Uncommon: second row; Promo/Rare+: only row)
                   if (showBothVariants || foilOnly) ...[
-                    if (showBothVariants) const SizedBox(height: 16),
+                    if (showBothVariants) const SizedBox(height: AppSpacing.base),
                     if (showBothVariants)
-                      const Text('Foil', style: TextStyle(color: Color(0xFFD4AF37), fontSize: 12)),
+                      Text('Foil', style: AppTextStyles.caption.copyWith(color: const Color(0xFFD4AF37))),
                     Row(
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: [
@@ -887,25 +899,25 @@ class CollectionScreenState extends State<CollectionScreen> {
                           icon: Icons.remove,
                           onTap: currentFoilQty > 0
                               ? () {
+                                  HapticFeedback.lightImpact();
                                   _decrement(card.id, foil: true);
                                   setSheetState(() {});
                                 }
                               : null,
                         ),
                         Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 24),
+                          padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
                           child: Text(
                             '$currentFoilQty',
-                            style: TextStyle(
+                            style: AppTextStyles.display.copyWith(
                               color: foilOnly ? AppColors.textPrimary : const Color(0xFFD4AF37),
-                              fontSize: 32,
-                              fontWeight: FontWeight.bold,
                             ),
                           ),
                         ),
                         _buildCountButton(
                           icon: Icons.add,
                           onTap: () {
+                            HapticFeedback.lightImpact();
                             _increment(card.id, foil: true);
                             setSheetState(() {});
                           },
@@ -913,7 +925,7 @@ class CollectionScreenState extends State<CollectionScreen> {
                       ],
                     ),
                   ],
-                  const SizedBox(height: 16),
+                  const SizedBox(height: AppSpacing.base),
                 ],
               ),
             );

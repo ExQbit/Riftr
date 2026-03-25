@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../../models/market/card_price_data.dart';
+import '../../theme/app_components.dart';
 import '../../theme/app_theme.dart';
 
 /// Grid card showing Buy From / Market / Trend / change stats.
@@ -31,31 +32,17 @@ class PriceOverviewCard extends StatelessWidget {
     final displayLow = low > 0 ? low : data.low30d;
     final displayTrend = trend > 0 ? trend : data.high30d;
 
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: AppColors.surface,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: AppColors.border),
-      ),
+    return RiftrCard(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Text(
-            'PRICE OVERVIEW',
-            style: TextStyle(
-              color: AppColors.textMuted,
-              fontSize: 10,
-              fontWeight: FontWeight.w900,
-              letterSpacing: 0.5,
-            ),
-          ),
-          const SizedBox(height: 12),
+          const RiftrSectionHeader(label: 'price overview'),
+          const SizedBox(height: AppSpacing.md),
 
           Row(
             children: [
               Expanded(child: _cell('Buy From', '€${displayLow.toStringAsFixed(2)}', AppColors.loss)),
-              const SizedBox(width: 12),
+              const SizedBox(width: AppSpacing.md),
               Expanded(child: _cell('Market', '€${price.toStringAsFixed(2)}', AppColors.amber300)),
             ],
           ),
@@ -63,7 +50,7 @@ class PriceOverviewCard extends StatelessWidget {
           Row(
             children: [
               Expanded(child: _cell('Trend', '€${displayTrend.toStringAsFixed(2)}', AppColors.win)),
-              const SizedBox(width: 12),
+              const SizedBox(width: AppSpacing.md),
               Expanded(child: _cell('vs 30d Avg', _fmtPct(monthChg), _pctColor(monthChg))),
             ],
           ),
@@ -71,7 +58,7 @@ class PriceOverviewCard extends StatelessWidget {
           Row(
             children: [
               Expanded(child: _cell('vs 7d Avg', _fmtPct(weekChg), _pctColor(weekChg))),
-              const SizedBox(width: 12),
+              const SizedBox(width: AppSpacing.md),
               Expanded(child: _cell('24h Change', _fmtPct(dayChg), _pctColor(dayChg))),
             ],
           ),
@@ -88,25 +75,22 @@ class PriceOverviewCard extends StatelessWidget {
       padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(
         color: AppColors.background,
-        borderRadius: BorderRadius.circular(10),
+        borderRadius: BorderRadius.circular(AppRadius.iconButton),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(
             label,
-            style: const TextStyle(
-              color: AppColors.textMuted,
-              fontSize: 9,
+            style: AppTextStyles.micro.copyWith(
               fontWeight: FontWeight.w600,
             ),
           ),
-          const SizedBox(height: 4),
+          const SizedBox(height: AppSpacing.xs),
           Text(
             value,
-            style: TextStyle(
+            style: AppTextStyles.bodyBold.copyWith(
               color: valueColor,
-              fontSize: 14,
               fontWeight: FontWeight.w800,
             ),
           ),

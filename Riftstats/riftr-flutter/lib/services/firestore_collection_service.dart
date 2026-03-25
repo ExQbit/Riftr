@@ -3,6 +3,7 @@ import 'package:flutter/foundation.dart';
 import '../models/market/cost_basis_entry.dart';
 import 'card_service.dart';
 import 'firestore_service.dart';
+import 'listing_service.dart';
 import 'market_service.dart';
 
 /// Firestore-backed collection service with real-time sync + cost basis tracking.
@@ -105,6 +106,7 @@ class FirestoreCollectionService extends ChangeNotifier {
   void setQuantity(String cardId, int qty, {double? costPrice, bool foil = false}) {
     final map = foil ? _foils : _cards;
     final oldQty = map[cardId] ?? 0;
+    final wasReduction = qty < oldQty;
 
     if (qty <= 0) {
       map.remove(cardId);
@@ -141,9 +143,11 @@ class FirestoreCollectionService extends ChangeNotifier {
 
     notifyListeners();
     _debounceSave();
+
+    if (wasReduction || qty <= 0) _syncListings(cardId);
   }
 
-  void increment(String cardId, {double? costPrice, bool foil = false}) {
+  void increment(String cardId, {double? costPrice, bool foil = false, String? source}) {
     if (foil) {
       _foils[cardId] = (_foils[cardId] ?? 0) + 1;
     } else {
@@ -152,6 +156,7 @@ class FirestoreCollectionService extends ChangeNotifier {
 
     // Track cost basis
     if (costPrice != null && costPrice > 0) {
+      final lotSource = source ?? (foil ? 'manual_foil' : 'manual');
       final existing = _costBasis[cardId] ??
           const CostBasisEntry(totalCost: 0, totalQty: 0, lots: []);
       _costBasis[cardId] = CostBasisEntry(
@@ -159,13 +164,20 @@ class FirestoreCollectionService extends ChangeNotifier {
         totalQty: existing.totalQty + 1,
         lots: [
           ...existing.lots,
-          CostBasisLot(qty: 1, price: costPrice, date: DateTime.now(), source: foil ? 'manual_foil' : 'manual'),
+          CostBasisLot(qty: 1, price: costPrice, date: DateTime.now(), source: lotSource),
         ],
       );
     }
 
     notifyListeners();
     _debounceSave();
+  }
+
+  /// Determines if a card should be tracked as foil based on rarity/set rules.
+  static bool isFoilVariant(String? setId, String? rarity) {
+    if (setId == 'OGS') return false;
+    final r = rarity?.toLowerCase() ?? '';
+    return r != 'common' && r != 'uncommon';
   }
 
   void decrement(String cardId, {bool foil = false}) {
@@ -204,81 +216,121 @@ class FirestoreCollectionService extends ChangeNotifier {
 
     notifyListeners();
     _debounceSave();
+    _syncListings(cardId);
   }
 
-  /// Repairs all existing cost basis lots with correct foilPrice / nonFoilPrice.
-  /// Lots recorded before the fix used currentPrice for all variants.
-  /// After repair, each lot.price reflects the correct variant price.
-  /// Returns the number of cards whose cost basis was repaired.
+  /// Check if collection can be reduced for this card.
+  /// Returns null if OK, or a warning message if blocked by open orders.
+  String? canReduce(String cardId, int newTotal) {
+    final openOrders = ListingService.instance.openOrderQtyForCard(cardId);
+    if (openOrders > 0 && newTotal < openOrders) {
+      return 'You have $openOrders open order${openOrders > 1 ? 's' : ''} — ship first';
+    }
+    return null;
+  }
+
+  /// Check and sync active listings when collection qty decreases.
+  /// Called from setQuantity and decrement after qty reduction.
+  void _syncListings(String cardId) {
+    final newTotal = getTotalQuantity(cardId);
+    ListingService.instance.syncListingsForCard(cardId, newTotal).then((msg) {
+      if (msg != null) {
+        _lastListingSyncMessage = msg;
+        notifyListeners();
+      }
+    });
+  }
+
+  /// Last listing sync message for toast display. Consumed once after read.
+  String? _lastListingSyncMessage;
+  String? consumeListingSyncMessage() {
+    final msg = _lastListingSyncMessage;
+    _lastListingSyncMessage = null;
+    return msg;
+  }
+
+  /// ONE-TIME migration (2026-03-14): Fixed lots that used avg1 price instead of trend.
+  /// DISABLED — was overwriting ALL lot prices with current market price on every
+  /// app start, destroying historical cost basis data (the "0% bug").
+  /// Cost basis prices are now immutable after creation.
   int repairCostBasis() {
+    // Migration complete — no longer needed.
+    return 0;
+  }
+
+  /// Synchronizes cost basis totalQty with actual collection quantity.
+  /// Removes excess lots (FIFO) when cbQty > actualQty.
+  /// Creates missing lots (at current market price) when cbQty < actualQty.
+  /// Returns the number of cards corrected.
+  int syncCostBasisWithCollection() {
     final market = MarketService.instance;
-    if (!market.initialized) return 0;
+    int corrected = 0;
 
-    int repairedCards = 0;
+    // 1. cbQty > actualQty → remove excess lots
+    // 2. cbQty < actualQty → add missing lots at current market price
+    for (final cardId in {..._costBasis.keys, ..._cards.keys, ..._foils.keys}) {
+      final actualQty = (_cards[cardId] ?? 0) + (_foils[cardId] ?? 0);
+      final cb = _costBasis[cardId];
+      final cbQty = cb?.totalQty ?? 0;
 
-    final updatedCostBasis = <String, CostBasisEntry>{};
-
-    for (final entry in _costBasis.entries) {
-      final cardId = entry.key;
-      final cb = entry.value;
-      final priceData = market.getPrice(cardId);
-      if (priceData == null) {
-        updatedCostBasis[cardId] = cb;
+      if (actualQty == 0 && cb != null) {
+        // Card no longer in collection — remove cost basis entirely
+        _costBasis.remove(cardId);
+        corrected++;
+        debugPrint('CostBasis sync: $cardId removed (no longer in collection)');
         continue;
       }
 
-      // Determine correct prices (same logic as _increment)
-      final correctFoilPrice = priceData.foilPrice > 0
-          ? priceData.foilPrice
-          : priceData.currentPrice;
-      final correctNormalPrice = priceData.nonFoilPrice > 0
-          ? priceData.nonFoilPrice
-          : priceData.currentPrice;
-
-      bool changed = false;
-      final newLots = <CostBasisLot>[];
-      double newTotalCost = 0;
-
-      for (final lot in cb.lots) {
-        final isFoilLot = lot.source.contains('foil');
-        final correctPrice = isFoilLot ? correctFoilPrice : correctNormalPrice;
-
-        if ((lot.price - correctPrice).abs() > 0.001) {
-          // Price was wrong — fix it
-          newLots.add(CostBasisLot(
-            qty: lot.qty,
-            price: correctPrice,
-            date: lot.date,
-            source: lot.source,
-          ));
-          newTotalCost += correctPrice * lot.qty;
-          changed = true;
+      if (cbQty > actualQty && cb != null) {
+        // Too many lots — trim excess (FIFO)
+        final excess = cbQty - actualQty;
+        final updated = cb.removeFIFO(excess);
+        if (updated != null) {
+          _costBasis[cardId] = updated;
         } else {
-          newLots.add(lot);
-          newTotalCost += lot.price * lot.qty;
+          _costBasis.remove(cardId);
         }
-      }
+        corrected++;
+        debugPrint('CostBasis sync: $cardId reduced $cbQty → $actualQty lots');
+      } else if (cbQty < actualQty && actualQty > 0) {
+        // Missing lots — create at current market price (break-even)
+        final missing = actualQty - cbQty;
+        final priceData = market.initialized ? market.getPrice(cardId) : null;
+        final foilQty = _foils[cardId] ?? 0;
+        final normalQty = _cards[cardId] ?? 0;
 
-      if (changed) {
-        updatedCostBasis[cardId] = CostBasisEntry(
-          totalCost: newTotalCost,
-          totalQty: cb.totalQty,
-          lots: newLots,
+        // Use foil price if card is mostly foil, else normal price
+        double fallbackPrice = 0;
+        if (priceData != null) {
+          if (foilQty >= normalQty) {
+            fallbackPrice = priceData.foilPrice > 0 ? priceData.foilPrice : priceData.currentPrice;
+          } else {
+            fallbackPrice = priceData.nonFoilPrice > 0 ? priceData.nonFoilPrice : priceData.currentPrice;
+          }
+        }
+
+        final existing = cb ?? const CostBasisEntry(totalCost: 0, totalQty: 0, lots: []);
+        final source = foilQty >= normalQty ? 'manual_foil' : 'manual';
+        _costBasis[cardId] = CostBasisEntry(
+          totalCost: existing.totalCost + fallbackPrice * missing,
+          totalQty: existing.totalQty + missing,
+          lots: [
+            ...existing.lots,
+            CostBasisLot(qty: missing, price: fallbackPrice, date: DateTime.now(), source: source),
+          ],
         );
-        repairedCards++;
-      } else {
-        updatedCostBasis[cardId] = cb;
+        corrected++;
+        debugPrint('CostBasis sync: $cardId added $missing missing lots @ €${fallbackPrice.toStringAsFixed(2)}');
       }
     }
 
-    if (repairedCards > 0) {
-      _costBasis = updatedCostBasis;
+    if (corrected > 0) {
       notifyListeners();
       _debounceSave();
-      debugPrint('CostBasis: Repaired $repairedCards cards');
+      debugPrint('CostBasis sync: corrected $corrected cards');
     }
 
-    return repairedCards;
+    return corrected;
   }
 
   /// Migrates non-foil entries for foil-only cards (promos, rare+) into foil map.

@@ -48,12 +48,18 @@ class CardPriceData {
   double getWeekChange(bool foil) => foil ? foilWeekChange : nonFoilWeekChange;
   double getMonthChange(bool foil) => foil ? foilMonthChange : nonFoilMonthChange;
 
-  /// Standard variant price based on rarity.
-  /// Common/Uncommon → non-foil is standard.
-  /// Rare/Epic/Showcase → foil is standard.
-  double get standardPrice {
+  /// Whether this card's standard variant is non-foil.
+  /// OGS cards are always non-foil. Common/Uncommon are non-foil.
+  bool get _isNonFoilStandard {
+    final s = (setId ?? '').toUpperCase();
+    if (s == 'OGS') return true;
     final r = (rarity ?? '').toLowerCase();
-    if (r == 'common' || r == 'uncommon') {
+    return r == 'common' || r == 'uncommon';
+  }
+
+  /// Standard variant price based on rarity/set.
+  double get standardPrice {
+    if (_isNonFoilStandard) {
       return nonFoilPrice > 0 ? nonFoilPrice : foilPrice;
     }
     return foilPrice > 0 ? foilPrice : nonFoilPrice;
@@ -61,23 +67,20 @@ class CardPriceData {
 
   /// Premium variant price (opposite of standard).
   double get premiumPrice {
-    final r = (rarity ?? '').toLowerCase();
-    if (r == 'common' || r == 'uncommon') {
-      return foilPrice; // foil is the premium for commons
+    if (_isNonFoilStandard) {
+      return foilPrice;
     }
-    return nonFoilPrice; // non-foil is the premium for rares
+    return nonFoilPrice;
   }
 
   /// Label for the standard variant.
   String get standardLabel {
-    final r = (rarity ?? '').toLowerCase();
-    return (r == 'common' || r == 'uncommon') ? 'Non-Foil' : 'Foil';
+    return _isNonFoilStandard ? 'Non-Foil' : 'Foil';
   }
 
   /// Label for the premium variant.
   String get premiumLabel {
-    final r = (rarity ?? '').toLowerCase();
-    return (r == 'common' || r == 'uncommon') ? 'Foil' : 'Non-Foil';
+    return _isNonFoilStandard ? 'Foil' : 'Non-Foil';
   }
 
   const CardPriceData({
@@ -173,6 +176,12 @@ class CardPriceData {
   }
 
   CardPriceData copyWith({
+    String? cardId,
+    String? cardName,
+    String? imageUrl,
+    String? rarity,
+    String? setId,
+    String? cardType,
     double? currentPrice,
     double? previousClose,
     double? dayChange,
@@ -181,12 +190,12 @@ class CardPriceData {
     List<PricePoint>? sparkline,
   }) {
     return CardPriceData(
-      cardId: cardId,
-      cardName: cardName,
-      imageUrl: imageUrl,
-      rarity: rarity,
-      setId: setId,
-      cardType: cardType,
+      cardId: cardId ?? this.cardId,
+      cardName: cardName ?? this.cardName,
+      imageUrl: imageUrl ?? this.imageUrl,
+      rarity: rarity ?? this.rarity,
+      setId: setId ?? this.setId,
+      cardType: cardType ?? this.cardType,
       currentPrice: currentPrice ?? this.currentPrice,
       previousClose: previousClose ?? this.previousClose,
       dayChange: dayChange ?? this.dayChange,

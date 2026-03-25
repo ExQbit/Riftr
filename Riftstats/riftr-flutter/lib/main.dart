@@ -10,6 +10,7 @@ import 'services/firestore_deck_service.dart';
 import 'services/firestore_collection_service.dart';
 import 'services/demo_service.dart';
 import 'services/public_deck_service.dart';
+import 'services/meta_deck_service.dart';
 import 'services/follow_service.dart';
 import 'services/profile_service.dart';
 import 'screens/login_screen.dart';
@@ -26,7 +27,17 @@ import 'services/listing_service.dart';
 import 'services/seller_service.dart';
 import 'services/card_service.dart';
 import 'services/order_service.dart';
+import 'services/wallet_service.dart';
 import 'package:flutter_stripe/flutter_stripe.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
+import 'services/push_notification_service.dart';
+
+/// Top-level background message handler (required by FCM).
+@pragma('vm:entry-point')
+Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+  // No action needed — FCM auto-displays notification in background
+}
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -34,6 +45,8 @@ void main() async {
   await Firebase.initializeApp(
     options: DefaultFirebaseOptions.currentPlatform,
   );
+
+  FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
 
   Stripe.publishableKey = 'pk_test_51T8RW7IF9chIKwTY1iXCxHqtIGfPlCRIs4k0INBevmznbBTmEiKmXoUcKBVBJdSrmUPa1ZsVIIRIWfUTW3I16WWu007iPI7MWl';
   // merchantIdentifier only needed when Apple Pay is configured
@@ -134,6 +147,7 @@ class _AppShellState extends State<AppShell> with TickerProviderStateMixin {
   int _currentIndex = 0;
   bool _hideNav = false;
   bool _navCollapsed = false;
+  final Set<int> _badgeTabs = {}; // Tab indices with unread events
   late final AnimationController _navAnimController;
   late final Animation<double> _navAnimation;
   late final AnimationController _pulseController;
@@ -147,7 +161,7 @@ class _AppShellState extends State<AppShell> with TickerProviderStateMixin {
   final _marketKey = GlobalKey<MarketScreenState>();
 
   late final List<Widget> _screens = [
-    TrackerScreen(onFullscreenChanged: _setNavHidden, onGoToDecks: () => setState(() => _currentIndex = 4)),
+    TrackerScreen(onFullscreenChanged: _setNavHidden, onGoToDecks: () => setState(() { _currentIndex = 4; _badgeTabs.remove(4); })),
     CardsScreen(key: _cardsKey),
     CollectionScreen(key: _collectionKey),
     MarketScreen(key: _marketKey, onFullscreenChanged: _setNavHidden),
@@ -155,21 +169,112 @@ class _AppShellState extends State<AppShell> with TickerProviderStateMixin {
       key: _decksKey,
       onFullscreenChanged: _setNavHidden,
       onNavigateToAuthor: _navigateToAuthor,
+      onShowMissingInMarket: _showMissingInMarket,
     ),
-    StatsScreen(key: _statsKey, onGoToTracker: () => setState(() => _currentIndex = 0)),
+    StatsScreen(key: _statsKey, onGoToTracker: () => setState(() { _currentIndex = 0; _badgeTabs.remove(0); })),
     SocialScreen(key: _socialKey, onViewPublicDeck: _viewPublicDeck, onGoToPublicDecks: () {
-      setState(() => _currentIndex = 4);
+      setState(() { _currentIndex = 4; _badgeTabs.remove(4); });
       _decksKey.currentState?.showPublicDecks();
     }),
   ];
 
+  // ─── Badge Listeners ───
+  int _prevPurchaseCount = -1;
+  int _prevSaleCount = -1;
+  int _prevCollectionCount = -1;
+  int _prevDeckCount = -1;
+  int _prevMatchCount = -1;
+  int _prevFollowerCount = -1;
+  int _prevFollowedDeckCount = -1;
+
+  void _setupBadgeListeners() {
+    // Market badges: new orders (purchases or sales)
+    OrderService.instance.addListener(_onOrdersChanged);
+    // Collection badges: new cards added
+    FirestoreCollectionService.instance.addListener(_onCollectionChanged);
+    // Deck badges: new decks
+    FirestoreDeckService.instance.addListener(_onDecksChanged);
+    // Stats badges: new matches
+    MatchService.instance.addListener(_onMatchesChanged);
+    // Social badges: new followers
+    FollowService.instance.addListener(_onFollowsChanged);
+    // Social badges: followee shared a new deck
+    PublicDeckService.instance.addListener(_onFollowedDecksChanged);
+  }
+
+  void _onOrdersChanged() {
+    final purchaseCount = OrderService.instance.purchases.length;
+    final saleCount = OrderService.instance.sales.length;
+    // Only badge if counts increased (not on first load)
+    if (_prevPurchaseCount >= 0 && purchaseCount > _prevPurchaseCount && _currentIndex != 3) {
+      setState(() => _badgeTabs.add(3)); // Market tab
+    }
+    if (_prevSaleCount >= 0 && saleCount > _prevSaleCount && _currentIndex != 3) {
+      setState(() => _badgeTabs.add(3)); // Market tab
+    }
+    _prevPurchaseCount = purchaseCount;
+    _prevSaleCount = saleCount;
+  }
+
+  void _onCollectionChanged() {
+    final count = FirestoreCollectionService.instance.cards.values
+        .fold<int>(0, (sum, qty) => sum + qty);
+    if (_prevCollectionCount >= 0 && count > _prevCollectionCount && _currentIndex != 2) {
+      setState(() => _badgeTabs.add(2)); // Collect tab
+    }
+    _prevCollectionCount = count;
+  }
+
+  void _onDecksChanged() {
+    final count = FirestoreDeckService.instance.decks.length;
+    if (_prevDeckCount >= 0 && count > _prevDeckCount && _currentIndex != 4) {
+      setState(() => _badgeTabs.add(4)); // Decks tab
+    }
+    _prevDeckCount = count;
+  }
+
+  void _onMatchesChanged() {
+    final count = MatchService.instance.matches.length;
+    if (_prevMatchCount >= 0 && count > _prevMatchCount && _currentIndex != 5) {
+      setState(() => _badgeTabs.add(5)); // Stats tab
+    }
+    _prevMatchCount = count;
+  }
+
+  void _onFollowsChanged() {
+    final uid = AuthService.instance.uid ?? '';
+    final count = FollowService.instance.getFollowerCount(uid);
+    if (_prevFollowerCount >= 0 && count > _prevFollowerCount && _currentIndex != 6) {
+      setState(() => _badgeTabs.add(6)); // Social tab
+    }
+    _prevFollowerCount = count;
+  }
+
+  void _onFollowedDecksChanged() {
+    final following = FollowService.instance.myFollowing;
+    if (following.isEmpty) return;
+    final count = PublicDeckService.instance.decks
+        .where((d) => following.contains(d.authorId))
+        .length;
+    if (_prevFollowedDeckCount >= 0 && count > _prevFollowedDeckCount && _currentIndex != 6) {
+      setState(() => _badgeTabs.add(6)); // Social tab
+    }
+    _prevFollowedDeckCount = count;
+  }
+
   void _navigateToAuthor(String authorId, String authorName) {
-    setState(() => _currentIndex = 6); // Social tab
+    setState(() { _currentIndex = 6; _badgeTabs.remove(6); }); // Social tab
     _socialKey.currentState?.navigateToAuthor(authorId, authorName);
   }
 
+  void _showMissingInMarket(Map<String, int> missingCards) {
+    _marketKey.currentState?.showMissingCards(missingCards);
+    _setNavHidden(false); // Close deck fullscreen overlay
+    setState(() { _currentIndex = 3; _badgeTabs.remove(3); }); // Market tab
+  }
+
   void _viewPublicDeck(PublicDeckData deck) {
-    setState(() => _currentIndex = 4); // Decks tab
+    setState(() { _currentIndex = 4; _badgeTabs.remove(4); }); // Decks tab
     _decksKey.currentState?.viewPublicDeck(deck);
   }
 
@@ -221,6 +326,12 @@ class _AppShellState extends State<AppShell> with TickerProviderStateMixin {
       ProfileService.instance.listen();
       SellerService.instance.listen();
       OrderService.instance.listen();
+      WalletService.instance.listen();
+      MetaDeckService.instance.listen();
+      PushNotificationService.instance.initialize().catchError((e) {
+        debugPrint('PushNotificationService init error: $e');
+      });
+      _setupBadgeListeners();
     }
     _initMarket();
   }
@@ -253,12 +364,18 @@ class _AppShellState extends State<AppShell> with TickerProviderStateMixin {
       // Repair cost basis lot prices (avg1 → trend, 2026-03-14)
       final repaired = FirestoreCollectionService.instance.repairCostBasis();
       if (repaired > 0) debugPrint('Cost basis repaired: $repaired cards');
+
+      // Sync cost basis qty with actual collection qty (fix orphaned/missing lots)
+      final synced = FirestoreCollectionService.instance.syncCostBasisWithCollection();
+      if (synced > 0) debugPrint('Cost basis synced: $synced cards');
     }
 
     // Recalculate portfolio when collection changes (new cards added, etc.)
     if (!DemoService.instance.isActive) {
       FirestoreCollectionService.instance.addListener(() {
         final svc = FirestoreCollectionService.instance;
+        // Repair any cost basis lots that used fallback prices
+        svc.repairCostBasis();
         MarketService.instance.recalculatePortfolio(
           svc.cards,
           foilCollection: svc.foils,
@@ -288,6 +405,12 @@ class _AppShellState extends State<AppShell> with TickerProviderStateMixin {
     _pulseController.dispose();
     _navSlideController.dispose();
     if (!DemoService.instance.isActive) {
+      OrderService.instance.removeListener(_onOrdersChanged);
+      FirestoreCollectionService.instance.removeListener(_onCollectionChanged);
+      FirestoreDeckService.instance.removeListener(_onDecksChanged);
+      MatchService.instance.removeListener(_onMatchesChanged);
+      FollowService.instance.removeListener(_onFollowsChanged);
+      PublicDeckService.instance.removeListener(_onFollowedDecksChanged);
       MatchService.instance.stopListening();
       FirestoreDeckService.instance.stopListening();
       FirestoreCollectionService.instance.stopListening();
@@ -297,6 +420,7 @@ class _AppShellState extends State<AppShell> with TickerProviderStateMixin {
       ProfileService.instance.stopListening();
       SellerService.instance.stopListening();
       OrderService.instance.stopListening();
+      WalletService.instance.stopListening();
     }
     super.dispose();
   }
@@ -350,24 +474,55 @@ class _AppShellState extends State<AppShell> with TickerProviderStateMixin {
               ),
             ),
           ),
-          AnimatedBuilder(
-            animation: _navSlideController,
-            builder: (context, child) {
-              final slideValue = _navSlideController.value; // 1 = visible, 0 = hidden
-              if (slideValue <= 0.01) return const SizedBox.shrink();
-              return Positioned(
-                bottom: -100 * (1 - slideValue), // slides 100px below screen
-                left: 0,
-                right: 0,
-                child: Opacity(
-                  opacity: slideValue,
-                  child: _buildFloatingNav(),
-                ),
-              );
-            },
+          Positioned(
+            bottom: 0,
+            left: 0,
+            right: 0,
+            child: AnimatedBuilder(
+              animation: _navSlideController,
+              builder: (context, child) {
+                final slideValue = _navSlideController.value;
+                if (slideValue <= 0.01) return const SizedBox.shrink();
+                return Transform.translate(
+                  offset: Offset(0, 100 * (1 - slideValue)),
+                  child: Opacity(
+                    opacity: slideValue,
+                    child: _buildFloatingNav(),
+                  ),
+                );
+              },
+            ),
           ),
         ],
       ),
+    );
+  }
+
+  Widget _badgeIcon(Widget icon, int tabIndex) {
+    if (!_badgeTabs.contains(tabIndex)) return icon;
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        icon,
+        Positioned(
+          top: -2,
+          right: -4,
+          child: Container(
+            width: 8,
+            height: 8,
+            decoration: BoxDecoration(
+              color: AppColors.amber400,
+              shape: BoxShape.circle,
+              boxShadow: [
+                BoxShadow(
+                  color: AppColors.amber400.withValues(alpha: 0.6),
+                  blurRadius: 4,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ],
     );
   }
 
@@ -405,7 +560,7 @@ class _AppShellState extends State<AppShell> with TickerProviderStateMixin {
           alignment: Alignment.lerp(Alignment.bottomLeft, Alignment.bottomCenter, t)!,
           child: Container(
             width: currentWidth,
-            margin: EdgeInsets.only(bottom: 16, left: 16, right: t > 0.5 ? 16 : 0),
+            margin: EdgeInsets.only(bottom: AppSpacing.base, left: AppSpacing.base, right: t > 0.5 ? AppSpacing.base : 0),
             child: CustomPaint(
               painter: _NavBarPainter(
                 color: AppColors.surface.withValues(alpha: 0.8),
@@ -438,7 +593,7 @@ class _AppShellState extends State<AppShell> with TickerProviderStateMixin {
                                 final iconScale = 1.0 + pulseVal * 0.06;
                                 return Center(
                                   child: Padding(
-                                    padding: const EdgeInsets.symmetric(vertical: 4),
+                                    padding: const EdgeInsets.symmetric(vertical: AppSpacing.xs),
                                     child: Transform.scale(
                                       scale: iconScale,
                                       child: Icon(
@@ -468,18 +623,27 @@ class _AppShellState extends State<AppShell> with TickerProviderStateMixin {
                                 flex: isMarket ? 5 : 4,
                                 child: GestureDetector(
                                 onTap: () {
-                                  setState(() => _currentIndex = i);
+                                  HapticFeedback.lightImpact();
+                                  setState(() {
+                                    _currentIndex = i;
+                                    _badgeTabs.remove(i);
+                                  });
                                   switch (i) {
                                     case 1: _cardsKey.currentState?.resetScroll();
                                     case 2: _collectionKey.currentState?.resetScroll();
                                     case 3: _marketKey.currentState?.resetScroll();
-                                    case 4: _decksKey.currentState?.resetScroll();
+                                    case 4:
+                                      _decksKey.currentState?.resetScroll();
+                                      // Hide nav if deck is open in fullscreen
+                                      if (_decksKey.currentState?.isFullscreen == true) {
+                                        _setNavHidden(true);
+                                      }
                                     case 5: _statsKey.currentState?.resetScroll();
                                   }
                                 },
                                 behavior: HitTestBehavior.opaque,
                                 child: Padding(
-                                  padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 4),
+                                  padding: const EdgeInsets.symmetric(horizontal: 2, vertical: AppSpacing.xs),
                                   child: Opacity(
                                     opacity: isActive ? 1.0 : (isMarket ? inactiveOpacity.clamp(0.7, 1.0) : inactiveOpacity),
                                     child: isMarket
@@ -492,23 +656,25 @@ class _AppShellState extends State<AppShell> with TickerProviderStateMixin {
                                             child: Column(
                                               mainAxisSize: MainAxisSize.min,
                                               children: [
-                                                Icon(
-                                                  _tabs[i].icon,
-                                                  size: 42,
-                                                  color: isActive
-                                                      ? AppColors.amber100
-                                                      : AppColors.textMuted,
+                                                _badgeIcon(
+                                                  Icon(
+                                                    _tabs[i].icon,
+                                                    size: 42,
+                                                    color: isActive
+                                                        ? AppColors.amber100
+                                                        : AppColors.textMuted,
+                                                  ),
+                                                  i,
                                                 ),
                                                 if (labelOpacity > 0.01) ...[
                                                   Opacity(
                                                     opacity: labelOpacity,
                                                     child: Text(
                                                       'Market',
-                                                      style: TextStyle(
+                                                      style: AppTextStyles.small.copyWith(
                                                         color: isActive
                                                             ? AppColors.amber100
                                                             : AppColors.textMuted,
-                                                        fontSize: 11,
                                                         fontWeight: FontWeight.w900,
                                                       ),
                                                     ),
@@ -522,10 +688,13 @@ class _AppShellState extends State<AppShell> with TickerProviderStateMixin {
                                       : Column(
                                       mainAxisSize: MainAxisSize.min,
                                       children: [
-                                        Icon(
-                                          _tabs[i].icon,
-                                          size: 30,
-                                          color: isActive ? AppColors.amber100 : AppColors.textMuted,
+                                        _badgeIcon(
+                                          Icon(
+                                            _tabs[i].icon,
+                                            size: 30,
+                                            color: isActive ? AppColors.amber100 : AppColors.textMuted,
+                                          ),
+                                          i,
                                         ),
                                         if (labelOpacity > 0.01) ...[
                                           const SizedBox(height: 2),
@@ -533,9 +702,8 @@ class _AppShellState extends State<AppShell> with TickerProviderStateMixin {
                                             opacity: labelOpacity,
                                             child: Text(
                                               _tabs[i].label,
-                                              style: TextStyle(
+                                              style: AppTextStyles.tiny.copyWith(
                                                 color: isActive ? AppColors.amber100 : AppColors.textMuted,
-                                                fontSize: 10,
                                                 fontWeight: FontWeight.bold,
                                               ),
                                             ),

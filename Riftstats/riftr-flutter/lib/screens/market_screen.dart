@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import '../widgets/drag_to_dismiss.dart';
 import '../theme/app_theme.dart';
 import '../data/shipping_rates.dart';
+import '../services/card_service.dart';
 import '../services/market_service.dart';
 import '../services/listing_service.dart';
 import '../services/auth_service.dart';
@@ -11,10 +13,12 @@ import '../services/demo_service.dart';
 import '../services/seller_service.dart';
 import '../services/firestore_collection_service.dart';
 import '../models/market/card_price_data.dart';
+import '../models/market/discover_filter.dart';
 import '../models/market/listing_model.dart';
 import '../models/market/price_point.dart';
 import '../widgets/gold_header.dart';
 import '../widgets/section_divider.dart';
+import '../widgets/market/discover_filter_sheet.dart';
 import '../widgets/market/portfolio_header.dart';
 import '../widgets/market/portfolio_chart.dart';
 import '../widgets/market/price_chart.dart';
@@ -29,11 +33,14 @@ import '../widgets/market/seller_onboarding_sheet.dart';
 import '../widgets/market/checkout_sheet.dart';
 import '../widgets/market/order_tile.dart';
 import '../models/market/order_model.dart';
-import 'package:flutter_stripe/flutter_stripe.dart';
 import '../widgets/market/condition_badge.dart';
 import '../services/order_service.dart';
 import '../models/market/cost_basis_entry.dart';
 import '../widgets/card_image.dart';
+import 'dispute_detail_screen.dart';
+import 'wallet_screen.dart';
+import '../services/wallet_service.dart';
+import '../theme/app_components.dart';
 
 /// Holdings metric display mode (Trade Republic-style)
 enum HoldingsMetric {
@@ -59,12 +66,19 @@ class MarketScreenState extends State<MarketScreen> {
   String _selectedRange = '1M';
   String _holdingsTab = 'holdings'; // 'holdings' | 'gainers' | 'losers'
   HoldingsMetric _holdingsMetric = HoldingsMetric.sincePurchaseRelative;
+  int _holdingsDisplayCount = 50;
   CardPriceData? _selectedCard;
   bool _detailShowFoil = false; // Whether detail page focuses on foil variant
 
-  // Search
+  // Search + Discover filters
   final _searchController = TextEditingController();
   List<CardPriceData> _searchResults = [];
+  DiscoverFilter _discoverFilter = const DiscoverFilter();
+  List<CardPriceData> _filteredResults = [];
+  String? _activeQuickFilter;
+
+  // Missing cards filter (from Decks screen)
+  Map<String, int>? _missingCardIds;
 
   String? _demoCountry; // Country selection stored locally in demo mode
   final List<MarketListing> _demoListings = []; // Local demo listings
@@ -84,6 +98,22 @@ class MarketScreenState extends State<MarketScreen> {
     if (_scrollController.hasClients) {
       _scrollController.animateTo(0, duration: const Duration(milliseconds: 300), curve: Curves.easeOut);
     }
+  }
+
+  /// Show missing cards from a deck in the Discover view
+  void showMissingCards(Map<String, int> missing) {
+    setState(() {
+      _missingCardIds = missing;
+      _view = 'discover';
+      _searchController.clear();
+      // Build filtered results from missing card IDs
+      _searchResults = missing.keys
+          .map((id) => _market.getPrice(id))
+          .whereType<CardPriceData>()
+          .toList()
+        ..sort((a, b) => b.currentPrice.compareTo(a.currentPrice));
+    });
+    resetScroll();
   }
 
   @override
@@ -112,6 +142,7 @@ class MarketScreenState extends State<MarketScreen> {
 
   void _navigateToCard(CardPriceData card, {bool isFoil = false}) {
     setState(() {
+      _viewBeforeDetail = _view;
       _selectedCard = card;
       _selectedRange = '1M';
       _view = 'cardDetail';
@@ -122,24 +153,44 @@ class MarketScreenState extends State<MarketScreen> {
     resetScroll();
 
     // Lazy-load history from Firestore if not cached
-    if (card.priceHistory.isEmpty) {
+    final hasCmId = _market.hasCmId(card.cardId);
+    if (card.priceHistory.isEmpty && hasCmId) {
+      debugPrint('MarketScreen: Loading history for ${card.cardName} (${card.cardId})');
       _market.loadHistory(card.cardId).then((_) {
         if (mounted && _selectedCard?.cardId == card.cardId) {
+          final updated = _market.getPrice(card.cardId);
+          debugPrint('MarketScreen: History loaded for ${card.cardName} — '
+              'foil=${updated?.priceHistory.length ?? 0}, '
+              'nf=${updated?.nonFoilHistory.length ?? 0}');
           setState(() {
-            _selectedCard = _market.getPrice(card.cardId);
+            _selectedCard = updated ?? _selectedCard;
             _loadingHistory = false;
           });
         }
       });
+    } else if (!hasCmId) {
+      _loadingHistory = false;
     }
   }
 
+  String _viewBeforeDetail = 'portfolio';
+
   void _goBack() {
-    setState(() {
-      _selectedCard = null;
-      _view = 'portfolio';
-    });
-    widget.onFullscreenChanged?.call(false);
+    if (_view == 'cardDetail') {
+      // Return to wherever we came from (discover, portfolio, etc.)
+      setState(() {
+        _selectedCard = null;
+        _view = _viewBeforeDetail;
+      });
+      widget.onFullscreenChanged?.call(false);
+    } else {
+      // From any other view → back to portfolio
+      setState(() {
+        _selectedCard = null;
+        _view = 'portfolio';
+      });
+      widget.onFullscreenChanged?.call(false);
+    }
     resetScroll();
   }
 
@@ -147,7 +198,7 @@ class MarketScreenState extends State<MarketScreen> {
     width: w, height: h,
     decoration: BoxDecoration(
       color: AppColors.surfaceLight,
-      borderRadius: BorderRadius.circular(12),
+      borderRadius: AppRadius.baseBR,
     ),
     child: const Icon(Icons.style, size: 40, color: AppColors.textMuted),
   );
@@ -181,14 +232,14 @@ class MarketScreenState extends State<MarketScreen> {
           mainAxisSize: MainAxisSize.min,
           children: [
             CircularProgressIndicator(color: AppColors.amber400, strokeWidth: 2),
-            SizedBox(height: 12),
-            Text('Loading market data...', style: TextStyle(color: AppColors.textMuted, fontSize: 12)),
+            SizedBox(height: AppSpacing.md),
+            Text('Loading market data...', style: AppTextStyles.caption),
           ],
         ),
       );
     }
 
-    return switch (_view) {
+    final content = switch (_view) {
       'discover' => _buildDiscover(),
       'cardDetail' => _buildCardDetail(),
       'listings' => _buildMyListings(),
@@ -196,6 +247,29 @@ class MarketScreenState extends State<MarketScreen> {
       'cart' => _buildCart(),
       _ => _buildPortfolio(),
     };
+
+    // FAB only on portfolio view, always fixed to screen bottom
+    final showFab = !_isDemo &&
+        _view != 'discover' &&
+        _view != 'cardDetail' &&
+        _view != 'listings' &&
+        _view != 'orders' &&
+        _view != 'cart';
+
+    if (!showFab) return content;
+
+    final viewPadding = MediaQuery.of(context).viewPadding;
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        content,
+        Positioned(
+          right: AppSpacing.lg,
+          bottom: 60 + viewPadding.bottom,
+          child: _buildWalletFab(),
+        ),
+      ],
+    );
   }
 
   // ═══════════════════════════════════════════
@@ -223,7 +297,7 @@ class MarketScreenState extends State<MarketScreen> {
     // Build holdings list — separate entries for normal and foil
     final holdings = <_HoldingEntry>[];
     for (final cardId in allCardIds) {
-      final price = _market.getPrice(cardId);
+      final price = _market.getPrice(cardId) ?? _market.getFallbackPrice(cardId);
       if (price == null) continue;
 
       final normalQty = normalCards[cardId] ?? 0;
@@ -289,8 +363,13 @@ class MarketScreenState extends State<MarketScreen> {
       _ => holdings,
     };
 
-    // Chart data filtered by range (plots totalValue over time)
-    final chartData = _filterByRange(portfolio.valueHistory, _selectedRange);
+    // Chart line = performance if available, value as legacy fallback
+    final chartData = _filterByRange(
+      portfolio.performanceHistory.isNotEmpty
+          ? portfolio.performanceHistory
+          : portfolio.valueHistory,
+      _selectedRange,
+    );
 
     // Performance = gains/losses from price movements only (NOT from adding cards)
     // Uses performanceHistory snapshots for time range calculation:
@@ -310,12 +389,12 @@ class MarketScreenState extends State<MarketScreen> {
     }
 
     return SingleChildScrollView(
-      controller: _scrollController,
-      padding: const EdgeInsets.only(bottom: 100),
-      child: Column(
-        children: [
-          const GoldOrnamentHeader(title: 'MARKET VALUE'),
-          const SizedBox(height: 8),
+          controller: _scrollController,
+          padding: const EdgeInsets.only(bottom: 100),
+          child: Column(
+            children: [
+              const GoldOrnamentHeader(title: 'MARKET VALUE'),
+          const SizedBox(height: AppSpacing.sm),
 
           // Portfolio header: value + performance (color based on PERFORMANCE)
           PortfolioHeader(
@@ -324,32 +403,32 @@ class MarketScreenState extends State<MarketScreen> {
             changePercent: perfPct,
             isPositive: perfPositive,
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: AppSpacing.md),
 
           // Time range selector
           TimeRangeSelector(
             selected: _selectedRange,
             onChanged: (r) => setState(() => _selectedRange = r),
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: AppSpacing.sm),
 
           // Portfolio chart (line = totalValue, color = performance)
           PortfolioChart(
             data: chartData,
             isPositive: perfPositive,
           ),
-          const SizedBox(height: 16),
+          const SizedBox(height: AppSpacing.base),
 
           // View toggle: Portfolio / Discover
           _buildViewToggle(),
-          const SizedBox(height: 12),
+          const SizedBox(height: AppSpacing.md),
 
           // Holdings section header
           Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
+            padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
             child: SectionDivider(icon: Icons.wallet, label: 'YOUR HOLDINGS'),
           ),
-          const SizedBox(height: 4),
+          const SizedBox(height: AppSpacing.xs),
 
           // Sub-tabs
           _buildHoldingsTabs(),
@@ -357,7 +436,7 @@ class MarketScreenState extends State<MarketScreen> {
 
           // Metric selector (TR-style: right-aligned text link)
           Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
+            padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
             child: Align(
               alignment: Alignment.centerRight,
               child: _buildMetricDropdown(),
@@ -367,27 +446,31 @@ class MarketScreenState extends State<MarketScreen> {
 
           // Holdings list
           if (displayList.isEmpty)
-            Padding(
-              padding: const EdgeInsets.all(32),
-              child: Text(
-                _holdingsTab == 'holdings'
-                    ? 'Add cards to your collection to see their value here.'
-                    : 'No ${_holdingsTab} today.',
-                style: const TextStyle(color: AppColors.textMuted, fontSize: 12),
-                textAlign: TextAlign.center,
-              ),
+            RiftrEmptyState(
+              icon: _holdingsTab == 'holdings' ? Icons.wallet : (_holdingsTab == 'gainers' ? Icons.trending_up : Icons.trending_down),
+              title: _holdingsTab == 'holdings' ? 'No Holdings Yet' : 'No ${_holdingsTab[0].toUpperCase()}${_holdingsTab.substring(1)} Today',
+              subtitle: _holdingsTab == 'holdings'
+                  ? 'Add cards to your collection to track their value\nor browse the market'
+                  : 'Price movements will show up here',
+              buttonLabel: _holdingsTab == 'holdings' ? 'Browse Market' : null,
+              buttonIcon: _holdingsTab == 'holdings' ? Icons.search : null,
+              onButtonPressed: _holdingsTab == 'holdings' ? () {
+                setState(() { _view = 'discover'; });
+                widget.onFullscreenChanged?.call(true);
+              } : null,
             )
           else
-            ...displayList.map((h) {
+            ...displayList.take(_holdingsDisplayCount).map((h) {
               final changeText = _formatMetricValue(h);
               final isPositive = metricVal(h) >= 0;
               return Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 3),
+                padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: 3),
                 child: CardPriceTile(
                   data: h.data,
                   quantity: h.quantity,
                   onTap: () => _navigateToCard(h.data, isFoil: h.isFoil),
                   showFoilStar: h.isFoil,
+
                   priceOverride: h.isFoil ? h.unitPrice : null,
                   changeText: changeText,
                   changePositive: isPositive,
@@ -395,7 +478,29 @@ class MarketScreenState extends State<MarketScreen> {
               );
             }),
 
-          const SizedBox(height: 16),
+          // "Show more" button
+          if (displayList.length > _holdingsDisplayCount)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.sm),
+              child: Center(
+                child: GestureDetector(
+                  onTap: () => setState(() => _holdingsDisplayCount += 50),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(vertical: AppSpacing.sm, horizontal: AppSpacing.lg),
+                    decoration: BoxDecoration(
+                      color: AppColors.surfaceLight,
+                      borderRadius: AppRadius.pillBR,
+                    ),
+                    child: Text(
+                      'Show more (${displayList.length - _holdingsDisplayCount} remaining)',
+                      style: AppTextStyles.bodySmall.copyWith(color: AppColors.amber400),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+
+          const SizedBox(height: AppSpacing.base),
         ],
       ),
     );
@@ -415,58 +520,41 @@ class MarketScreenState extends State<MarketScreen> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           const GoldOrnamentHeader(title: 'CART'),
-          const SizedBox(height: 8),
+          const SizedBox(height: AppSpacing.sm),
           _buildViewToggle(),
-          const SizedBox(height: 16),
+          const SizedBox(height: AppSpacing.base),
 
           if (entries.isEmpty)
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
-              child: Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(32),
-                decoration: BoxDecoration(
-                  color: AppColors.surface,
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: AppColors.border),
-                ),
-                child: const Column(
-                  children: [
-                    Icon(Icons.shopping_cart_outlined, size: 32, color: AppColors.textMuted),
-                    SizedBox(height: 12),
-                    Text(
-                      'Cart is empty',
-                      style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w700),
-                    ),
-                    SizedBox(height: 4),
-                    Text(
-                      'Add cards from the listing page to your cart.',
-                      style: TextStyle(color: AppColors.textMuted, fontSize: 11),
-                      textAlign: TextAlign.center,
-                    ),
-                  ],
-                ),
-              ),
+            RiftrEmptyState(
+              icon: Icons.shopping_cart_outlined,
+              title: 'Cart is Empty',
+              subtitle: 'Add cards from the listing page to your cart',
+              buttonLabel: 'Browse Market',
+              buttonIcon: Icons.search,
+              onButtonPressed: () {
+                setState(() { _view = 'discover'; });
+                widget.onFullscreenChanged?.call(true);
+              },
             )
           else ...[
             // Seller info
             Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
+              padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
               child: Text(
                 'from ${entries.first.listing.sellerName}',
-                style: const TextStyle(color: AppColors.textMuted, fontSize: 11),
+                style: AppTextStyles.small,
               ),
             ),
-            const SizedBox(height: 8),
+            const SizedBox(height: AppSpacing.sm),
 
             // Cart items
             ...entries.map((entry) => Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 3),
+              padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: 3),
               child: Container(
-                padding: const EdgeInsets.all(12),
+                padding: const EdgeInsets.all(AppSpacing.md),
                 decoration: BoxDecoration(
                   color: AppColors.surface,
-                  borderRadius: BorderRadius.circular(12),
+                  borderRadius: AppRadius.baseBR,
                   border: Border.all(color: AppColors.border),
                 ),
                 child: Row(
@@ -477,24 +565,22 @@ class MarketScreenState extends State<MarketScreen> {
                         children: [
                           Text(
                             entry.listing.cardName,
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontSize: 12,
+                            style: AppTextStyles.caption.copyWith(
+                              color: AppColors.textPrimary,
                               fontWeight: FontWeight.w700,
                             ),
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
                           ),
-                          const SizedBox(height: 4),
+                          const SizedBox(height: AppSpacing.xs),
                           Row(
                             children: [
                               ConditionBadge(condition: entry.listing.condition),
-                              const SizedBox(width: 8),
+                              const SizedBox(width: AppSpacing.sm),
                               Text(
                                 '×${entry.quantity}',
-                                style: const TextStyle(
+                                style: AppTextStyles.tiny.copyWith(
                                   color: AppColors.textMuted,
-                                  fontSize: 10,
                                   fontWeight: FontWeight.w600,
                                 ),
                               ),
@@ -505,9 +591,8 @@ class MarketScreenState extends State<MarketScreen> {
                     ),
                     Text(
                       '€${(entry.listing.price * entry.quantity).toStringAsFixed(2)}',
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 13,
+                      style: AppTextStyles.bodySmall.copyWith(
+                        color: AppColors.textPrimary,
                         fontWeight: FontWeight.w900,
                       ),
                     ),
@@ -518,7 +603,7 @@ class MarketScreenState extends State<MarketScreen> {
                         padding: const EdgeInsets.all(6),
                         decoration: BoxDecoration(
                           color: AppColors.loss.withValues(alpha: 0.15),
-                          borderRadius: BorderRadius.circular(6),
+                          borderRadius: BorderRadius.circular(AppRadius.sm),
                         ),
                         child: const Icon(Icons.close, size: 12, color: AppColors.loss),
                       ),
@@ -527,16 +612,16 @@ class MarketScreenState extends State<MarketScreen> {
                 ),
               ),
             )),
-            const SizedBox(height: 16),
+            const SizedBox(height: AppSpacing.base),
 
             // Subtotal
             Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
+              padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
               child: Container(
-                padding: const EdgeInsets.all(12),
+                padding: const EdgeInsets.all(AppSpacing.md),
                 decoration: BoxDecoration(
                   color: AppColors.surface,
-                  borderRadius: BorderRadius.circular(12),
+                  borderRadius: AppRadius.baseBR,
                   border: Border.all(color: AppColors.border),
                 ),
                 child: Row(
@@ -544,13 +629,12 @@ class MarketScreenState extends State<MarketScreen> {
                   children: [
                     const Text(
                       'Subtotal',
-                      style: TextStyle(color: AppColors.textSecondary, fontSize: 12),
+                      style: AppTextStyles.caption,
                     ),
                     Text(
                       '€${subtotal.toStringAsFixed(2)} + shipping',
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 14,
+                      style: AppTextStyles.bodyBold.copyWith(
+                        color: AppColors.textPrimary,
                         fontWeight: FontWeight.w900,
                       ),
                     ),
@@ -558,45 +642,44 @@ class MarketScreenState extends State<MarketScreen> {
                 ),
               ),
             ),
-            const SizedBox(height: 16),
+            const SizedBox(height: AppSpacing.base),
 
             // Checkout + Clear buttons
             Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
+              padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
               child: Row(
                 children: [
                   GestureDetector(
                     onTap: () => setState(() => _cart.clear()),
                     child: Container(
-                      padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 20),
+                      padding: const EdgeInsets.symmetric(vertical: AppSpacing.base, horizontal: AppSpacing.lg),
                       decoration: BoxDecoration(
                         color: AppColors.loss.withValues(alpha: 0.1),
-                        borderRadius: BorderRadius.circular(12),
+                        borderRadius: AppRadius.baseBR,
                         border: Border.all(color: AppColors.loss.withValues(alpha: 0.2)),
                       ),
-                      child: const Text(
+                      child: Text(
                         'Clear',
-                        style: TextStyle(color: AppColors.loss, fontSize: 13, fontWeight: FontWeight.w700),
+                        style: AppTextStyles.bodySmall.copyWith(color: AppColors.loss, fontWeight: FontWeight.w700),
                       ),
                     ),
                   ),
-                  const SizedBox(width: 12),
+                  const SizedBox(width: AppSpacing.md),
                   Expanded(
                     child: GestureDetector(
                       onTap: _openCartCheckout,
                       child: Container(
-                        padding: const EdgeInsets.symmetric(vertical: 14),
+                        padding: const EdgeInsets.symmetric(vertical: AppSpacing.base),
                         decoration: BoxDecoration(
                           color: AppColors.win.withValues(alpha: 0.2),
-                          borderRadius: BorderRadius.circular(12),
+                          borderRadius: AppRadius.baseBR,
                           border: Border.all(color: AppColors.win.withValues(alpha: 0.4)),
                         ),
                         child: Text(
                           'Checkout €${subtotal.toStringAsFixed(2)}',
                           textAlign: TextAlign.center,
-                          style: const TextStyle(
+                          style: AppTextStyles.bodyBold.copyWith(
                             color: AppColors.win,
-                            fontSize: 14,
                             fontWeight: FontWeight.w800,
                           ),
                         ),
@@ -606,16 +689,106 @@ class MarketScreenState extends State<MarketScreen> {
                 ],
               ),
             ),
-            const SizedBox(height: 24),
+            const SizedBox(height: AppSpacing.lg),
           ],
         ],
       ),
     ));
   }
 
+  Widget _buildWalletFab() {
+    return ListenableBuilder(
+      listenable: WalletService.instance,
+      builder: (context, _) {
+        final bal = WalletService.instance.balance;
+        final label = '€${bal.availableEur.toStringAsFixed(2)}';
+
+        return TweenAnimationBuilder<double>(
+          key: const ValueKey('wallet-fab-anim'),
+          tween: Tween(begin: 0.0, end: 1.0),
+          duration: const Duration(milliseconds: 350),
+          curve: Curves.easeOut,
+          builder: (context, value, child) {
+            return Opacity(
+              opacity: value,
+              child: Transform.scale(
+                scale: 0.3 + value * 0.7,
+                child: child,
+              ),
+            );
+          },
+          child: GestureDetector(
+            onTap: () => Navigator.push(
+              context,
+              PageRouteBuilder(
+                opaque: false,
+                barrierColor: Colors.black54,
+                pageBuilder: (_, __, ___) => Material(
+                  color: AppColors.background,
+                  child: DragToDismiss(
+                    onDismissed: () => Navigator.pop(context),
+                    backgroundColor: AppColors.background,
+                    child: SafeArea(
+                      child: Column(children: [
+                        Container(
+                          height: 36,
+                          color: AppColors.background,
+                          child: Center(child: Container(
+                            margin: const EdgeInsets.only(top: 10),
+                            width: 40, height: 5,
+                            decoration: BoxDecoration(
+                              color: AppColors.textSecondary,
+                              borderRadius: BorderRadius.circular(3),
+                            ),
+                          )),
+                        ),
+                        const Expanded(child: WalletScreen()),
+                      ]),
+                    ),
+                  ),
+                ),
+                transitionsBuilder: (_, anim, __, child) =>
+                    SlideTransition(position: Tween(begin: const Offset(0, 1), end: Offset.zero).animate(anim), child: child),
+              ),
+            ),
+            child: Container(
+              height: 56,
+              padding: const EdgeInsets.symmetric(horizontal: AppSpacing.base),
+              decoration: BoxDecoration(
+                color: AppColors.amber400,
+                borderRadius: AppRadius.pillBR,
+                boxShadow: [
+                  BoxShadow(
+                    color: AppColors.amber400.withValues(alpha: 0.5),
+                    blurRadius: 16,
+                    spreadRadius: 2,
+                  ),
+                ],
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.account_balance_wallet_outlined, color: AppColors.textPrimary, size: 22),
+                  const SizedBox(width: AppSpacing.sm),
+                  Text(
+                    label,
+                    style: AppTextStyles.bodyBold.copyWith(
+                      color: AppColors.textPrimary,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
   Widget _buildViewToggle() {
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 16),
+      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
       child: Row(
         children: [
           _toggleButton('Listings', _view == 'listings', () {
@@ -623,20 +796,20 @@ class MarketScreenState extends State<MarketScreen> {
             widget.onFullscreenChanged?.call(true);
             resetScroll();
           }),
-          const SizedBox(width: 8),
+          const SizedBox(width: AppSpacing.sm),
           _toggleButton('Orders', _view == 'orders', () {
             setState(() { _view = 'orders'; });
             widget.onFullscreenChanged?.call(true);
             resetScroll();
           }),
-          const SizedBox(width: 8),
+          const SizedBox(width: AppSpacing.sm),
           _toggleButton('Discover', _view == 'discover', () {
             setState(() { _view = 'discover'; });
             widget.onFullscreenChanged?.call(true);
             resetScroll();
           }),
           if (_cart.isNotEmpty) ...[
-            const SizedBox(width: 8),
+            const SizedBox(width: AppSpacing.sm),
             GestureDetector(
               onTap: () {
                 setState(() { _view = 'cart'; });
@@ -644,10 +817,10 @@ class MarketScreenState extends State<MarketScreen> {
                 resetScroll();
               },
               child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.sm),
                 decoration: BoxDecoration(
                   color: _view == 'cart' ? AppColors.amber600 : AppColors.amber500.withValues(alpha: 0.15),
-                  borderRadius: BorderRadius.circular(10),
+                  borderRadius: BorderRadius.circular(AppRadius.iconButton),
                   border: Border.all(
                     color: _view == 'cart' ? AppColors.amber600 : AppColors.amber500.withValues(alpha: 0.4),
                   ),
@@ -658,14 +831,13 @@ class MarketScreenState extends State<MarketScreen> {
                     Icon(
                       Icons.shopping_cart,
                       size: 12,
-                      color: _view == 'cart' ? Colors.white : AppColors.amber500,
+                      color: _view == 'cart' ? AppColors.textPrimary : AppColors.amber500,
                     ),
-                    const SizedBox(width: 4),
+                    const SizedBox(width: AppSpacing.xs),
                     Text(
                       '$_cartCount',
-                      style: TextStyle(
-                        color: _view == 'cart' ? Colors.white : AppColors.amber500,
-                        fontSize: 12,
+                      style: AppTextStyles.caption.copyWith(
+                        color: _view == 'cart' ? AppColors.textPrimary : AppColors.amber500,
                         fontWeight: FontWeight.w800,
                       ),
                     ),
@@ -681,32 +853,17 @@ class MarketScreenState extends State<MarketScreen> {
 
   Widget _toggleButton(String label, bool active, VoidCallback onTap) {
     return Expanded(
-      child: GestureDetector(
+      child: RiftrPill(
+        label: label,
+        isActive: active,
         onTap: onTap,
-        child: Container(
-          padding: const EdgeInsets.symmetric(vertical: 8),
-          decoration: BoxDecoration(
-            color: active ? AppColors.amber600 : AppColors.surface,
-            borderRadius: BorderRadius.circular(10),
-            border: Border.all(color: active ? AppColors.amber600 : AppColors.border),
-          ),
-          child: Text(
-            label,
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              color: active ? Colors.white : AppColors.textMuted,
-              fontSize: 12,
-              fontWeight: FontWeight.w700,
-            ),
-          ),
-        ),
       ),
     );
   }
 
   Widget _buildHoldingsTabs() {
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 16),
+      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
       child: Row(
         children: [
           _holdingsTabPill('Holdings', 'holdings'),
@@ -720,25 +877,20 @@ class MarketScreenState extends State<MarketScreen> {
   }
 
   Widget _holdingsTabPill(String label, String value) {
-    final active = _holdingsTab == value;
-    return GestureDetector(
-      onTap: () => setState(() => _holdingsTab = value),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
-        decoration: BoxDecoration(
-          color: active ? AppColors.amber600 : AppColors.surface,
-          borderRadius: BorderRadius.circular(20),
-          border: Border.all(color: active ? AppColors.amber600 : AppColors.border),
-        ),
-        child: Text(
-          label,
-          style: TextStyle(
-            color: active ? Colors.white : AppColors.textMuted,
-            fontSize: 11,
-            fontWeight: FontWeight.w700,
-          ),
-        ),
-      ),
+    return RiftrPill(
+      label: label,
+      isActive: _holdingsTab == value,
+      onTap: () {
+        HapticFeedback.lightImpact();
+        if (_holdingsTab == value) return;
+        setState(() { _holdingsTab = value; _holdingsDisplayCount = 50; });
+        // Scroll to top so content doesn't jump when list is shorter
+        if (_scrollController.hasClients && _scrollController.offset > 0) {
+          _scrollController.animateTo(0,
+              duration: const Duration(milliseconds: 250),
+              curve: Curves.easeOut);
+        }
+      },
     );
   }
 
@@ -781,9 +933,8 @@ class MarketScreenState extends State<MarketScreen> {
         children: [
           Text(
             _metricLabel(_holdingsMetric),
-            style: const TextStyle(
+            style: AppTextStyles.bodySmall.copyWith(
               color: AppColors.textMuted,
-              fontSize: 13,
               fontWeight: FontWeight.w500,
             ),
           ),
@@ -795,40 +946,20 @@ class MarketScreenState extends State<MarketScreen> {
   }
 
   void _showMetricSheet() {
-    showModalBottomSheet(
+    showRiftrSheet(
       context: context,
-      backgroundColor: AppColors.surface,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-      ),
       builder: (_) => SafeArea(
         child: Padding(
-          padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+          padding: const EdgeInsets.fromLTRB(AppSpacing.base, 0, AppSpacing.base, AppSpacing.base),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              // Drag handle
-              Center(
-                child: Container(
-                  width: 36,
-                  height: 4,
-                  decoration: BoxDecoration(
-                    color: AppColors.textMuted.withValues(alpha: 0.3),
-                    borderRadius: BorderRadius.circular(2),
-                  ),
-                ),
-              ),
-              const SizedBox(height: 16),
-              const Text(
+              Text(
                 'Metric',
-                style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 20,
-                  fontWeight: FontWeight.w800,
-                ),
+                style: AppTextStyles.h2.copyWith(fontWeight: FontWeight.w800),
               ),
-              const SizedBox(height: 12),
+              const SizedBox(height: AppSpacing.md),
               ...HoldingsMetric.values.map((m) => _metricSheetRow(m)),
             ],
           ),
@@ -846,21 +977,19 @@ class MarketScreenState extends State<MarketScreen> {
       },
       child: Container(
         width: double.infinity,
-        padding: const EdgeInsets.symmetric(vertical: 14),
+        padding: const EdgeInsets.symmetric(vertical: AppSpacing.base),
         child: Row(
           children: [
             Expanded(
               child: Text(
                 _metricSheetLabel(m),
-                style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 15,
+                style: AppTextStyles.bodyLarge.copyWith(
                   fontWeight: isSelected ? FontWeight.w700 : FontWeight.w400,
                 ),
               ),
             ),
             if (isSelected)
-              const Icon(Icons.check, color: Colors.white, size: 20),
+              const Icon(Icons.check, color: AppColors.textPrimary, size: 20),
           ],
         ),
       ),
@@ -880,9 +1009,9 @@ class MarketScreenState extends State<MarketScreen> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           const GoldOrnamentHeader(title: 'MY LISTINGS'),
-          const SizedBox(height: 8),
+          const SizedBox(height: AppSpacing.sm),
           _buildViewToggle(),
-          const SizedBox(height: 16),
+          const SizedBox(height: AppSpacing.base),
 
           // Strike / Suspension banner
           if (!_isDemo) ...[
@@ -891,23 +1020,23 @@ class MarketScreenState extends State<MarketScreen> {
               if (profile == null) return const SizedBox.shrink();
               if (profile.suspended) {
                 return Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                  padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.xs),
                   child: Container(
                     width: double.infinity,
                     padding: const EdgeInsets.all(10),
                     decoration: BoxDecoration(
                       color: AppColors.loss.withValues(alpha: 0.15),
-                      borderRadius: BorderRadius.circular(8),
+                      borderRadius: BorderRadius.circular(AppRadius.md),
                       border: Border.all(color: AppColors.loss.withValues(alpha: 0.3)),
                     ),
-                    child: const Row(
+                    child: Row(
                       children: [
                         Icon(Icons.block, size: 14, color: AppColors.loss),
-                        SizedBox(width: 8),
+                        SizedBox(width: AppSpacing.sm),
                         Expanded(
                           child: Text(
                             'Your seller account is suspended. You cannot create new listings.',
-                            style: TextStyle(color: AppColors.loss, fontSize: 11, fontWeight: FontWeight.w600),
+                            style: AppTextStyles.small.copyWith(color: AppColors.loss, fontWeight: FontWeight.w600),
                           ),
                         ),
                       ],
@@ -917,22 +1046,22 @@ class MarketScreenState extends State<MarketScreen> {
               }
               if (profile.strikes > 0) {
                 return Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                  padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.xs),
                   child: Container(
                     width: double.infinity,
                     padding: const EdgeInsets.all(10),
                     decoration: BoxDecoration(
                       color: AppColors.amber500.withValues(alpha: 0.15),
-                      borderRadius: BorderRadius.circular(8),
+                      borderRadius: BorderRadius.circular(AppRadius.md),
                       border: Border.all(color: AppColors.amber500.withValues(alpha: 0.3)),
                     ),
                     child: Row(
                       children: [
                         const Icon(Icons.warning_amber_rounded, size: 14, color: AppColors.amber500),
-                        const SizedBox(width: 8),
+                        const SizedBox(width: AppSpacing.sm),
                         Text(
                           'Strikes: ${profile.strikes}/3 — Ship orders on time to avoid suspension.',
-                          style: const TextStyle(color: AppColors.amber500, fontSize: 11, fontWeight: FontWeight.w600),
+                          style: AppTextStyles.small.copyWith(color: AppColors.amber500, fontWeight: FontWeight.w600),
                         ),
                       ],
                     ),
@@ -944,57 +1073,39 @@ class MarketScreenState extends State<MarketScreen> {
           ],
 
           Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
+            padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
             child: SectionDivider(
               icon: Icons.sell_outlined,
               label: 'MY LISTINGS (${myListings.length})',
             ),
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: AppSpacing.sm),
 
           if (myListings.isEmpty)
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
-              child: Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(32),
-                decoration: BoxDecoration(
-                  color: AppColors.surface,
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: AppColors.border),
-                ),
-                child: const Column(
-                  children: [
-                    Icon(Icons.sell_outlined, size: 32, color: AppColors.textMuted),
-                    SizedBox(height: 12),
-                    Text(
-                      'No active listings',
-                      style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w700),
-                    ),
-                    SizedBox(height: 4),
-                    Text(
-                      'Go to a card and tap "Sell" to create your first listing.',
-                      style: TextStyle(color: AppColors.textMuted, fontSize: 11),
-                      textAlign: TextAlign.center,
-                    ),
-                  ],
-                ),
-              ),
+            RiftrEmptyState(
+              icon: Icons.sell_outlined,
+              title: 'No Active Listings',
+              subtitle: 'Select a card from your holdings to list it for sale',
+              buttonLabel: 'Go to Holdings',
+              buttonIcon: Icons.wallet,
+              onButtonPressed: () {
+                setState(() { _view = 'portfolio'; _holdingsTab = 'holdings'; });
+              },
             )
           else
             ...myListings.map((l) => Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 3),
+                  padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: 3),
                   child: _myListingTile(l),
                 )),
 
-          const SizedBox(height: 32),
+          const SizedBox(height: AppSpacing.xl),
         ],
       ),
     ));
   }
 
   // ═══════════════════════════════════════════
-  // ─── BIDS VIEW ───
+  // ─── ORDERS VIEW ───
   // ═══════════════════════════════════════════
 
   Widget _buildOrders() {
@@ -1009,68 +1120,50 @@ class MarketScreenState extends State<MarketScreen> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           const GoldOrnamentHeader(title: 'ORDERS'),
-          const SizedBox(height: 8),
+          const SizedBox(height: AppSpacing.sm),
           _buildViewToggle(),
-          const SizedBox(height: 12),
+          const SizedBox(height: AppSpacing.md),
 
           // Purchases / Sales sub-tabs
           Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
+            padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
             child: Row(
               children: [
                 _orderSubTabButton('Purchases', 'purchases'),
-                const SizedBox(width: 8),
+                const SizedBox(width: AppSpacing.sm),
                 _orderSubTabButton('Sales', 'sales'),
               ],
             ),
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: AppSpacing.md),
 
           if (orders.isEmpty)
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
-              child: Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(32),
-                decoration: BoxDecoration(
-                  color: AppColors.surface,
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: AppColors.border),
-                ),
-                child: Column(
-                  children: [
-                    Icon(
-                      _orderSubTab == 'purchases'
-                          ? Icons.shopping_bag_outlined
-                          : Icons.sell_outlined,
-                      size: 32,
-                      color: AppColors.textMuted,
-                    ),
-                    const SizedBox(height: 12),
-                    Text(
-                      _orderSubTab == 'purchases'
-                          ? 'No purchases yet'
-                          : 'No sales yet',
-                      style: const TextStyle(
-                        color: AppColors.textMuted,
-                        fontSize: 12,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
+            RiftrEmptyState(
+              icon: _orderSubTab == 'purchases' ? Icons.shopping_bag_outlined : Icons.sell_outlined,
+              title: _orderSubTab == 'purchases' ? 'No Purchases Yet' : 'No Sales Yet',
+              subtitle: _orderSubTab == 'purchases'
+                  ? 'Your purchased cards will appear here'
+                  : 'Start selling cards to see your sales history',
+              buttonLabel: 'Browse Market',
+              buttonIcon: Icons.search,
+              onButtonPressed: () {
+                setState(() { _view = 'discover'; });
+                widget.onFullscreenChanged?.call(true);
+              },
             )
           else
             ...orders.map((order) => Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 3),
+                  padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: 3),
                   child: OrderTile(
                     order: order,
                     role: role,
                     onMarkShipped: (id, tracking) async {
                       final ok = await OrderService.instance.markShipped(id, tracking);
                       if (mounted) {
+                        final qty = order.totalQuantity;
+                        final label = qty == 1 ? 'Card' : 'Cards';
                         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                          content: Text(ok ? 'Marked as shipped' : 'Failed to mark shipped'),
+                          content: Text(ok ? 'Shipped! $label removed from your collection.' : 'Failed to mark shipped'),
                           backgroundColor: ok ? AppColors.win : AppColors.loss,
                         ));
                       }
@@ -1078,8 +1171,10 @@ class MarketScreenState extends State<MarketScreen> {
                     onConfirmDelivery: (id) async {
                       final ok = await OrderService.instance.confirmDelivery(id);
                       if (mounted) {
+                        final qty = order.totalQuantity;
+                        final label = qty == 1 ? 'Card' : 'Cards';
                         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                          content: Text(ok ? 'Delivery confirmed!' : 'Failed to confirm'),
+                          content: Text(ok ? '$label added to your collection!' : 'Failed to confirm'),
                           backgroundColor: ok ? AppColors.win : AppColors.loss,
                         ));
                       }
@@ -1093,14 +1188,31 @@ class MarketScreenState extends State<MarketScreen> {
                         ));
                       }
                     },
-                    onOpenDispute: (id, reason) async {
-                      final ok = await OrderService.instance.openDispute(id, reason);
+                    onOpenDispute: (id, reason, description) async {
+                      final ok = await OrderService.instance.openDispute(id, reason, description: description);
                       if (mounted) {
                         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
                           content: Text(ok ? 'Dispute opened' : 'Failed to open dispute'),
                           backgroundColor: ok ? AppColors.amber500 : AppColors.loss,
                         ));
                       }
+                    },
+                    onSubmitReview: (id, rating, comment, tags) async {
+                      final ok = await OrderService.instance.submitReview(id, rating, comment, tags: tags);
+                      if (mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                          content: Text(ok ? 'Review submitted!' : 'Failed to submit review'),
+                          backgroundColor: ok ? AppColors.win : AppColors.loss,
+                        ));
+                      }
+                    },
+                    onViewDispute: () {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) => DisputeDetailScreen(order: order),
+                        ),
+                      );
                     },
                   ),
                 )),
@@ -1111,24 +1223,22 @@ class MarketScreenState extends State<MarketScreen> {
 
   Widget _orderSubTabButton(String label, String value) {
     final active = _orderSubTab == value;
+    final color = value == 'purchases' ? AppColors.win : AppColors.amber500;
     return Expanded(
       child: GestureDetector(
         onTap: () => setState(() => _orderSubTab = value),
         child: Container(
-          padding: const EdgeInsets.symmetric(vertical: 7),
+          padding: const EdgeInsets.symmetric(vertical: AppSpacing.sm),
           decoration: BoxDecoration(
-            color: active ? AppColors.win.withValues(alpha: 0.15) : AppColors.surface,
-            borderRadius: BorderRadius.circular(8),
-            border: Border.all(
-              color: active ? AppColors.win.withValues(alpha: 0.3) : AppColors.border,
-            ),
+            color: active ? color : AppColors.surface,
+            borderRadius: BorderRadius.circular(AppRadius.md),
+            border: active ? null : Border.all(color: AppColors.border),
           ),
           child: Text(
             label,
             textAlign: TextAlign.center,
-            style: TextStyle(
-              color: active ? AppColors.win : AppColors.textMuted,
-              fontSize: 11,
+            style: AppTextStyles.small.copyWith(
+              color: active ? AppColors.background : AppColors.textMuted,
               fontWeight: FontWeight.w700,
             ),
           ),
@@ -1138,102 +1248,407 @@ class MarketScreenState extends State<MarketScreen> {
   }
 
   // ═══════════════════════════════════════════
+  // ─── DISCOVER FILTER LOGIC ───
+  // ═══════════════════════════════════════════
+
+  static const _rarityOrder = {'Common': 0, 'Uncommon': 1, 'Rare': 2, 'Epic': 3, 'Showcase': 4, 'Metal': 5};
+
+  void _refreshFilteredResults() {
+    final query = _searchController.text;
+    if (query.isEmpty && _discoverFilter.isEmpty) {
+      setState(() => _filteredResults = []);
+      return;
+    }
+    setState(() => _filteredResults = _applyDiscoverFilter(_discoverFilter, query));
+  }
+
+  List<CardPriceData> _applyDiscoverFilter(DiscoverFilter filter, String query) {
+    // Include all cards: priced + unpriced (e.g. UNL pre-release)
+    var results = _market.allCardsWithFallback;
+
+    // Text search
+    if (query.isNotEmpty) {
+      final lower = query.toLowerCase();
+      results = results.where((p) => p.cardName.toLowerCase().contains(lower)).toList();
+    }
+
+    // Rarity
+    if (filter.rarities.isNotEmpty) {
+      results = results.where((p) => filter.rarities.contains(p.rarity)).toList();
+    }
+
+    // Price range
+    if (filter.priceMin != null) {
+      results = results.where((p) => p.currentPrice >= filter.priceMin!).toList();
+    }
+    if (filter.priceMax != null) {
+      results = results.where((p) => p.currentPrice <= filter.priceMax!).toList();
+    }
+
+    // Set
+    if (filter.setIds.isNotEmpty) {
+      results = results.where((p) => filter.setIds.contains(p.setId?.toUpperCase())).toList();
+    }
+
+    // Domain (cross-reference with RiftCard)
+    if (filter.domains.isNotEmpty) {
+      final lookup = CardService.getLookup();
+      results = results.where((p) {
+        final card = lookup[p.cardId];
+        if (card == null) return false;
+        return card.domains.any((d) => filter.domains.contains(d));
+      }).toList();
+    }
+
+    // Card type
+    if (filter.cardType != null) {
+      results = results.where((p) => p.cardType == filter.cardType).toList();
+    }
+
+    // Listing-level filters (condition, language, country)
+    if (filter.conditions.isNotEmpty || filter.languages.isNotEmpty || filter.sellerCountry != null) {
+      final listings = ListingService.instance.allActive;
+      final listingsByCard = <String, List<MarketListing>>{};
+      for (final l in listings) {
+        (listingsByCard[l.cardId] ??= []).add(l);
+      }
+      results = results.where((p) {
+        final cardListings = listingsByCard[p.cardId];
+        if (cardListings == null || cardListings.isEmpty) return false;
+        return cardListings.any((l) {
+          if (filter.conditions.isNotEmpty && !filter.conditions.contains(l.condition)) return false;
+          if (filter.languages.isNotEmpty && !filter.languages.contains(l.language)) return false;
+          if (filter.sellerCountry != null && l.sellerCountry != filter.sellerCountry) return false;
+          return true;
+        });
+      }).toList();
+    }
+
+    // Sort
+    switch (filter.sort) {
+      case DiscoverSort.priceAsc:
+        results.sort((a, b) => a.currentPrice.compareTo(b.currentPrice));
+      case DiscoverSort.priceDesc:
+        results.sort((a, b) => b.currentPrice.compareTo(a.currentPrice));
+      case DiscoverSort.rarityAsc:
+        results.sort((a, b) =>
+            (_rarityOrder[a.rarity] ?? 0).compareTo(_rarityOrder[b.rarity] ?? 0));
+      case DiscoverSort.newest:
+        final listings = ListingService.instance.allActive;
+        final latestByCard = <String, DateTime>{};
+        for (final l in listings) {
+          final existing = latestByCard[l.cardId];
+          if (existing == null || l.listedAt.isAfter(existing)) {
+            latestByCard[l.cardId] = l.listedAt;
+          }
+        }
+        results.sort((a, b) {
+          final aDate = latestByCard[a.cardId] ?? DateTime(2020);
+          final bDate = latestByCard[b.cardId] ?? DateTime(2020);
+          return bDate.compareTo(aDate);
+        });
+    }
+
+    return results;
+  }
+
+  Future<void> _openFilterSheet() async {
+    final result = await Navigator.push<DiscoverFilter>(
+      context,
+      PageRouteBuilder(
+        opaque: false,
+        barrierColor: Colors.black54,
+        pageBuilder: (_, __, ___) => FilterFullScreen(initial: _discoverFilter),
+        transitionsBuilder: (_, anim, __, child) =>
+            SlideTransition(
+              position: Tween(begin: const Offset(0, 1), end: Offset.zero)
+                  .animate(CurvedAnimation(parent: anim, curve: Curves.easeOut)),
+              child: child,
+            ),
+      ),
+    );
+
+    if (result != null && mounted) {
+      setState(() {
+        _discoverFilter = result;
+        _activeQuickFilter = null;
+      });
+      _refreshFilteredResults();
+    }
+  }
+
+  // ═══════════════════════════════════════════
   // ─── DISCOVER VIEW ───
   // ═══════════════════════════════════════════
 
   Widget _buildDiscover() {
+    final hasActiveFilter = !_discoverFilter.isEmpty || _searchController.text.isNotEmpty;
+
     return _wrapWithDismiss(SingleChildScrollView(
       controller: _scrollController,
       padding: const EdgeInsets.only(bottom: 100, top: 36),
       child: Column(
         children: [
           const GoldOrnamentHeader(title: 'DISCOVER'),
-          const SizedBox(height: 8),
+          const SizedBox(height: AppSpacing.sm),
 
           // View toggle
           _buildViewToggle(),
-          const SizedBox(height: 12),
+          const SizedBox(height: AppSpacing.md),
 
-          // Search bar
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            child: MarketSearchBar(
-              controller: _searchController,
-              onChanged: (q) {
-                setState(() {
-                  _searchResults = _market.search(q);
-                });
-              },
-            ),
-          ),
-          const SizedBox(height: 12),
-
-          // Search results or browse
-          if (_searchController.text.isNotEmpty) ...[
+          // Missing cards banner
+          if (_missingCardIds != null) ...[
             Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              child: Align(
-                alignment: Alignment.centerLeft,
-                child: Text(
-                  '${_searchResults.length} results',
-                  style: const TextStyle(color: AppColors.textMuted, fontSize: 11),
+              padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.sm),
+                decoration: BoxDecoration(
+                  color: AppColors.amber400.withValues(alpha: 0.12),
+                  borderRadius: BorderRadius.circular(AppRadius.iconButton),
+                  border: Border.all(color: AppColors.amber400.withValues(alpha: 0.3)),
                 ),
+                child: Row(children: [
+                  const Icon(Icons.style, size: 16, color: AppColors.amber400),
+                  const SizedBox(width: AppSpacing.sm),
+                  Text('${_missingCardIds!.values.fold(0, (s, q) => s + q)} missing cards',
+                    style: AppTextStyles.caption.copyWith(color: AppColors.amber400, fontWeight: FontWeight.w700)),
+                  const Spacer(),
+                  GestureDetector(
+                    onTap: () => setState(() { _missingCardIds = null; _searchResults = []; }),
+                    child: const Icon(Icons.close, size: 16, color: AppColors.textMuted)),
+                ]),
               ),
             ),
-            const SizedBox(height: 8),
-            ..._searchResults.take(50).map((card) => Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 3),
-                  child: CardPriceTile(
-                    data: card,
-                    onTap: () => _navigateToCard(card),
-                  ),
-                )),
-          ] else ...[
-            // Trending
+            const SizedBox(height: AppSpacing.md),
+          ],
+
+          // Search bar + filter button
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
+            child: Row(children: [
+              Expanded(child: MarketSearchBar(
+                controller: _searchController,
+                onChanged: (q) {
+                  setState(() => _missingCardIds = null);
+                  _refreshFilteredResults();
+                },
+              )),
+              const SizedBox(width: AppSpacing.sm),
+              _buildFilterButton(),
+            ]),
+          ),
+          const SizedBox(height: AppSpacing.sm),
+
+          // Quick-filter pills
+          _buildQuickFilterPills(),
+          const SizedBox(height: AppSpacing.sm),
+
+          // Active filter pills
+          if (!_discoverFilter.isEmpty)
+            _buildActiveFilterPills(),
+
+          // Missing cards results
+          if (_missingCardIds != null) ...[
             Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
+              padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
+              child: Align(alignment: Alignment.centerLeft,
+                child: Text('${_searchResults.length} cards', style: AppTextStyles.small)),
+            ),
+            const SizedBox(height: AppSpacing.sm),
+            ..._searchResults.map((card) {
+              final needQty = _missingCardIds![card.cardId];
+              return Padding(
+                padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: 3),
+                child: CardPriceTile(data: card, quantity: needQty, onTap: () => _navigateToCard(card)),
+              );
+            }),
+          ]
+          // Filtered / search results
+          else if (hasActiveFilter) ...[
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
+              child: Align(alignment: Alignment.centerLeft,
+                child: Text('${_filteredResults.length} results', style: AppTextStyles.small)),
+            ),
+            const SizedBox(height: AppSpacing.sm),
+            ..._filteredResults.take(100).map((card) => Padding(
+              padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: 3),
+              child: CardPriceTile(data: card, onTap: () => _navigateToCard(card)),
+            )),
+            if (_filteredResults.isEmpty)
+              const Padding(
+                padding: EdgeInsets.only(top: AppSpacing.xl),
+                child: RiftrEmptyState(
+                  icon: Icons.search_off,
+                  title: 'No results',
+                  subtitle: 'Try adjusting your filters',
+                ),
+              ),
+          ]
+          // Browse mode: Trending + Gainers + Losers
+          else ...[
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
               child: SectionDivider(icon: Icons.local_fire_department, label: 'TRENDING'),
             ),
-            const SizedBox(height: 4),
-            GainersLosersList(
-              cards: _market.trending,
-              isGainers: true,
-              onCardTap: _navigateToCard,
-            ),
-            const SizedBox(height: 16),
+            const SizedBox(height: AppSpacing.xs),
+            GainersLosersList(cards: _market.trending, isGainers: true, onCardTap: _navigateToCard),
+            const SizedBox(height: AppSpacing.base),
 
-            // Top Gainers
             Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
+              padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
               child: SectionDivider(icon: Icons.trending_up, label: 'TOP GAINERS'),
             ),
-            const SizedBox(height: 4),
+            const SizedBox(height: AppSpacing.xs),
             ..._market.topGainers.map((card) => Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 3),
-                  child: CardPriceTile(
-                    data: card,
-                    onTap: () => _navigateToCard(card),
-                  ),
-                )),
-            const SizedBox(height: 16),
+              padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: 3),
+              child: CardPriceTile(data: card, onTap: () => _navigateToCard(card)),
+            )),
+            const SizedBox(height: AppSpacing.base),
 
-            // Top Losers
             Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
+              padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
               child: SectionDivider(icon: Icons.trending_down, label: 'TOP LOSERS'),
             ),
-            const SizedBox(height: 4),
+            const SizedBox(height: AppSpacing.xs),
             ..._market.topLosers.map((card) => Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 3),
-                  child: CardPriceTile(
-                    data: card,
-                    onTap: () => _navigateToCard(card),
-                  ),
-                )),
+              padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: 3),
+              child: CardPriceTile(data: card, onTap: () => _navigateToCard(card)),
+            )),
           ],
         ],
       ),
     ));
+  }
+
+  Widget _buildFilterButton() {
+    final count = _discoverFilter.activeCount;
+    return GestureDetector(
+      onTap: _openFilterSheet,
+      child: Container(
+        width: 48, height: 48,
+        decoration: BoxDecoration(
+          color: count > 0 ? AppColors.amber500 : AppColors.surfaceLight,
+          borderRadius: AppRadius.baseBR,
+        ),
+        child: Stack(children: [
+          Center(child: Icon(Icons.tune, size: 20,
+              color: count > 0 ? AppColors.background : AppColors.textSecondary)),
+          if (count > 0)
+            Positioned(top: 4, right: 4,
+              child: Container(
+                width: 18, height: 18,
+                decoration: const BoxDecoration(color: AppColors.loss, shape: BoxShape.circle),
+                child: Center(child: Text('$count',
+                    style: AppTextStyles.small.copyWith(color: Colors.white, fontSize: 10, fontWeight: FontWeight.w700))),
+              ),
+            ),
+        ]),
+      ),
+    );
+  }
+
+  Widget _buildQuickFilterPills() {
+    Widget pill(String label, String key, IconData icon) {
+      final isActive = _activeQuickFilter == key;
+      return GestureDetector(
+        onTap: () {
+          HapticFeedback.lightImpact();
+          setState(() {
+            if (isActive) {
+              _activeQuickFilter = null;
+              _discoverFilter = const DiscoverFilter();
+            } else {
+              _activeQuickFilter = key;
+              _discoverFilter = switch (key) {
+                'rareDeals' => DiscoverFilter.rareDeals(),
+                'legends' => DiscoverFilter.legends(),
+                'underOne' => DiscoverFilter.underOneEuro(),
+                _ => const DiscoverFilter(),
+              };
+            }
+          });
+          _refreshFilteredResults();
+        },
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.xs + 2),
+          decoration: BoxDecoration(
+            color: isActive ? AppColors.amber500 : AppColors.surfaceLight,
+            borderRadius: AppRadius.pillBR,
+          ),
+          child: Row(mainAxisSize: MainAxisSize.min, children: [
+            Icon(icon, size: 14, color: isActive ? AppColors.background : AppColors.textSecondary),
+            const SizedBox(width: AppSpacing.xs),
+            Text(label, style: AppTextStyles.small.copyWith(
+              color: isActive ? AppColors.background : AppColors.textSecondary,
+              fontWeight: FontWeight.w600,
+            )),
+          ]),
+        ),
+      );
+    }
+
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
+      child: Row(children: [
+        pill('Rare Deals', 'rareDeals', Icons.diamond_outlined),
+        const SizedBox(width: AppSpacing.sm),
+        pill('Legends', 'legends', Icons.shield_outlined),
+        const SizedBox(width: AppSpacing.sm),
+        pill('Under €1', 'underOne', Icons.euro_outlined),
+      ]),
+    );
+  }
+
+  Widget _buildActiveFilterPills() {
+    final labels = _discoverFilter.activeLabels;
+    return Padding(
+      padding: const EdgeInsets.only(left: AppSpacing.md, right: AppSpacing.md, bottom: AppSpacing.sm),
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: Row(children: [
+          ...labels.map((item) => Padding(
+            padding: const EdgeInsets.only(right: AppSpacing.xs),
+            child: GestureDetector(
+              onTap: () {
+                HapticFeedback.lightImpact();
+                setState(() {
+                  _discoverFilter = _discoverFilter.removeByKey(item.key);
+                  _activeQuickFilter = null;
+                });
+                _refreshFilteredResults();
+              },
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: AppSpacing.xs),
+                decoration: BoxDecoration(
+                  color: AppColors.amber400.withValues(alpha: 0.15),
+                  borderRadius: AppRadius.pillBR,
+                  border: Border.all(color: AppColors.amber400.withValues(alpha: 0.3)),
+                ),
+                child: Row(mainAxisSize: MainAxisSize.min, children: [
+                  Text(item.label, style: AppTextStyles.small.copyWith(color: AppColors.amber400)),
+                  const SizedBox(width: 4),
+                  const Icon(Icons.close, size: 12, color: AppColors.amber400),
+                ]),
+              ),
+            ),
+          )),
+          GestureDetector(
+            onTap: () {
+              HapticFeedback.lightImpact();
+              setState(() {
+                _discoverFilter = const DiscoverFilter();
+                _activeQuickFilter = null;
+              });
+              _refreshFilteredResults();
+            },
+            child: Text('Clear all', style: AppTextStyles.small.copyWith(
+              color: AppColors.textMuted, fontWeight: FontWeight.w600)),
+          ),
+        ]),
+      ),
+    );
   }
 
   // ═══════════════════════════════════════════
@@ -1247,8 +1662,24 @@ class MarketScreenState extends State<MarketScreen> {
     final chartData = _filterByRange(card.priceHistory, _selectedRange);
     final liveListings = _listings.getListings(card.cardId);
     final listings = _isDemo
-        ? [...liveListings, ..._demoListings.where((l) => l.cardId == card.cardId)]
+        ? ([...liveListings, ..._demoListings.where((l) => l.cardId == card.cardId)]
+            ..sort((a, b) => a.price.compareTo(b.price)))
         : liveListings;
+
+    // Buyable listings: exclude own, sort by total cost (price + shipping)
+    final uid = AuthService.instance.uid;
+    final buyerCountry = ProfileService.instance.ownProfile?.country;
+    final buyableListings = listings
+        .where((l) => l.sellerId != uid && l.availableQty > 0)
+        .toList()
+      ..sort((a, b) {
+        final aCost = buyerCountry != null ? a.totalPriceFor(buyerCountry) : a.price;
+        final bCost = buyerCountry != null ? b.totalPriceFor(buyerCountry) : b.price;
+        final priceCmp = aCost.compareTo(bCost);
+        if (priceCmp != 0) return priceCmp;
+        // Same total price → prefer better condition
+        return a.condition.index.compareTo(b.condition.index);
+      });
 
     // Calculate change relative to selected range
     double rangeChangeAbs = card.dayChangeAbs;
@@ -1263,19 +1694,18 @@ class MarketScreenState extends State<MarketScreen> {
     final changeColor = rangePositive ? AppColors.win : AppColors.loss;
     final changeSign = rangePositive ? '+' : '';
 
-    return _wrapWithDismiss(SingleChildScrollView(
+    final content = _wrapWithDismiss(SingleChildScrollView(
           controller: _scrollController,
-          physics: const BouncingScrollPhysics(),
-          padding: const EdgeInsets.only(bottom: 100, top: 36),
+          padding: const EdgeInsets.only(bottom: 120, top: 36),
           child: Column(
             children: [
               // Card image (battlefields shown landscape via rotation)
               if (card.imageUrl != null)
                 Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
                   child: Center(
                     child: ClipRRect(
-                            borderRadius: BorderRadius.circular(12),
+                            borderRadius: AppRadius.baseBR,
                             child: CardImage(
                               imageUrl: card.imageUrl,
                               fallbackText: card.cardName,
@@ -1286,30 +1716,41 @@ class MarketScreenState extends State<MarketScreen> {
                           ),
                   ),
                 ),
-              const SizedBox(height: 12),
+              const SizedBox(height: AppSpacing.md),
 
               // Name + set
               Text(
                 card.cardName,
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 18,
-                  fontWeight: FontWeight.w900,
-                ),
+                style: AppTextStyles.subtitle.copyWith(fontWeight: FontWeight.w900),
                 textAlign: TextAlign.center,
               ),
               if (card.setId != null || card.rarity != null)
                 Padding(
                   padding: const EdgeInsets.only(top: 2),
-                  child: Text(
-                    [if (card.setId != null) card.setId!.toUpperCase(), if (card.rarity != null) card.rarity!]
-                        .join(' · '),
-                    style: const TextStyle(color: AppColors.textMuted, fontSize: 11),
-                  ),
+                  child: Builder(builder: (_) {
+                    final riftCard = CardService.getLookup()[card.cardId];
+                    final col = riftCard?.collectorNumber;
+                    return Text(
+                      [
+                        if (card.setId != null) card.setId!.toUpperCase(),
+                        if (col != null) col,
+                        if (card.rarity != null) card.rarity!,
+                      ].join(' · '),
+                      style: AppTextStyles.small,
+                    );
+                  }),
                 ),
-              const SizedBox(height: 8),
+              const SizedBox(height: AppSpacing.sm),
 
               // Price + change (relative to selected range)
+              if (card.currentPrice == 0 && card.foilPrice == 0 && card.nonFoilPrice == 0)
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: AppSpacing.md),
+                  child: Text('No price data available',
+                    style: AppTextStyles.bodySecondary,
+                    textAlign: TextAlign.center),
+                )
+              else ...[
               // Show selected variant price (foil or non-foil)
               Builder(builder: (_) {
                 final displayPrice = _detailShowFoil
@@ -1317,12 +1758,7 @@ class MarketScreenState extends State<MarketScreen> {
                     : (card.standardPrice > 0 ? card.standardPrice : card.currentPrice);
                 return Text(
                   '€${displayPrice.toStringAsFixed(2)}',
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 28,
-                    fontWeight: FontWeight.w900,
-                    letterSpacing: -0.5,
-                  ),
+                  style: AppTextStyles.displaySmall.copyWith(fontWeight: FontWeight.w900),
                 );
               }),
               Row(
@@ -1335,10 +1771,8 @@ class MarketScreenState extends State<MarketScreen> {
                   ),
                   Text(
                     '$changeSign€${rangeChangeAbs.abs().toStringAsFixed(2)} ($changeSign${rangeChangePct.toStringAsFixed(1)}%)',
-                    style: TextStyle(
+                    style: AppTextStyles.captionBold.copyWith(
                       color: changeColor,
-                      fontSize: 12,
-                      fontWeight: FontWeight.w700,
                     ),
                   ),
                 ],
@@ -1356,7 +1790,7 @@ class MarketScreenState extends State<MarketScreen> {
                         child: _variantBadge(
                           card.standardLabel,
                           card.standardPrice,
-                          _detailShowFoil ? AppColors.textMuted : Colors.white,
+                          _detailShowFoil ? AppColors.textMuted : AppColors.textPrimary,
                         ),
                       ),
                       const SizedBox(width: 10),
@@ -1365,25 +1799,25 @@ class MarketScreenState extends State<MarketScreen> {
                         child: _variantBadge(
                           card.premiumLabel,
                           card.premiumPrice,
-                          _detailShowFoil ? Colors.white : AppColors.textMuted,
+                          _detailShowFoil ? AppColors.textPrimary : AppColors.textMuted,
                         ),
                       ),
                     ],
                   ),
                 ),
-              const SizedBox(height: 12),
+              const SizedBox(height: AppSpacing.md),
 
               // Time range selector
               TimeRangeSelector(
                 selected: _selectedRange,
                 onChanged: (r) => setState(() => _selectedRange = r),
               ),
-              const SizedBox(height: 8),
+              const SizedBox(height: AppSpacing.sm),
 
               // Price chart(s)
               if (_loadingHistory)
                 const Padding(
-                  padding: EdgeInsets.symmetric(horizontal: 16),
+                  padding: EdgeInsets.symmetric(horizontal: AppSpacing.md),
                   child: SizedBox(
                     height: 180,
                     child: Center(
@@ -1397,7 +1831,7 @@ class MarketScreenState extends State<MarketScreen> {
               else ...[
                 // Overlaid chart — active variant solid, inactive dimmed
                 Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
                   child: PriceChart(
                     data: _detailShowFoil
                         ? _getFoilChartData(card)
@@ -1411,27 +1845,28 @@ class MarketScreenState extends State<MarketScreen> {
                   ),
                 ),
               ],
-              const SizedBox(height: 16),
+              const SizedBox(height: AppSpacing.base),
 
               // Price overview
               Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 16),
+                padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
                 child: PriceOverviewCard(data: card, showFoil: _detailShowFoil),
               ),
-              const SizedBox(height: 16),
+              const SizedBox(height: AppSpacing.base),
+              ], // end of price data section
 
               // Listings
               if (listings.isNotEmpty) ...[
                 Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
                   child: SectionDivider(icon: Icons.sell, label: 'LISTINGS (${listings.length})'),
                 ),
-                const SizedBox(height: 4),
+                const SizedBox(height: AppSpacing.xs),
                 ...listings.map((l) {
                   final uid = AuthService.instance.uid;
                   final canBuy = l.sellerId != uid && l.availableQty > 0;
                   return Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 3),
+                    padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: 3),
                     child: ListingTile(
                       listing: l,
                       onBuy: canBuy ? () => _openCheckoutSheet(l) : null,
@@ -1440,64 +1875,77 @@ class MarketScreenState extends State<MarketScreen> {
                   );
                 }),
               ] else
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                  child: Container(
-                    padding: const EdgeInsets.all(20),
-                    decoration: BoxDecoration(
-                      color: AppColors.surface,
-                      borderRadius: BorderRadius.circular(12),
-                      border: Border.all(color: AppColors.border),
-                    ),
-                    child: const Column(
-                      children: [
-                        Icon(Icons.storefront_outlined, size: 28, color: AppColors.textMuted),
-                        SizedBox(height: 8),
-                        Text(
-                          'No listings yet',
-                          style: TextStyle(color: AppColors.textMuted, fontSize: 12),
-                        ),
-                      ],
-                    ),
+                const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.sm),
+                  child: RiftrEmptyState(
+                    icon: Icons.storefront_outlined,
+                    title: 'No Listings Yet',
+                    subtitle: 'Be the first to list this card for sale',
                   ),
                 ),
-              const SizedBox(height: 16),
-
-              // Buy/Sell buttons
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 16),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: listings.isNotEmpty
-                          ? _buyButton(listings.first)
-                          : _comingSoonButton('Buy', AppColors.win),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: _sellButton(card),
-                    ),
-                  ],
-                ),
-              ),
             ],
           ),
     ));
+
+    final viewPadding = MediaQuery.of(context).viewPadding;
+
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        content,
+        // Gradient fade behind buttons
+        Positioned(
+          left: 0, right: 0,
+          bottom: 0,
+          child: IgnorePointer(
+            child: Container(
+              height: 100,
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: [
+                    AppColors.surface.withValues(alpha: 0),
+                    AppColors.surface,
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+        // Fixed Buy/Sell FABs
+        Positioned(
+          left: AppSpacing.base,
+          right: AppSpacing.base,
+          bottom: AppSpacing.base,
+          child: Row(
+            children: [
+              Expanded(
+                child: _buyButton(buyableListings.isNotEmpty ? buyableListings.first : null),
+              ),
+              const SizedBox(width: AppSpacing.md),
+              Expanded(
+                child: _sellButton(card),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
   }
 
   Widget _variantBadge(String label, double price, Color color) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: 3),
       decoration: BoxDecoration(
         color: color.withValues(alpha: 0.1),
-        borderRadius: BorderRadius.circular(6),
+        borderRadius: BorderRadius.circular(AppRadius.sm),
         border: Border.all(color: color.withValues(alpha: 0.2)),
       ),
       child: Text(
         '$label  €${price.toStringAsFixed(2)}',
-        style: TextStyle(
+        style: AppTextStyles.tiny.copyWith(
           color: color,
-          fontSize: 10,
           fontWeight: FontWeight.w700,
         ),
       ),
@@ -1506,10 +1954,10 @@ class MarketScreenState extends State<MarketScreen> {
 
   Widget _myListingTile(MarketListing listing) {
     return Container(
-      padding: const EdgeInsets.all(12),
+      padding: const EdgeInsets.all(AppSpacing.md),
       decoration: BoxDecoration(
         color: AppColors.surface,
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: AppRadius.baseBR,
         border: Border.all(color: AppColors.border),
       ),
       child: Row(
@@ -1520,38 +1968,48 @@ class MarketScreenState extends State<MarketScreen> {
               children: [
                 Text(
                   listing.cardName,
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 12,
+                  style: AppTextStyles.caption.copyWith(
+                    color: AppColors.textPrimary,
                     fontWeight: FontWeight.w700,
                   ),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                 ),
-                const SizedBox(height: 4),
+                const SizedBox(height: AppSpacing.xs),
                 Row(
                   children: [
                     ConditionBadge(condition: listing.condition),
-                    if (listing.quantity > 1) ...[
+                    if (listing.availableQty > 1) ...[
                       const SizedBox(width: 6),
                       Text(
-                        '×${listing.quantity}',
-                        style: const TextStyle(
+                        '×${listing.availableQty}',
+                        style: AppTextStyles.tiny.copyWith(
                           color: AppColors.textMuted,
-                          fontSize: 10,
                           fontWeight: FontWeight.w600,
                         ),
                       ),
                     ],
-                    const SizedBox(width: 8),
+                    const SizedBox(width: AppSpacing.sm),
                     Text(
                       '€${listing.price.toStringAsFixed(2)}',
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 12,
+                      style: AppTextStyles.caption.copyWith(
+                        color: AppColors.textPrimary,
                         fontWeight: FontWeight.w800,
                       ),
                     ),
+                    if (listing.isPreRelease) ...[
+                      const SizedBox(width: AppSpacing.sm),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: AppColors.amber400.withValues(alpha: 0.15),
+                          borderRadius: AppRadius.pillBR,
+                        ),
+                        child: Text('PRE-ORDER',
+                          style: AppTextStyles.micro.copyWith(
+                            color: AppColors.amber400, fontWeight: FontWeight.w700)),
+                      ),
+                    ],
                   ],
                 ),
               ],
@@ -1560,17 +2018,16 @@ class MarketScreenState extends State<MarketScreen> {
           GestureDetector(
             onTap: () => _cancelListing(listing),
             child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.sm),
               decoration: BoxDecoration(
                 color: AppColors.loss.withValues(alpha: 0.1),
-                borderRadius: BorderRadius.circular(8),
+                borderRadius: BorderRadius.circular(AppRadius.md),
                 border: Border.all(color: AppColors.loss.withValues(alpha: 0.2)),
               ),
-              child: const Text(
+              child: Text(
                 'Cancel',
-                style: TextStyle(
+                style: AppTextStyles.small.copyWith(
                   color: AppColors.loss,
-                  fontSize: 11,
                   fontWeight: FontWeight.w700,
                 ),
               ),
@@ -1582,25 +2039,30 @@ class MarketScreenState extends State<MarketScreen> {
   }
 
   Future<void> _cancelListing(MarketListing listing) async {
-    final confirm = await showDialog<bool>(
+    final confirm = await showRiftrSheet<bool>(
       context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: AppColors.surface,
-        title: const Text('Cancel Listing?', style: TextStyle(color: Colors.white, fontSize: 16)),
-        content: Text(
-          'Remove ${listing.cardName} (€${listing.price.toStringAsFixed(2)}) from the marketplace?',
-          style: const TextStyle(color: AppColors.textSecondary, fontSize: 13),
+      builder: (ctx) => Padding(
+        padding: const EdgeInsets.fromLTRB(AppSpacing.base, 0, AppSpacing.base, AppSpacing.lg),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('CANCEL LISTING?', style: AppTextStyles.h2.copyWith(color: AppColors.error, fontWeight: FontWeight.w900)),
+            const SizedBox(height: AppSpacing.sm),
+            Text(
+              'Remove ${listing.cardName} (€${listing.price.toStringAsFixed(2)}) from the marketplace?',
+              style: AppTextStyles.bodySecondary,
+            ),
+            const SizedBox(height: AppSpacing.lg),
+            Row(children: [
+              Expanded(child: RiftrButton(label: 'Keep',
+                onPressed: () => Navigator.pop(ctx, false), style: RiftrButtonStyle.secondary)),
+              const SizedBox(width: AppSpacing.md),
+              Expanded(child: RiftrButton(label: 'Cancel Listing',
+                onPressed: () => Navigator.pop(ctx, true), style: RiftrButtonStyle.danger)),
+            ]),
+          ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Keep', style: TextStyle(color: AppColors.textMuted)),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('Cancel Listing', style: TextStyle(color: AppColors.loss)),
-          ),
-        ],
       ),
     );
 
@@ -1632,53 +2094,92 @@ class MarketScreenState extends State<MarketScreen> {
 
   Widget _sellButton(CardPriceData card) {
     return GestureDetector(
-      onTap: () => _openSellSheet(card),
+      onTap: () {
+        HapticFeedback.lightImpact();
+        _openSellSheet(card);
+      },
       child: Container(
-        padding: const EdgeInsets.symmetric(vertical: 14),
+        height: 56,
+        alignment: Alignment.center,
         decoration: BoxDecoration(
-          color: AppColors.amber500.withValues(alpha: 0.15),
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: AppColors.amber500.withValues(alpha: 0.3)),
+          color: AppColors.amber400,
+          borderRadius: AppRadius.pillBR,
+          boxShadow: [
+            BoxShadow(
+              color: AppColors.amber400.withValues(alpha: 0.5),
+              blurRadius: 16,
+              spreadRadius: 2,
+            ),
+          ],
         ),
-        child: const Text(
-          'Sell',
-          textAlign: TextAlign.center,
-          style: TextStyle(
-            color: AppColors.amber400,
-            fontSize: 14,
-            fontWeight: FontWeight.w800,
-          ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(Icons.sell_outlined, color: AppColors.background, size: 20),
+            const SizedBox(width: AppSpacing.sm),
+            Text(
+              'Sell',
+              style: AppTextStyles.bodyBold.copyWith(
+                color: AppColors.background,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+          ],
         ),
       ),
     );
   }
 
-  Widget _buyButton(MarketListing listing) {
-    final uid = AuthService.instance.uid;
-    final canBuy = listing.sellerId != uid && listing.availableQty > 0;
+  Widget _buyButton(MarketListing? listing) {
+    final canBuy = listing != null;
+    final label = canBuy ? 'Buy €${listing.price.toStringAsFixed(2)}' : 'Buy';
     return GestureDetector(
-      onTap: canBuy ? () => _openCheckoutSheet(listing) : null,
+      onTap: canBuy
+          ? () {
+              HapticFeedback.lightImpact();
+              _openCheckoutSheet(listing);
+            }
+          : () {
+              HapticFeedback.lightImpact();
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text('No listings available'),
+                  backgroundColor: AppColors.textMuted,
+                  duration: Duration(seconds: 2),
+                ),
+              );
+            },
       child: Container(
-        padding: const EdgeInsets.symmetric(vertical: 14),
+        height: 56,
+        alignment: Alignment.center,
         decoration: BoxDecoration(
-          color: canBuy
-              ? AppColors.win.withValues(alpha: 0.15)
-              : AppColors.textMuted.withValues(alpha: 0.08),
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(
-            color: canBuy
-                ? AppColors.win.withValues(alpha: 0.3)
-                : AppColors.textMuted.withValues(alpha: 0.15),
-          ),
+          color: canBuy ? AppColors.win : AppColors.surfaceLight,
+          borderRadius: AppRadius.pillBR,
+          boxShadow: canBuy
+              ? [
+                  BoxShadow(
+                    color: AppColors.win.withValues(alpha: 0.5),
+                    blurRadius: 16,
+                    spreadRadius: 2,
+                  ),
+                ]
+              : null,
         ),
-        child: Text(
-          'Buy €${listing.price.toStringAsFixed(2)}',
-          textAlign: TextAlign.center,
-          style: TextStyle(
-            color: canBuy ? AppColors.win : AppColors.textMuted,
-            fontSize: 14,
-            fontWeight: FontWeight.w800,
-          ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(Icons.shopping_bag_outlined,
+                color: canBuy ? AppColors.background : AppColors.textMuted,
+                size: 20),
+            const SizedBox(width: AppSpacing.sm),
+            Text(
+              label,
+              style: AppTextStyles.bodyBold.copyWith(
+                color: canBuy ? AppColors.background : AppColors.textMuted,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+          ],
         ),
       ),
     );
@@ -1724,16 +2225,22 @@ class MarketScreenState extends State<MarketScreen> {
     final entries = _cart.values.toList();
     final firstListing = entries.first.listing;
 
-    final result = await showModalBottomSheet<dynamic>(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: Colors.transparent,
-      builder: (_) => CheckoutSheet(
-        listing: firstListing,
-        cartItems: entries.map((e) => CartCheckoutItem(
-          listing: e.listing,
-          quantity: e.quantity,
-        )).toList(),
+    final cartItems = entries.map((e) => CartCheckoutItem(
+      listing: e.listing,
+      quantity: e.quantity,
+    )).toList();
+
+    final result = await Navigator.push<dynamic>(
+      context,
+      PageRouteBuilder(
+        opaque: false,
+        barrierColor: Colors.black54,
+        pageBuilder: (_, __, ___) => _CheckoutFullScreen(
+          listing: firstListing,
+          cartItems: cartItems,
+        ),
+        transitionsBuilder: (_, anim, __, child) =>
+            SlideTransition(position: Tween(begin: const Offset(0, 1), end: Offset.zero).animate(anim), child: child),
       ),
     );
 
@@ -1742,163 +2249,38 @@ class MarketScreenState extends State<MarketScreen> {
     if (result is String) {
       setState(() => _cart.clear());
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Order placed (Demo Mode)'),
+        SnackBar(
+          content: Text(result == 'demo-order' ? 'Order placed (Demo Mode)' : 'Order placed!'),
           backgroundColor: AppColors.win,
-          duration: Duration(seconds: 2),
+          duration: const Duration(seconds: 3),
         ),
       );
-      return;
-    }
-
-    if (result is CheckoutResult) {
-      try {
-        await Future.delayed(const Duration(milliseconds: 500));
-        if (!mounted) return;
-
-        await Stripe.instance.initPaymentSheet(
-          paymentSheetParameters: SetupPaymentSheetParameters(
-            paymentIntentClientSecret: result.clientSecret,
-            merchantDisplayName: 'Riftr',
-            style: ThemeMode.dark,
-            returnURL: 'riftr://stripe-redirect',
-          ),
-        );
-
-        await Stripe.instance.presentPaymentSheet();
-        if (!mounted) return;
-
-        // Confirm payment with backend (updates order to "paid")
-        await OrderService.instance.confirmPayment(result.orderId);
-
-        if (!mounted) return;
-        setState(() => _cart.clear());
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Payment successful! Order placed.'),
-            backgroundColor: AppColors.win,
-            duration: Duration(seconds: 3),
-          ),
-        );
-      } on StripeException catch (e) {
-        await OrderService.instance.cancelOrder(result.orderId);
-        if (!mounted) return;
-        if (e.error.code == FailureCode.Canceled) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('Payment cancelled'),
-              backgroundColor: AppColors.textMuted,
-              duration: Duration(seconds: 2),
-            ),
-          );
-        } else {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text('Payment failed: ${e.error.localizedMessage}'),
-              backgroundColor: AppColors.loss,
-              duration: const Duration(seconds: 3),
-            ),
-          );
-        }
-      }
     }
   }
 
   Future<void> _openCheckoutSheet(MarketListing listing) async {
-    final result = await showModalBottomSheet<dynamic>(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: Colors.transparent,
-      builder: (_) => CheckoutSheet(listing: listing),
+    final result = await Navigator.push<dynamic>(
+      context,
+      PageRouteBuilder(
+        opaque: false,
+        barrierColor: Colors.black54,
+        pageBuilder: (_, __, ___) => _CheckoutFullScreen(listing: listing),
+        transitionsBuilder: (_, anim, __, child) =>
+            SlideTransition(position: Tween(begin: const Offset(0, 1), end: Offset.zero).animate(anim), child: child),
+      ),
     );
 
     if (!mounted) return;
 
-    // Demo mode returns a string
+    // Wallet purchase returns orderId string, demo returns 'demo-order'
     if (result is String) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Order placed (Demo Mode)'),
+        SnackBar(
+          content: Text(result == 'demo-order' ? 'Order placed (Demo Mode)' : 'Order placed!'),
           backgroundColor: AppColors.win,
-          duration: Duration(seconds: 2),
+          duration: const Duration(seconds: 3),
         ),
       );
-      return;
-    }
-
-    // Real mode: CheckoutSheet returns CheckoutResult with clientSecret.
-    // Init + present PaymentSheet both from this parent context.
-    if (result is CheckoutResult) {
-      try {
-        // Wait for bottom sheet dismiss animation to fully complete
-        await Future.delayed(const Duration(milliseconds: 500));
-        if (!mounted) return;
-
-        debugPrint('Stripe: initPaymentSheet from parent...');
-        await Stripe.instance.initPaymentSheet(
-          paymentSheetParameters: SetupPaymentSheetParameters(
-            paymentIntentClientSecret: result.clientSecret,
-            merchantDisplayName: 'Riftr',
-            style: ThemeMode.dark,
-            returnURL: 'riftr://stripe-redirect',
-          ),
-        );
-        debugPrint('Stripe: initPaymentSheet DONE, presenting...');
-
-        await Stripe.instance.presentPaymentSheet();
-        debugPrint('Stripe: presentPaymentSheet DONE — payment success');
-        if (!mounted) return;
-
-        // Confirm payment with backend (updates order to "paid")
-        await OrderService.instance.confirmPayment(result.orderId);
-        debugPrint('Stripe: confirmPayment DONE — order marked as paid');
-
-        if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Payment successful! Order placed.'),
-            backgroundColor: AppColors.win,
-            duration: Duration(seconds: 3),
-          ),
-        );
-      } on StripeException catch (e) {
-        debugPrint('Stripe PaymentSheet error: ${e.error.localizedMessage}');
-        // Release reservation on cancel/failure
-        await OrderService.instance.cancelOrder(result.orderId);
-        debugPrint('Order ${result.orderId} cancelled — reservation released');
-        if (!mounted) return;
-        // User cancelled is not an error
-        if (e.error.code == FailureCode.Canceled) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('Payment cancelled'),
-              backgroundColor: AppColors.textMuted,
-              duration: Duration(seconds: 2),
-            ),
-          );
-        } else {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text('Payment failed: ${e.error.localizedMessage}'),
-              backgroundColor: AppColors.loss,
-              duration: const Duration(seconds: 3),
-            ),
-          );
-        }
-      } catch (e) {
-        debugPrint('PaymentSheet unexpected error: $e');
-        // Release reservation on unexpected failure
-        await OrderService.instance.cancelOrder(result.orderId);
-        debugPrint('Order ${result.orderId} cancelled — reservation released');
-        if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Payment error: $e'),
-            backgroundColor: AppColors.loss,
-            duration: const Duration(seconds: 3),
-          ),
-        );
-      }
     }
   }
 
@@ -1923,10 +2305,8 @@ class MarketScreenState extends State<MarketScreen> {
         : !SellerService.instance.isReady;
 
     if (needsOnboarding) {
-      final completed = await showModalBottomSheet<bool>(
+      final completed = await showRiftrSheet<bool>(
         context: context,
-        isScrollControlled: true,
-        backgroundColor: Colors.transparent,
         builder: (_) => const SellerOnboardingSheet(),
       );
       if (completed != true || !mounted) return;
@@ -1937,17 +2317,24 @@ class MarketScreenState extends State<MarketScreen> {
     }
 
     if (!mounted) return;
-    final result = await showModalBottomSheet<Map<String, dynamic>>(
+    final collectionQty = _isDemo
+        ? 0
+        : FirestoreCollectionService.instance.getTotalQuantity(card.cardId);
+
+    final result = await showRiftrSheet<Map<String, dynamic>>(
       context: context,
-      isScrollControlled: true,
-      backgroundColor: Colors.transparent,
       builder: (_) => SellSheet(
         cardName: card.cardName,
         imageUrl: card.imageUrl,
         suggestedPrice: card.currentPrice,
+        collectionQty: collectionQty,
+        setId: card.setId,
       ),
     );
     if (result == null || !mounted) return;
+
+    final isNewCards = result['newCards'] as bool? ?? false;
+    final quantity = result['quantity'] as int;
 
     if (_isDemo) {
       setState(() {
@@ -1963,7 +2350,7 @@ class MarketScreenState extends State<MarketScreen> {
           sellerSales: 0,
           price: result['price'] as double,
           condition: result['condition'] as CardCondition,
-          quantity: result['quantity'] as int,
+          quantity: quantity,
           insuredOnly: result['insuredOnly'] as bool? ?? false,
           status: 'active',
           listedAt: DateTime.now(),
@@ -1985,15 +2372,39 @@ class MarketScreenState extends State<MarketScreen> {
       imageUrl: card.imageUrl,
       condition: result['condition'] as CardCondition,
       price: result['price'] as double,
-      quantity: result['quantity'] as int,
+      quantity: quantity,
       insuredOnly: result['insuredOnly'] as bool? ?? false,
+      language: result['language'] as String? ?? 'EN',
+      setId: card.setId,
     );
 
+    // Add new lots to collection if needed
+    // Toggle AN: all cards are new → newLots = quantity
+    // Toggle AUS: fill up collection if listing > owned → newLots = max(0, quantity - collectionQty)
+    if (listingId != null) {
+      final newLots = isNewCards ? quantity : (quantity - collectionQty).clamp(0, quantity);
+      if (newLots > 0) {
+        final collection = FirestoreCollectionService.instance;
+        final isFoil = FirestoreCollectionService.isFoilVariant(card.setId, card.rarity);
+        final costPrice = card.currentPrice;
+        for (int i = 0; i < newLots; i++) {
+          collection.increment(card.cardId, costPrice: costPrice, foil: isFoil, source: 'listing');
+        }
+      }
+    }
+
     if (!mounted) return;
+    final newLots = isNewCards ? quantity : (quantity - collectionQty).clamp(0, quantity);
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(
-          listingId != null ? 'Listed for sale!' : 'Failed to create listing',
+          listingId != null
+              ? newLots > 0
+                  ? newLots > 1
+                      ? 'Listed for sale! $newLots cards added to your collection.'
+                      : 'Listed for sale! Card added to your collection.'
+                  : 'Listed for sale!'
+              : 'Failed to create listing',
         ),
         backgroundColor: listingId != null ? AppColors.win : AppColors.loss,
         duration: const Duration(seconds: 2),
@@ -2002,49 +2413,28 @@ class MarketScreenState extends State<MarketScreen> {
   }
 
   Future<String?> _showCountryPicker() async {
-    return showModalBottomSheet<String>(
+    return showRiftrSheet<String>(
       context: context,
-      isScrollControlled: true,
-      backgroundColor: Colors.transparent,
-      builder: (ctx) => Container(
+      builder: (ctx) => ConstrainedBox(
         constraints: BoxConstraints(
-          maxHeight: MediaQuery.of(ctx).size.height * 0.7,
-        ),
-        decoration: const BoxDecoration(
-          color: AppColors.surface,
-          borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+          maxHeight: MediaQuery.of(ctx).size.height * 0.7 - 80,
         ),
         child: SingleChildScrollView(
-          padding: const EdgeInsets.fromLTRB(20, 16, 20, 16),
+          padding: const EdgeInsets.fromLTRB(AppSpacing.lg, 0, AppSpacing.lg, AppSpacing.base),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Center(
-                child: Container(
-                  width: 40,
-                  height: 4,
-                  decoration: BoxDecoration(
-                    color: AppColors.textMuted.withValues(alpha: 0.3),
-                    borderRadius: BorderRadius.circular(2),
-                  ),
-                ),
-              ),
-              const SizedBox(height: 16),
-              const Text(
+              Text(
                 'Select Your Country',
-                style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 16,
-                  fontWeight: FontWeight.w900,
-                ),
+                style: AppTextStyles.h3.copyWith(fontWeight: FontWeight.w900),
               ),
-              const SizedBox(height: 4),
+              const SizedBox(height: AppSpacing.xs),
               const Text(
                 'Used to calculate shipping costs for buyers.',
-                style: TextStyle(color: AppColors.textMuted, fontSize: 11),
+                style: AppTextStyles.small,
               ),
-              const SizedBox(height: 16),
+              const SizedBox(height: AppSpacing.base),
               Wrap(
                 spacing: 8,
                 runSpacing: 8,
@@ -2052,28 +2442,21 @@ class MarketScreenState extends State<MarketScreen> {
                   return GestureDetector(
                     onTap: () => Navigator.pop(ctx, entry.key),
                     child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.base, vertical: AppSpacing.md),
                       decoration: BoxDecoration(
                         color: AppColors.background,
-                        borderRadius: BorderRadius.circular(10),
+                        borderRadius: BorderRadius.circular(AppRadius.iconButton),
                         border: Border.all(color: AppColors.border),
                       ),
                       child: Column(
                         children: [
                           Text(
                             entry.key,
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontSize: 14,
-                              fontWeight: FontWeight.w800,
-                            ),
+                            style: AppTextStyles.bodyBold.copyWith(fontWeight: FontWeight.w800),
                           ),
                           Text(
                             entry.value,
-                            style: const TextStyle(
-                              color: AppColors.textMuted,
-                              fontSize: 9,
-                            ),
+                            style: AppTextStyles.micro.copyWith(color: AppColors.textMuted),
                           ),
                         ],
                       ),
@@ -2081,7 +2464,7 @@ class MarketScreenState extends State<MarketScreen> {
                   );
                 }).toList(),
               ),
-              const SizedBox(height: 16),
+              const SizedBox(height: AppSpacing.base),
             ],
           ),
         ),
@@ -2091,29 +2474,22 @@ class MarketScreenState extends State<MarketScreen> {
 
   Widget _comingSoonButton(String label, Color color) {
     return Container(
-      padding: const EdgeInsets.symmetric(vertical: 14),
+      height: 56,
+      alignment: Alignment.center,
       decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.08),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: color.withValues(alpha: 0.15)),
+        color: color.withValues(alpha: 0.2),
+        borderRadius: AppRadius.pillBR,
       ),
-      child: Column(
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          Text(
-            label,
-            style: TextStyle(
-              color: color.withValues(alpha: 0.4),
-              fontSize: 14,
-              fontWeight: FontWeight.w800,
-            ),
-          ),
-          const SizedBox(height: 2),
+          Icon(Icons.shopping_bag_outlined, color: color.withValues(alpha: 0.4), size: 20),
+          const SizedBox(width: AppSpacing.sm),
           Text(
             'Coming Soon',
-            style: TextStyle(
-              color: color.withValues(alpha: 0.25),
-              fontSize: 9,
-              fontWeight: FontWeight.w600,
+            style: AppTextStyles.bodyBold.copyWith(
+              color: color.withValues(alpha: 0.4),
+              fontWeight: FontWeight.w800,
             ),
           ),
         ],
@@ -2204,3 +2580,50 @@ class _CartEntry {
   int quantity;
   _CartEntry({required this.listing, this.quantity = 1});
 }
+
+/// Full-screen checkout overlay with DragToDismiss.
+class _CheckoutFullScreen extends StatelessWidget {
+  final MarketListing listing;
+  final List<CartCheckoutItem>? cartItems;
+
+  const _CheckoutFullScreen({required this.listing, this.cartItems});
+
+  @override
+  Widget build(BuildContext context) {
+    final kb = MediaQuery.of(context).viewInsets.bottom;
+    return Material(
+      color: AppColors.background,
+      child: DragToDismiss(
+        onDismissed: () => Navigator.pop(context),
+        backgroundColor: AppColors.background,
+        child: SafeArea(
+          child: Padding(
+            padding: EdgeInsets.only(bottom: kb),
+            child: Column(children: [
+            Container(
+              height: 36,
+              color: AppColors.background,
+              child: Center(child: Container(
+                margin: const EdgeInsets.only(top: 10),
+                width: 40, height: 5,
+                decoration: BoxDecoration(
+                  color: AppColors.textSecondary,
+                  borderRadius: BorderRadius.circular(3),
+                ),
+              )),
+            ),
+            Expanded(
+              child: CheckoutSheet(
+                listing: listing,
+                cartItems: cartItems,
+              ),
+            ),
+          ]),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+

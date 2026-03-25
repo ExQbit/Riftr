@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../../models/market/card_price_data.dart';
+import '../../theme/app_components.dart';
 import '../../theme/app_theme.dart';
 import '../card_image.dart';
 
@@ -37,23 +38,17 @@ class CardPriceTile extends StatelessWidget {
     final changeColor = isPositive ? AppColors.win : AppColors.loss;
     final changeSign = isPositive ? '+' : '';
 
-    return GestureDetector(
+    return RiftrCard(
       onTap: onTap,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-        decoration: BoxDecoration(
-          color: AppColors.surface,
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: AppColors.border),
-        ),
-        child: Row(
+      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.md),
+      child: Row(
           children: [
             // Card image (battlefields rotated to fit portrait thumbnail)
             SizedBox(
               width: 32,
               height: 44,
               child: ClipRRect(
-                borderRadius: BorderRadius.circular(4),
+                borderRadius: BorderRadius.circular(AppRadius.badge),
                 child: data.imageUrl != null
                     ? (data.isBattlefield
                         ? RotatedBox(
@@ -83,9 +78,8 @@ class CardPriceTile extends StatelessWidget {
                 children: [
                   Text(
                     data.cardName,
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 12,
+                    style: AppTextStyles.captionBold.copyWith(
+                      color: AppColors.textPrimary,
                       fontWeight: FontWeight.w700,
                     ),
                     maxLines: 1,
@@ -97,35 +91,32 @@ class CardPriceTile extends StatelessWidget {
                       if (data.setId != null)
                         Text(
                           data.setId!.toUpperCase(),
-                          style: const TextStyle(
-                            color: AppColors.textMuted,
-                            fontSize: 9,
+                          style: AppTextStyles.micro.copyWith(
                             fontWeight: FontWeight.w600,
                           ),
                         ),
                       if (showFoilStar) ...[
-                        const SizedBox(width: 4),
-                        const Text(
+                        const SizedBox(width: AppSpacing.xs),
+                        Text(
                           '★',
-                          style: TextStyle(
+                          style: AppTextStyles.micro.copyWith(
                             color: AppColors.amber300,
-                            fontSize: 9,
+                            fontWeight: FontWeight.normal,
                           ),
                         ),
                       ],
                       if (quantity != null && quantity! > 0) ...[
                         const SizedBox(width: 6),
                         Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                          padding: const EdgeInsets.symmetric(horizontal: AppSpacing.xs, vertical: 1),
                           decoration: BoxDecoration(
                             color: AppColors.amber500.withValues(alpha: 0.15),
-                            borderRadius: BorderRadius.circular(4),
+                            borderRadius: BorderRadius.circular(AppRadius.badge),
                           ),
                           child: Text(
                             '×$quantity',
-                            style: const TextStyle(
+                            style: AppTextStyles.micro.copyWith(
                               color: AppColors.amber300,
-                              fontSize: 9,
                               fontWeight: FontWeight.w700,
                             ),
                           ),
@@ -136,7 +127,7 @@ class CardPriceTile extends StatelessWidget {
                 ],
               ),
             ),
-            const SizedBox(width: 8),
+            const SizedBox(width: AppSpacing.sm),
 
             // Price + change
             Column(
@@ -144,18 +135,16 @@ class CardPriceTile extends StatelessWidget {
               children: [
                 Text(
                   '€${(priceOverride ?? data.currentPrice).toStringAsFixed(2)}',
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 12,
+                  style: AppTextStyles.captionBold.copyWith(
+                    color: AppColors.textPrimary,
                     fontWeight: FontWeight.w800,
                   ),
                 ),
                 const SizedBox(height: 2),
                 Text(
                   changeText ?? '$changeSign${data.dayChange.toStringAsFixed(1)}%',
-                  style: TextStyle(
+                  style: AppTextStyles.tiny.copyWith(
                     color: changeColor,
-                    fontSize: 10,
                     fontWeight: FontWeight.w700,
                   ),
                 ),
@@ -163,7 +152,6 @@ class CardPriceTile extends StatelessWidget {
             ),
           ],
         ),
-      ),
     );
   }
 
@@ -173,7 +161,7 @@ class CardPriceTile extends StatelessWidget {
       height: 44,
       decoration: BoxDecoration(
         color: AppColors.surfaceLight,
-        borderRadius: BorderRadius.circular(4),
+        borderRadius: BorderRadius.circular(AppRadius.badge),
       ),
       child: const Icon(Icons.style, size: 16, color: AppColors.textMuted),
     );
