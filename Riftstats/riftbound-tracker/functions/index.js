@@ -35,10 +35,10 @@ const PLATED_LEGEND_IDS = {
   874518: { name: "Viktor, Herald of the Arcane", set: "OGNX" },
   874519: { name: "Miss Fortune, Bounty Hunter", set: "OGNX" },
   874520: { name: "Sett, The Boss", set: "OGNX" },
-  874521: { name: "Annie, Dark Child", set: "OGNX" },
-  874522: { name: "Master Yi, Wuju Bladesman", set: "OGNX" },
-  874523: { name: "Lux, Lady of Luminosity", set: "OGNX" },
-  874524: { name: "Garen, Might of Demacia", set: "OGNX" },
+  874521: { name: "Annie, Dark Child", set: "OGSX" },
+  874522: { name: "Master Yi, Wuju Bladesman", set: "OGSX" },
+  874523: { name: "Lux, Lady of Luminosity", set: "OGSX" },
+  874524: { name: "Garen, Might of Demacia", set: "OGSX" },
   874525: { name: "Rumble, Mechanized Menace", set: "SFDX" },
   874526: { name: "Lucian, Purifier", set: "SFDX" },
   874527: { name: "Draven, Glorious Executioner", set: "SFDX" },
@@ -110,6 +110,83 @@ async function recordSales(order, orderId) {
 }
 
 /**
+ * Calculate realized gains for seller using FIFO cost basis.
+ * Removes consumed lots from seller's cost_basis doc.
+ * Updates seller's profile with lifetime realizedGains + totalCostBasisSold.
+ *
+ * @param {string} sellerId - Seller's UID
+ * @param {Array} items - Order items [{cardId, pricePerCard, quantity}]
+ * @param {number} fee - Platform fee fraction (default 0.05 = 5%)
+ * @returns {{ totalRealizedGain: number, totalCostBasisSold: number }}
+ */
+async function calculateRealizedGains(sellerId, items, fee = 0.05) {
+  if (!sellerId || !items || items.length === 0) return { totalRealizedGain: 0, totalCostBasisSold: 0 };
+
+  // 1. Read seller's cost basis BEFORE cards are removed from collection
+  const cbRef = db.collection("artifacts").doc(APP_ID)
+    .collection("users").doc(sellerId).collection("data").doc("cost_basis");
+  const cbDoc = await cbRef.get();
+  const entries = cbDoc.exists ? (cbDoc.data().entries || {}) : {};
+
+  let totalRealizedGain = 0;
+  let totalCostBasisSold = 0;
+
+  for (const item of items) {
+    if (!item.cardId) continue;
+    const qty = item.quantity || 1;
+    const netPrice = (item.pricePerCard || 0) * (1 - fee); // After platform fee
+    const entry = entries[item.cardId];
+
+    if (!entry || !entry.lots || entry.lots.length === 0) {
+      // No cost basis recorded — treat as pure gain (cost = 0)
+      totalRealizedGain += netPrice * qty;
+      continue;
+    }
+
+    // FIFO: Sort lots by date ascending (oldest first), consume oldest lots first
+    entry.lots.sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+
+    let remaining = qty;
+    let costForThisSale = 0;
+
+    while (remaining > 0 && entry.lots.length > 0) {
+      const lot = entry.lots[0];
+      const take = Math.min(remaining, lot.qty);
+      costForThisSale += take * lot.price;
+      lot.qty -= take;
+      remaining -= take;
+      if (lot.qty <= 0) entry.lots.shift(); // Lot fully consumed
+    }
+
+    // Update cost basis totals
+    entry.totalCost = Math.max(0, (entry.totalCost || 0) - costForThisSale);
+    entry.totalQty = Math.max(0, (entry.totalQty || 0) - qty);
+    if (entry.totalQty === 0) {
+      delete entries[item.cardId]; // Clean up empty entries
+    } else {
+      entries[item.cardId] = entry;
+    }
+
+    totalRealizedGain += (netPrice * qty) - costForThisSale;
+    totalCostBasisSold += costForThisSale;
+  }
+
+  // 2. Write updated cost basis (lots removed)
+  await cbRef.set({ entries, updatedAt: new Date().toISOString() }, { merge: true });
+
+  // 3. Update seller's profile with lifetime realized gains (atomic increment)
+  const profileRef = db.collection("artifacts").doc(APP_ID)
+    .collection("users").doc(sellerId).collection("data").doc("profile");
+  await profileRef.set({
+    realizedGains: admin.firestore.FieldValue.increment(totalRealizedGain),
+    totalCostBasisSold: admin.firestore.FieldValue.increment(totalCostBasisSold),
+  }, { merge: true });
+
+  console.log(`Realized gains for seller ${sellerId}: €${totalRealizedGain.toFixed(2)} (cost basis sold: €${totalCostBasisSold.toFixed(2)})`);
+  return { totalRealizedGain, totalCostBasisSold };
+}
+
+/**
  * Add purchased items to the buyer's collection after delivery.
  * Increments quantity for each card in the order.
  */
@@ -122,6 +199,18 @@ async function addItemsToCollection(order) {
     .collection("users").doc(order.buyerId)
     .collection("data");
 
+  // Look up card metadata to determine foil status
+  const pricesSnap = await db.collection("artifacts").doc(APP_ID).collection("market").get();
+  const cardMeta = {};
+  pricesSnap.docs.forEach(d => {
+    const data = d.data();
+    cardMeta[d.id] = {
+      rarity: (data.rarity || "").toLowerCase(),
+      setId: data.setId || "",
+      isPromo: !!(data.isPromo),
+    };
+  });
+
   // --- Increment collection quantities ---
   const collRef = userBase.doc("collection");
   const collDoc = await collRef.get();
@@ -130,7 +219,24 @@ async function addItemsToCollection(order) {
   for (const item of items) {
     if (!item.cardId) continue;
     const qty = item.quantity || 1;
-    cards[item.cardId] = (cards[item.cardId] || 0) + qty;
+
+    // Determine if this card is foil-only (same logic as Flutter)
+    // OGS = always non-foil, Promos = always foil, Rare+ = foil-only
+    const meta = cardMeta[item.cardId] || {};
+    const isOGS = meta.setId === "OGS";
+    const foilOnly = !isOGS && (meta.isPromo || (meta.rarity !== "common" && meta.rarity !== "uncommon"));
+
+    // Ensure entry is an object with qty + foil_qty
+    const existing = (typeof cards[item.cardId] === "object" && cards[item.cardId] !== null)
+      ? cards[item.cardId]
+      : { qty: 0, foil_qty: 0 };
+
+    if (foilOnly) {
+      existing.foil_qty = (existing.foil_qty || 0) + qty;
+    } else {
+      existing.qty = (existing.qty || 0) + qty;
+    }
+    cards[item.cardId] = existing;
   }
 
   await collRef.set({ cards, updatedAt: new Date().toISOString() }, { merge: true });
@@ -159,6 +265,102 @@ async function addItemsToCollection(order) {
 
   await cbRef.set({ entries, updatedAt: new Date().toISOString() }, { merge: true });
   console.log(`Added ${items.length} item(s) to buyer ${order.buyerId} collection + cost basis`);
+
+}
+
+/**
+ * Remove sold items from seller's collection when order is shipped.
+ * Uses {qty, foil_qty} object format matching Flutter's collection structure.
+ */
+async function removeItemsFromSellerCollection(order) {
+  const items = order.items || [];
+  if (items.length === 0 || !order.sellerId) return;
+
+  // Look up card metadata to determine foil status
+  const pricesSnap = await db.collection("artifacts").doc(APP_ID).collection("market").get();
+  const cardMeta = {};
+  pricesSnap.docs.forEach(d => {
+    const data = d.data();
+    cardMeta[d.id] = {
+      rarity: (data.rarity || "").toLowerCase(),
+      setId: data.setId || "",
+      isPromo: !!(data.isPromo),
+    };
+  });
+
+  const sellerBase = db
+    .collection("artifacts").doc(APP_ID)
+    .collection("users").doc(order.sellerId)
+    .collection("data");
+  const sellerCollRef = sellerBase.doc("collection");
+  const sellerCollDoc = await sellerCollRef.get();
+  if (!sellerCollDoc.exists) return;
+
+  const sellerCards = sellerCollDoc.data().cards || {};
+  let changed = false;
+
+  for (const item of items) {
+    if (!item.cardId || sellerCards[item.cardId] === undefined) continue;
+    const qty = item.quantity || 1;
+
+    const meta = cardMeta[item.cardId] || {};
+    const isOGS = meta.setId === "OGS";
+    const foilOnly = !isOGS && (meta.isPromo || (meta.rarity !== "common" && meta.rarity !== "uncommon"));
+
+    const entry = (typeof sellerCards[item.cardId] === "object" && sellerCards[item.cardId] !== null)
+      ? sellerCards[item.cardId]
+      : { qty: sellerCards[item.cardId] || 0, foil_qty: 0 };
+
+    if (foilOnly) {
+      entry.foil_qty = Math.max(0, (entry.foil_qty || 0) - qty);
+    } else {
+      entry.qty = Math.max(0, (entry.qty || 0) - qty);
+    }
+
+    if ((entry.qty || 0) + (entry.foil_qty || 0) <= 0) {
+      delete sellerCards[item.cardId];
+    } else {
+      sellerCards[item.cardId] = entry;
+    }
+    changed = true;
+  }
+
+  if (changed) {
+    await sellerCollRef.set({ cards: sellerCards, updatedAt: new Date().toISOString() }, { merge: true });
+    console.log(`Removed ${items.length} item(s) from seller ${order.sellerId} collection`);
+  }
+}
+
+/**
+ * Finalize listing quantities after delivery confirmation.
+ * Reduces quantity and reservedQty by sold amount.
+ * Marks listing as 'sold' when quantity reaches 0.
+ */
+async function finalizeListingQuantities(items) {
+  const listingsCol = db.collection("artifacts").doc(APP_ID).collection("listings");
+  for (const item of items) {
+    if (!item.listingId) continue;
+    const listingRef = listingsCol.doc(item.listingId);
+    const listingDoc = await listingRef.get();
+    if (!listingDoc.exists) continue;
+
+    const qty = item.quantity || 1;
+    const data = listingDoc.data();
+    const newQty = Math.max(0, (data.quantity || 1) - qty);
+    const newReserved = Math.max(0, (data.reservedQty || 0) - qty);
+
+    if (newQty <= 0) {
+      await listingRef.update({ quantity: 0, reservedQty: 0, status: "sold" });
+    } else {
+      const updateData = { quantity: newQty, reservedQty: newReserved };
+      // If there's still available stock, re-activate
+      if (newQty > newReserved && data.status === "reserved") {
+        updateData.status = "active";
+      }
+      await listingRef.update(updateData);
+    }
+    console.log(`Listing ${item.listingId}: qty ${data.quantity} → ${newQty}, reserved ${data.reservedQty || 0} → ${newReserved}`);
+  }
 }
 
 /**
@@ -187,6 +389,83 @@ async function addStrike(sellerId, reason) {
 
   await sellerRef.update(updateData);
   console.log(`Strike added to seller ${sellerId}: ${reason} (now ${newStrikes}/3)`);
+}
+
+// ── Order Description Helper ──
+
+/**
+ * Build a short description from order items.
+ * "Flammenritter" or "Flammenritter + 2 more"
+ */
+function orderItemsSummary(items) {
+  if (!items || items.length === 0) return "your order";
+  const first = items[0].cardName || "Card";
+  const totalQty = items.reduce((sum, i) => sum + (i.quantity || 1), 0);
+  if (items.length === 1 && totalQty === 1) return first;
+  if (items.length === 1) return `${first} ×${totalQty}`;
+  const otherCount = items.length - 1;
+  return `${first} + ${otherCount} more`;
+}
+
+// ── Push Notification Helper ──
+
+/**
+ * Send a push notification to a user. Fire-and-forget — never throws.
+ * @param {string} uid - Target user's UID
+ * @param {string} title - Notification title
+ * @param {string} body - Notification body
+ * @param {Object} data - Optional data payload
+ */
+async function sendNotification(uid, title, body, data = {}) {
+  try {
+    const tokenDoc = await db
+      .collection("artifacts").doc(APP_ID)
+      .collection("users").doc(uid)
+      .collection("data").doc("fcmTokens")
+      .get();
+
+    if (!tokenDoc.exists) return;
+
+    const tokens = tokenDoc.data().tokens || {};
+    const tokenList = Object.keys(tokens);
+    if (tokenList.length === 0) return;
+
+    const staleTokens = [];
+
+    for (const token of tokenList) {
+      try {
+        await admin.messaging().send({
+          token,
+          notification: { title, body },
+          data,
+          android: { notification: { channelId: "order_updates" } },
+          apns: { payload: { aps: { sound: "default" } } },
+        });
+      } catch (err) {
+        if (
+          err.code === "messaging/registration-token-not-registered" ||
+          err.code === "messaging/invalid-registration-token" ||
+          err.code === "messaging/third-party-auth-error"
+        ) {
+          staleTokens.push(token);
+        } else {
+          console.error(`FCM send failed for ${uid}: ${err.message}`);
+        }
+      }
+    }
+
+    // Clean up stale tokens
+    if (staleTokens.length > 0) {
+      const deleteData = {};
+      for (const t of staleTokens) {
+        deleteData[`tokens.${t}`] = admin.firestore.FieldValue.delete();
+      }
+      await tokenDoc.ref.update(deleteData);
+      console.log(`Removed ${staleTokens.length} stale FCM token(s) for ${uid}`);
+    }
+  } catch (err) {
+    console.error(`sendNotification failed for ${uid}: ${err.message}`);
+  }
 }
 
 // ── Core update logic ──
@@ -221,8 +500,27 @@ async function updatePrices() {
     priceMap[pg.idProduct] = pg;
   }
 
-  const EXP_MAP = { 6286: "OGN", 6289: "OGS", 6399: "SFD", 6322: "OGNX", 6483: "SFDX" };
+  const EXP_MAP = {
+    6286: "OGN", 6289: "OGS", 6399: "SFD",
+    6322: "OGNX", 6483: "SFDX", 6480: "OGNX",
+    // TODO: UNL (Unleashed) — add idExpansion when available on Cardmarket
+    // TODO: OGSX (Proving Grounds Extras) — add idExpansion when available on Cardmarket
+  };
   const knownExps = new Set(Object.keys(EXP_MAP).map(Number));
+
+  // Debug: log all unique idExpansion + idCategory combos to discover Metal/new sets
+  const unknownCombos = {};
+  for (const p of catalogData.products) {
+    if (!knownExps.has(p.idExpansion) || p.idCategory !== 1655) {
+      const key = `exp:${p.idExpansion} cat:${p.idCategory}`;
+      if (!unknownCombos[key]) unknownCombos[key] = { count: 0, sample: p.name };
+      unknownCombos[key].count++;
+    }
+  }
+  if (Object.keys(unknownCombos).length > 0) {
+    console.log("Unknown expansion/category combos:", JSON.stringify(unknownCombos));
+  }
+
   const allSingles = catalogData.products.filter(
     (p) => p.idCategory === 1655 && knownExps.has(p.idExpansion)
   );
@@ -258,6 +556,7 @@ async function updatePrices() {
     // Track variant index within same rarity (for Flutter matching)
     const rarityIndexCounters = {};
 
+    let pricedIdx = 0;
     for (let idx = 0; idx < products.length; idx++) {
       const product = products[idx];
       const pg = priceMap[product.idProduct];
@@ -266,8 +565,9 @@ async function updatePrices() {
         continue;
       }
 
-      // Assign rarity: from variant list if available, else default to "Showcase"
-      const rarity = idx < variantList.length ? variantList[idx] : "Showcase";
+      // Assign rarity: from variant list based on priced-product index (skip unpriced gaps)
+      const rarity = pricedIdx < variantList.length ? variantList[pricedIdx] : "Showcase";
+      pricedIdx++;
       const rarityLower = rarity.toLowerCase();
 
       // Variant index: counts up within same rarity for same name+set
@@ -284,6 +584,10 @@ async function updatePrices() {
 
       const cmId = String(product.idProduct);
       const setId = EXP_MAP[product.idExpansion] || "";
+
+      if (groupKey === "Teemo, Scout|OGNX") {
+        console.log(`DEBUG TEEMO: cmId=${cmId} pricedIdx=${pricedIdx - 1} rarity=${rarity} vi=${variantIndex}`);
+      }
 
       // Standard variant based on rarity
       let primaryPrice, isPrimaryFoil;
@@ -372,7 +676,7 @@ async function updatePrices() {
       const primaryPrice = nonFoilPrice > 0 ? nonFoilPrice : foilPrice;
       if (primaryPrice > 0) {
         prices[cmId] = {
-          n: "Plated Legend: " + meta.name,
+          n: meta.name,
           p: round2(primaryPrice),
           pF: round2(foilPrice),
           pNf: round2(nonFoilPrice),
@@ -384,7 +688,7 @@ async function updatePrices() {
           tF: round2(pg["trend-foil"] || 0),
           tNf: round2(pg.trend || 0),
           c7F: 0, c7Nf: 0, c30F: 0, c30Nf: 0,
-          r: "Metal", s: "MTL", vi: 0, sp: "",
+          r: "Metal", s: meta.set, vi: 0, sp: "", metal: true,
         };
         const metalLowF = round2(pg["low-foil"] || 0);
         const metalLowNf = round2(pg.low || 0);
@@ -402,12 +706,33 @@ async function updatePrices() {
 
     // Not in price guide — preserve previous overview price if available
     if (prevPrices[cmId]) {
-      prices[cmId] = { ...prevPrices[cmId] };
+      prices[cmId] = { ...prevPrices[cmId], n: meta.name, s: meta.set, metal: true };
       // Keep sparkline + history growing via existing history doc
       metalMatched++;
     }
   }
   console.log(`Metal cards: ${metalMatched} of ${Object.keys(PLATED_LEGEND_IDS).length} preserved`);
+
+  // Fix: Cardmarket has prices swapped between SFD Common/Showcase Rune pairs.
+  // Swap all price values between each pair so Common gets cents and Showcase gets euros.
+  const SFD_RUNE_SWAP = {
+    "871893": "872478",  // Fury Rune Common ↔ Showcase
+    "871894": "872479",  // Calm Rune
+    "871895": "872480",  // Mind Rune
+    "871896": "872481",  // Body Rune
+    "871897": "872482",  // Chaos Rune
+    "871898": "872483",  // Order Rune
+  };
+  const priceFields = ["pF", "pNf", "p", "l30", "h30", "l30F", "l30Nf", "tF", "tNf", "c7", "c30", "c7F", "c7Nf", "c30F", "c30Nf", "sp"];
+  for (const [cmA, cmB] of Object.entries(SFD_RUNE_SWAP)) {
+    if (prices[cmA] && prices[cmB]) {
+      for (const f of priceFields) {
+        const tmp = prices[cmA][f];
+        prices[cmA][f] = prices[cmB][f];
+        prices[cmB][f] = tmp;
+      }
+    }
+  }
 
   // Write initial overview (c24 computed after history merge)
   await marketRef.doc("overview").set({
@@ -528,6 +853,15 @@ async function updatePrices() {
   }
 
   // Compute top movers (c24 now populated from stored history)
+  const allC24 = Object.values(prices).map(v => v.c24 || 0);
+  const pos = allC24.filter(c => c > 0).length;
+  const neg = allC24.filter(c => c < 0).length;
+  const zero = allC24.filter(c => c === 0).length;
+  console.log(`c24 stats: ${pos} positive, ${neg} negative, ${zero} zero (total ${allC24.length})`);
+  if (pos > 0) {
+    const topPos = Object.entries(prices).filter(([,v]) => (v.c24||0) > 0).sort((a,b) => b[1].c24 - a[1].c24).slice(0,3);
+    for (const [id, v] of topPos) console.log(`  TOP GAINER: ${v.n} c24=${v.c24}% p=${v.p} pF=${v.pF} pNf=${v.pNf}`);
+  }
   const entries = Object.entries(prices).filter(([, v]) => v.c24 !== 0);
   entries.sort((a, b) => b[1].c24 - a[1].c24);
 
@@ -763,6 +1097,203 @@ function getStripe() {
   return require("stripe")(STRIPE_SECRET);
 }
 
+// ═══════════════════════════════════════════
+// ─── Wallet Helper Functions ───
+// ═══════════════════════════════════════════
+
+/**
+ * Ensure a Stripe Customer exists for the given user.
+ * Creates one + initialises wallet/balance and trustLevel docs if needed.
+ * Returns the Stripe Customer ID.
+ */
+async function ensureStripeCustomer(uid) {
+  const stripeDoc = await db.doc(`artifacts/${APP_ID}/users/${uid}/data/stripe`).get();
+  if (stripeDoc.exists && stripeDoc.data().customerId) {
+    return stripeDoc.data().customerId;
+  }
+
+  // Fetch email from profile
+  const profileDoc = await db.doc(`artifacts/${APP_ID}/users/${uid}/data/profile`).get();
+  const email = profileDoc.exists ? (profileDoc.data().email || null) : null;
+
+  const stripe = getStripe();
+  const customer = await stripe.customers.create({
+    email,
+    metadata: { uid, platform: "riftr" },
+  });
+
+  await db.doc(`artifacts/${APP_ID}/users/${uid}/data/stripe`).set({
+    customerId: customer.id,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  // Initial wallet balance doc
+  const balDoc = db.doc(`artifacts/${APP_ID}/users/${uid}/wallet/balance`);
+  const balSnap = await balDoc.get();
+  if (!balSnap.exists) {
+    await balDoc.set({
+      amount: 0,
+      pendingEscrow: 0,
+      available: 0,
+      frozen: false,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  }
+
+  // Initial trust level doc
+  const trustDoc = db.doc(`artifacts/${APP_ID}/users/${uid}/data/trustLevel`);
+  const trustSnap = await trustDoc.get();
+  if (!trustSnap.exists) {
+    await trustDoc.set({
+      level: "new",
+      accountAge: 0,
+      completedPurchases: 0,
+      completedSales: 0,
+      activeStrikes: 0,
+      totalDisputes: 0,
+      lastDisputeAt: null,
+      flags: [],
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  }
+
+  console.log(`Stripe Customer ${customer.id} created for uid ${uid}`);
+  return customer.id;
+}
+
+/** Get existing Stripe Customer ID or throw. */
+async function getStripeCustomerId(uid) {
+  const doc = await db.doc(`artifacts/${APP_ID}/users/${uid}/data/stripe`).get();
+  if (!doc.exists || !doc.data().customerId) {
+    throw new HttpsError("failed-precondition", "No Stripe customer — call ensureStripeCustomer first");
+  }
+  return doc.data().customerId;
+}
+
+/** Get trust level document for a user. Returns defaults for missing docs. */
+async function getTrustLevel(uid) {
+  const doc = await db.doc(`artifacts/${APP_ID}/users/${uid}/data/trustLevel`).get();
+  if (!doc.exists) {
+    return { level: "new", accountAge: 0, completedPurchases: 0, completedSales: 0, activeStrikes: 0, totalDisputes: 0, flags: [] };
+  }
+  return doc.data();
+}
+
+/** Get total balance (positive cents) from Stripe customer.balance. */
+async function getBalance(uid) {
+  const customerId = await getStripeCustomerId(uid);
+  const stripe = getStripe();
+  const customer = await stripe.customers.retrieve(customerId);
+  // Stripe convention: negative balance = credit/funds available
+  return Math.abs(Math.min(customer.balance, 0));
+}
+
+/** Get available balance (total minus escrow minus pending payouts; 0 if frozen). */
+async function getAvailableBalance(uid) {
+  const balDoc = await db.doc(`artifacts/${APP_ID}/users/${uid}/wallet/balance`).get();
+  if (!balDoc.exists) return 0;
+  const data = balDoc.data();
+  if (data.frozen) return 0;
+  return data.available || 0;
+}
+
+/** Count today's top-up transactions for rate limiting. */
+async function countTodayTopUps(uid) {
+  const startOfDay = new Date();
+  startOfDay.setHours(0, 0, 0, 0);
+  const snap = await db.collection(`artifacts/${APP_ID}/users/${uid}/walletTransactions`)
+    .where("type", "==", "top_up")
+    .where("createdAt", ">=", startOfDay)
+    .get();
+  return snap.size;
+}
+
+/** Count purchases in the last hour for rate limiting. */
+async function countHourlyPurchases(uid) {
+  const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+  const snap = await db.collection(`artifacts/${APP_ID}/users/${uid}/walletTransactions`)
+    .where("type", "==", "purchase")
+    .where("createdAt", ">=", oneHourAgo)
+    .get();
+  return snap.size;
+}
+
+/** Sum today's payout amounts (in cents) for daily limit. */
+async function getTodayPayoutTotal(uid) {
+  const startOfDay = new Date();
+  startOfDay.setHours(0, 0, 0, 0);
+  const snap = await db.collection(`artifacts/${APP_ID}/users/${uid}/walletTransactions`)
+    .where("type", "==", "payout")
+    .where("createdAt", ">=", startOfDay)
+    .get();
+  let total = 0;
+  snap.forEach(doc => { total += Math.abs(doc.data().amount || 0); });
+  return total;
+}
+
+/** Log a wallet transaction and return the doc ref. */
+async function logTransaction(uid, type, amount, orderId, description, fee = 0, transferId = null, piId = null) {
+  const ref = db.collection(`artifacts/${APP_ID}/users/${uid}/walletTransactions`).doc();
+  await ref.set({
+    type,
+    amount,
+    orderId: orderId || null,
+    description: description || "",
+    platformFee: fee || 0,
+    stripePaymentIntentId: piId || null,
+    stripeTransferId: transferId || null,
+    status: "completed",
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+  return ref;
+}
+
+/**
+ * Recalculate and cache the user's wallet balance.
+ * Reads Stripe customer.balance, computes escrow and frozen state.
+ * Available = total - escrow (no hold periods).
+ */
+async function updateBalanceCache(uid) {
+  const stripe = getStripe();
+  const customerId = await getStripeCustomerId(uid);
+  const customer = await stripe.customers.retrieve(customerId);
+  // Stripe: negative = credit. Convert to positive cents for display.
+  const totalBalance = Math.abs(Math.min(customer.balance, 0));
+
+  // Escrow: open orders where this user is the seller
+  const pendingOrders = await db.collection(`artifacts/${APP_ID}/orders`)
+    .where("sellerId", "==", uid)
+    .where("status", "in", ["paid", "shipped"])
+    .where("paymentMethod", "==", "balance")
+    .get();
+  let pendingEscrow = 0;
+  pendingOrders.forEach(doc => {
+    pendingEscrow += Math.round((doc.data().sellerPayout || 0) * 100);
+  });
+
+  // Frozen state
+  const balDoc = await db.doc(`artifacts/${APP_ID}/users/${uid}/wallet/balance`).get();
+  const frozen = balDoc.exists ? (balDoc.data().frozen || false) : false;
+
+  const available = frozen ? 0 : Math.max(totalBalance - pendingEscrow, 0);
+
+  await db.doc(`artifacts/${APP_ID}/users/${uid}/wallet/balance`).set({
+    amount: totalBalance,
+    pendingEscrow,
+    available,
+    frozen,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  return { amount: totalBalance, pendingEscrow, available };
+}
+
+/** Send alert email to admin (fire-and-forget). */
+function sendAdminAlert(type, message) {
+  console.warn(`[ADMIN ALERT] [${type}] ${message}`);
+  // TODO: Send actual email via SendGrid/Mailgun in production
+}
+
 /**
  * createStripeAccount — Callable, authenticated.
  * Creates a Stripe Express connected account (or reuses existing) and
@@ -925,6 +1456,43 @@ exports.stripeWebhook = onRequest(
     // Handle PaymentIntent events for order status updates
     if (event.type === "payment_intent.succeeded") {
       const pi = event.data.object;
+
+      // ── Wallet Top-Up ──
+      if (pi.metadata?.type === "top_up" && pi.metadata?.uid) {
+        const topUpUid = pi.metadata.uid;
+        const topUpAmount = pi.amount;
+        try {
+          const customerId = pi.customer;
+          if (customerId) {
+            // Credit the customer balance (make more negative = more credit)
+            const cust = await stripe.customers.retrieve(customerId);
+            await stripe.customers.update(customerId, {
+              balance: cust.balance - topUpAmount,
+            });
+          }
+
+          // Transaction log — top-ups are always immediately available
+          const txRef = db.collection(`artifacts/${APP_ID}/users/${topUpUid}/walletTransactions`).doc();
+          await txRef.set({
+            type: "top_up",
+            amount: topUpAmount,
+            status: "completed",
+            stripePaymentIntentId: pi.id,
+            description: `Guthaben aufgeladen: €${(topUpAmount / 100).toFixed(2)}`,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+
+          await updateBalanceCache(topUpUid);
+
+          sendNotification(topUpUid, "Balance topped up!",
+            `€${(topUpAmount / 100).toFixed(2)} added to your balance.`);
+          console.log(`Top-up ${pi.id} succeeded: ${topUpUid} +€${(topUpAmount / 100).toFixed(2)}`);
+        } catch (err) {
+          console.error(`Top-up webhook error for ${pi.id}:`, err);
+        }
+      }
+
+      // ── Legacy Direct Pay (order with orderId in metadata) ──
       const orderId = pi.metadata?.orderId;
       if (orderId) {
         const orderRef = db.collection("artifacts").doc(APP_ID)
@@ -936,6 +1504,9 @@ exports.stripeWebhook = onRequest(
             paidAt: admin.firestore.FieldValue.serverTimestamp(),
           });
           console.log(`Order ${orderId} payment confirmed via webhook`);
+          const whOrder = orderDoc.data();
+          const whSummary = orderItemsSummary(whOrder.items);
+          sendNotification(whOrder.sellerId, "New order!", `${whSummary} — €${(whOrder.totalPaid || 0).toFixed(2)}. Ship within 7 days.`);
         }
       }
     }
@@ -970,6 +1541,98 @@ exports.stripeWebhook = onRequest(
           }
           console.log(`Order ${orderId} payment failed, cancelled`);
         }
+      }
+    }
+
+    // ── Chargeback: INSTANT account freeze ──
+    if (event.type === "charge.dispute.created") {
+      const dispute = event.data.object;
+      try {
+        const disputePi = dispute.payment_intent
+          ? await stripe.paymentIntents.retrieve(dispute.payment_intent)
+          : null;
+        const disputeUid = disputePi?.metadata?.uid;
+        if (disputeUid) {
+          // Suspend account
+          await db.doc(`artifacts/${APP_ID}/users/${disputeUid}/data/trustLevel`).update({
+            level: "suspended",
+            flags: admin.firestore.FieldValue.arrayUnion("chargeback_dispute"),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+
+          // Freeze balance
+          await db.doc(`artifacts/${APP_ID}/users/${disputeUid}/wallet/balance`).update({
+            available: 0,
+            frozen: true,
+            frozenReason: "chargeback_dispute",
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+
+          // Pause open orders (as buyer)
+          const openOrders = await db.collection("artifacts").doc(APP_ID)
+            .collection("orders")
+            .where("buyerId", "==", disputeUid)
+            .where("status", "in", ["paid", "shipped"])
+            .get();
+          for (const orderDoc of openOrders.docs) {
+            await orderDoc.ref.update({
+              status: "frozen",
+              frozenReason: "buyer_chargeback",
+            });
+            sendNotification(orderDoc.data().sellerId, "Order paused",
+              "An order has been temporarily paused. Please do not ship.");
+          }
+
+          sendAdminAlert("CHARGEBACK", `User ${disputeUid} chargeback. Account frozen.`);
+          console.log(`CHARGEBACK: User ${disputeUid} frozen (dispute ${dispute.id})`);
+        }
+      } catch (err) {
+        console.error("charge.dispute.created handler error:", err);
+      }
+    }
+
+    // ── Chargeback resolved ──
+    if (event.type === "charge.dispute.closed") {
+      const dispute = event.data.object;
+      try {
+        const disputePi = dispute.payment_intent
+          ? await stripe.paymentIntents.retrieve(dispute.payment_intent)
+          : null;
+        const disputeUid = disputePi?.metadata?.uid;
+        if (disputeUid) {
+          if (dispute.status === "won") {
+            // We won — unfreeze account
+            await db.doc(`artifacts/${APP_ID}/users/${disputeUid}/data/trustLevel`).update({
+              level: "established",
+              flags: admin.firestore.FieldValue.arrayRemove("chargeback_dispute"),
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+            await db.doc(`artifacts/${APP_ID}/users/${disputeUid}/wallet/balance`).update({
+              frozen: false,
+              frozenReason: null,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+            await updateBalanceCache(disputeUid);
+            console.log(`Chargeback WON for ${disputeUid}: account unfrozen`);
+          } else {
+            // We lost — keep suspended, deduct from balance
+            console.log(`Chargeback LOST for ${disputeUid}: account remains suspended`);
+            sendAdminAlert("CHARGEBACK_LOST", `User ${disputeUid} chargeback lost. Manual review needed.`);
+          }
+        }
+      } catch (err) {
+        console.error("charge.dispute.closed handler error:", err);
+      }
+    }
+
+    // ── Transfer completed (payout to seller bank) ──
+    if (event.type === "transfer.paid") {
+      const transfer = event.data.object;
+      const payoutUid = transfer.metadata?.uid;
+      if (payoutUid && transfer.metadata?.type === "payout") {
+        sendNotification(payoutUid, "Payout completed",
+          `€${(transfer.amount / 100).toFixed(2)} has arrived at your bank account.`);
+        console.log(`Transfer ${transfer.id} paid to ${payoutUid}`);
       }
     }
 
@@ -1028,6 +1691,10 @@ exports.confirmPayment = onCall(
       paidAt: admin.firestore.FieldValue.serverTimestamp(),
     });
     console.log(`Order ${orderId} payment confirmed via confirmPayment call`);
+
+    // Notify seller about new order
+    const cpSummary = orderItemsSummary(order.items);
+    sendNotification(order.sellerId, "New order!", `${cpSummary} — €${(order.totalPaid || 0).toFixed(2)}. Ship within 7 days.`);
 
     return { success: true };
   }
@@ -1200,7 +1867,7 @@ exports.createPaymentIntent = onCall(
     const effectiveMethod = anyInsuredOnly ? "insured" : shippingMethod;
     const shippingCost = round2(getShippingRate(sellerCountry, buyerCountry, effectiveMethod));
     const totalPaid = round2(subtotal + shippingCost);
-    const sellerPayout = round2(subtotal - platformFee);
+    const sellerPayout = round2(subtotal - platformFee + shippingCost);
 
     // Amounts in cents for Stripe
     const totalCents = Math.round(totalPaid * 100);
@@ -1220,13 +1887,16 @@ exports.createPaymentIntent = onCall(
       .collection("orders").doc();
     const orderId = orderRef.id;
 
-    // 7. Create Stripe PaymentIntent
+    // 7. Create Stripe PaymentIntent (with 3D Secure for liability shift)
     const paymentIntent = await stripe.paymentIntents.create({
       amount: totalCents,
       currency: "eur",
       capture_method: "manual",
       transfer_data: { destination: sellerStripeAccountId },
       application_fee_amount: feeCents,
+      payment_method_options: {
+        card: { request_three_d_secure: "challenge" },
+      },
       metadata: {
         orderId,
         buyerId: uid,
@@ -1253,6 +1923,7 @@ exports.createPaymentIntent = onCall(
       status: "pending_payment",
       sellerName: listingData[0].sellerName || null,
       buyerName,
+      preReleaseDate: listingData[0].preReleaseDate || null,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
@@ -1308,9 +1979,19 @@ exports.markShipped = onCall(
       throw new HttpsError("failed-precondition", `Order status is ${order.status}, expected paid`);
     }
 
-    // Capture the PaymentIntent (charge the buyer)
-    const stripe = getStripe();
-    await stripe.paymentIntents.capture(order.stripePaymentIntentId);
+    // Pre-release: block shipping before release date
+    if (order.preReleaseDate) {
+      const releaseDate = new Date(order.preReleaseDate + "T00:00:00Z");
+      if (releaseDate > new Date()) {
+        throw new HttpsError("failed-precondition", `Cannot ship before release date ${order.preReleaseDate}`);
+      }
+    }
+
+    // Capture the PaymentIntent (only for Stripe-paid orders, not balance purchases)
+    if (order.paymentMethod !== "balance" && order.stripePaymentIntentId) {
+      const stripe = getStripe();
+      await stripe.paymentIntents.capture(order.stripePaymentIntentId);
+    }
 
     // Update order
     const autoReleaseAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
@@ -1321,7 +2002,71 @@ exports.markShipped = onCall(
       autoReleaseAt: autoReleaseAt.toISOString(),
     });
 
-    console.log(`Order ${orderId} shipped (tracking: ${trackingNumber || "none"})`);
+    // 1. Calculate realized gains BEFORE removing from collection (needs cost basis)
+    const { totalRealizedGain } = await calculateRealizedGains(order.sellerId, order.items || []);
+
+    // Store realized gain on order doc for potential dispute/storno reversal
+    if (totalRealizedGain !== 0) {
+      await orderRef.update({ realizedGainOnShip: totalRealizedGain });
+    }
+
+    // 2. Remove sold items from seller's collection
+    await removeItemsFromSellerCollection(order);
+
+    console.log(`Order ${orderId} shipped (tracking: ${trackingNumber || "none"}, realizedGain: €${totalRealizedGain.toFixed(2)})`);
+
+    // Notify buyer that order shipped
+    const shipSummary = orderItemsSummary(order.items);
+    sendNotification(order.buyerId, "Order shipped!", `${shipSummary} is on its way.${trackingNumber ? " Tracking: " + trackingNumber : ""}`);
+
+    return { success: true };
+  }
+);
+
+// ── Update Tracking Number ──
+
+exports.updateTrackingNumber = onCall(
+  { region: "europe-west1", timeoutSeconds: 10 },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Must be signed in");
+    }
+
+    const uid = request.auth.uid;
+    const { orderId, trackingNumber } = request.data;
+
+    if (!orderId) {
+      throw new HttpsError("invalid-argument", "orderId is required");
+    }
+
+    const orderRef = db.collection("artifacts").doc(APP_ID)
+      .collection("orders").doc(orderId);
+    const orderDoc = await orderRef.get();
+    if (!orderDoc.exists) {
+      throw new HttpsError("not-found", "Order not found");
+    }
+
+    const order = orderDoc.data();
+    if (order.sellerId !== uid) {
+      throw new HttpsError("permission-denied", "Only the seller can update tracking");
+    }
+
+    const blocked = ["delivered", "autoCompleted", "refunded", "cancelled"];
+    if (blocked.includes(order.status)) {
+      throw new HttpsError("failed-precondition", "Cannot update tracking on a completed order");
+    }
+
+    await orderRef.update({
+      trackingNumber: trackingNumber || null,
+    });
+
+    // Notify buyer
+    if (trackingNumber) {
+      const summary = orderItemsSummary(order.items);
+      sendNotification(order.buyerId, "Tracking updated", `${summary} — Tracking: ${trackingNumber}`);
+    }
+
+    console.log(`Order ${orderId} tracking updated: ${trackingNumber || "removed"}`);
     return { success: true };
   }
 );
@@ -1331,7 +2076,7 @@ exports.markShipped = onCall(
  * Buyer confirms receipt. Finalizes order.
  */
 exports.confirmDelivery = onCall(
-  { region: "europe-west1", timeoutSeconds: 15 },
+  { region: "europe-west1", timeoutSeconds: 30, secrets: ["STRIPE_SECRET_KEY"] },
   async (request) => {
     if (!request.auth) {
       throw new HttpsError("unauthenticated", "Must be signed in");
@@ -1365,23 +2110,43 @@ exports.confirmDelivery = onCall(
       deliveredAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
-    // Increment seller stats
-    const totalQty = (order.items || []).reduce((sum, item) => sum + (item.quantity || 1), 0);
-    const sellerRef = db.collection("artifacts").doc(APP_ID)
-      .collection("users").doc(order.sellerId)
-      .collection("data").doc("sellerProfile");
-    await sellerRef.update({
-      totalSales: admin.firestore.FieldValue.increment(totalQty),
-      totalRevenue: admin.firestore.FieldValue.increment(order.sellerPayout || 0),
-    });
+    // All post-status operations: if any fail, order stays delivered
+    // but we log the error and still return success to the buyer
+    try {
+      // Increment seller stats (set+merge so doc is created if missing)
+      const totalQty = (order.items || []).reduce((sum, item) => sum + (item.quantity || 1), 0);
+      const sellerRef = db.collection("artifacts").doc(APP_ID)
+        .collection("users").doc(order.sellerId)
+        .collection("data").doc("sellerProfile");
+      await sellerRef.set({
+        totalSales: admin.firestore.FieldValue.increment(totalQty),
+        totalRevenue: admin.firestore.FieldValue.increment(order.sellerPayout || 0),
+      }, { merge: true });
 
-    // Record sale prices for analytics
-    await recordSales(order, orderId);
+      // Record sale prices for analytics
+      await recordSales(order, orderId);
 
-    // Add purchased cards to buyer's collection
-    await addItemsToCollection(order);
+      // Realized gains already calculated in markShipped — no need here
 
-    console.log(`Order ${orderId} delivered, seller ${order.sellerId} stats updated`);
+      // Add purchased cards to buyer's collection
+      await addItemsToCollection(order);
+
+      // Reduce listing quantities (mark sold if 0)
+      await finalizeListingQuantities(order.items || []);
+
+      // Recalculate seller balance (moves funds out of escrow → available)
+      await updateBalanceCache(order.sellerId);
+
+      console.log(`Order ${orderId} delivered, seller ${order.sellerId} stats updated, balance cache refreshed`);
+
+      // Notify seller that delivery confirmed
+      const delSummary = orderItemsSummary(order.items);
+      sendNotification(order.sellerId, "Delivery confirmed!", `${delSummary} — €${(order.sellerPayout || 0).toFixed(2)} released.`);
+    } catch (postErr) {
+      console.error(`confirmDelivery post-status error for ${orderId}:`, postErr);
+      // Don't throw — order IS delivered, buyer should see success
+    }
+
     return { success: true };
   }
 );
@@ -1398,7 +2163,7 @@ exports.openDispute = onCall(
     }
 
     const uid = request.auth.uid;
-    const { orderId, reason } = request.data;
+    const { orderId, reason, description } = request.data;
 
     if (!orderId || !reason) {
       throw new HttpsError("invalid-argument", "orderId and reason are required");
@@ -1429,14 +2194,23 @@ exports.openDispute = onCall(
       throw new HttpsError("failed-precondition", `Order status is ${order.status}, expected shipped`);
     }
 
+    const safeDesc = typeof description === "string" ? description.trim().substring(0, 500) : null;
+
     await orderRef.update({
       status: "disputed",
+      disputeStatus: "open",
       disputeReason: reason,
+      ...(safeDesc ? { disputeDescription: safeDesc } : {}),
       disputedAt: admin.firestore.FieldValue.serverTimestamp(),
       autoReleaseAt: null, // Pause auto-release
     });
 
-    console.log(`Dispute opened on order ${orderId}: ${reason}`);
+    console.log(`Dispute opened on order ${orderId}: ${reason}${safeDesc ? ` — ${safeDesc}` : ""}`);
+
+    // Notify seller about dispute
+    const dispSummary = orderItemsSummary(order.items);
+    sendNotification(order.sellerId, "Dispute opened", `${dispSummary}: ${reason}`);
+
     return { success: true };
   }
 );
@@ -1474,15 +2248,41 @@ exports.cancelOrder = onCall(
       throw new HttpsError("failed-precondition", "Order cannot be cancelled after shipping");
     }
 
-    const stripe = getStripe();
-    const piId = order.stripePaymentIntentId;
+    const isBalanceOrder = order.paymentMethod === "balance";
 
-    if (order.status === "paid") {
-      // Already authorized/captured — issue refund
-      await stripe.refunds.create({ payment_intent: piId });
+    if (isBalanceOrder) {
+      // Balance order: refund buyer's wallet, deduct from seller's wallet
+      const stripe = getStripe();
+      const totalCents = Math.round((order.totalPaid || 0) * 100);
+      const sellerPayoutCents = Math.round((order.sellerPayout || 0) * 100);
+
+      // Refund buyer (add credit back)
+      const buyerCustId = await getStripeCustomerId(order.buyerId);
+      const buyerCust = await stripe.customers.retrieve(buyerCustId);
+      await stripe.customers.update(buyerCustId, {
+        balance: buyerCust.balance - totalCents,
+      });
+
+      // Deduct from seller (remove credit)
+      const sellerCustId = await getStripeCustomerId(order.sellerId);
+      const sellerCust = await stripe.customers.retrieve(sellerCustId);
+      await stripe.customers.update(sellerCustId, {
+        balance: sellerCust.balance + sellerPayoutCents,
+      });
+
+      // Log transactions
+      await logTransaction(order.buyerId, "refund", totalCents, orderId, "Order cancelled — refund");
+      await logTransaction(order.sellerId, "reversal", -sellerPayoutCents, orderId, "Order cancelled — reversal");
     } else {
-      // Still pending — cancel PI
-      await stripe.paymentIntents.cancel(piId);
+      // Card order: Stripe refund/cancel
+      const stripe = getStripe();
+      const piId = order.stripePaymentIntentId;
+
+      if (order.status === "paid") {
+        await stripe.refunds.create({ payment_intent: piId });
+      } else {
+        await stripe.paymentIntents.cancel(piId);
+      }
     }
 
     // Update order
@@ -1509,7 +2309,285 @@ exports.cancelOrder = onCall(
       }
     }
 
+    // Update balance caches for balance orders
+    if (isBalanceOrder) {
+      await updateBalanceCache(order.buyerId);
+      await updateBalanceCache(order.sellerId);
+    }
+
     console.log(`Order ${orderId} cancelled by ${uid}`);
+
+    // Notify the other party
+    const otherUid = uid === order.buyerId ? order.sellerId : order.buyerId;
+    const cancelSummary = orderItemsSummary(order.items);
+    sendNotification(otherUid, "Order cancelled", `${cancelSummary} — refunded.`);
+
+    return { success: true };
+  }
+);
+
+/**
+ * proposeRefund — Callable, seller only.
+ * Seller proposes a partial or full refund (10-100%) for a disputed order.
+ */
+exports.proposeRefund = onCall(
+  { region: "europe-west1", timeoutSeconds: 15 },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Must be signed in");
+    }
+
+    const uid = request.auth.uid;
+    const { orderId, refundPercent } = request.data;
+
+    if (!orderId || refundPercent == null) {
+      throw new HttpsError("invalid-argument", "orderId and refundPercent are required");
+    }
+
+    const percent = Math.round(Number(refundPercent));
+    if (percent < 10 || percent > 100) {
+      throw new HttpsError("invalid-argument", "refundPercent must be 10-100");
+    }
+
+    const orderRef = db.collection("artifacts").doc(APP_ID)
+      .collection("orders").doc(orderId);
+    const orderDoc = await orderRef.get();
+    if (!orderDoc.exists) {
+      throw new HttpsError("not-found", "Order not found");
+    }
+
+    const order = orderDoc.data();
+    if (order.sellerId !== uid) {
+      throw new HttpsError("permission-denied", "Only the seller can propose a refund");
+    }
+    if (order.status !== "disputed") {
+      throw new HttpsError("failed-precondition", `Order status is ${order.status}, expected disputed`);
+    }
+    if (order.disputeStatus && order.disputeStatus !== "open") {
+      throw new HttpsError("failed-precondition", `Dispute status is ${order.disputeStatus}, expected open`);
+    }
+
+    const refundAmount = Math.round(order.totalPaid * percent) / 100;
+
+    await orderRef.update({
+      disputeStatus: "sellerProposed",
+      proposedRefundPercent: percent,
+      proposedRefundAmount: refundAmount,
+      proposedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    console.log(`Seller ${uid} proposed ${percent}% refund (€${refundAmount.toFixed(2)}) on order ${orderId}`);
+
+    const summary = orderItemsSummary(order.items);
+    sendNotification(order.buyerId, "Refund proposed", `${summary}: ${percent}% refund (€${refundAmount.toFixed(2)}) — review and accept or reject.`);
+
+    return { success: true, refundPercent: percent, refundAmount };
+  }
+);
+
+/**
+ * respondToRefund — Callable, buyer only.
+ * Buyer accepts or rejects the seller's refund proposal.
+ */
+exports.respondToRefund = onCall(
+  { region: "europe-west1", timeoutSeconds: 30, secrets: ["STRIPE_SECRET_KEY"] },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Must be signed in");
+    }
+
+    const uid = request.auth.uid;
+    const { orderId, accept } = request.data;
+
+    if (!orderId || accept == null) {
+      throw new HttpsError("invalid-argument", "orderId and accept are required");
+    }
+
+    const orderRef = db.collection("artifacts").doc(APP_ID)
+      .collection("orders").doc(orderId);
+    const orderDoc = await orderRef.get();
+    if (!orderDoc.exists) {
+      throw new HttpsError("not-found", "Order not found");
+    }
+
+    const order = orderDoc.data();
+    if (order.buyerId !== uid) {
+      throw new HttpsError("permission-denied", "Only the buyer can respond to a refund proposal");
+    }
+    if (order.status !== "disputed") {
+      throw new HttpsError("failed-precondition", `Order status is ${order.status}, expected disputed`);
+    }
+    if (order.disputeStatus !== "sellerProposed") {
+      throw new HttpsError("failed-precondition", `No pending proposal (status: ${order.disputeStatus})`);
+    }
+
+    const summary = orderItemsSummary(order.items);
+
+    if (accept) {
+      // WALLET REFUND: Transfer balance from seller → buyer (no Stripe refund API)
+      const stripe = getStripe();
+      const refundAmount = order.proposedRefundAmount || 0;
+      const refundPercent = order.proposedRefundPercent || 100;
+      const refundCents = Math.round(refundAmount * 100);
+
+      const isBalanceOrder = order.paymentMethod === "balance";
+
+      if (isBalanceOrder) {
+        // ── Balance-paid order: transfer via Stripe Customer Balance ──
+        const buyerCustomerId = await ensureStripeCustomer(order.buyerId);
+        const sellerCustomerId = await ensureStripeCustomer(order.sellerId);
+
+        // Credit buyer balance (make more negative = more credit)
+        const buyerCust = await stripe.customers.retrieve(buyerCustomerId);
+        await stripe.customers.update(buyerCustomerId, {
+          balance: buyerCust.balance - refundCents,
+        });
+
+        // Debit seller balance (make less negative = less credit; can go positive = debt)
+        const sellerCust = await stripe.customers.retrieve(sellerCustomerId);
+        await stripe.customers.update(sellerCustomerId, {
+          balance: sellerCust.balance + refundCents,
+        });
+
+        // Log transactions
+        await logTransaction(order.buyerId, "refund", refundCents, orderId,
+          `Erstattung: ${refundPercent}% von ${summary}`);
+        await logTransaction(order.sellerId, "refund", -refundCents, orderId,
+          `Erstattung an Käufer: ${refundPercent}% von ${summary}`);
+
+        // Update balance caches
+        await updateBalanceCache(order.buyerId);
+        await updateBalanceCache(order.sellerId);
+      } else {
+        // ── Legacy direct-pay order: use Stripe refund API ──
+        const piId = order.stripePaymentIntentId;
+        if (!piId) {
+          throw new HttpsError("failed-precondition", "No payment intent found");
+        }
+        if (refundPercent >= 100) {
+          await stripe.refunds.create({ payment_intent: piId });
+        } else {
+          await stripe.refunds.create({ payment_intent: piId, amount: refundCents });
+        }
+      }
+
+      // Update order
+      await orderRef.update({
+        status: "refunded",
+        disputeStatus: "resolved",
+        resolvedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      // Release listing reservation
+      for (const item of (order.items || [])) {
+        if (item.listingId) {
+          const listingRef = db.collection("artifacts").doc(APP_ID)
+            .collection("listings").doc(item.listingId);
+          const listingDoc = await listingRef.get();
+          if (listingDoc.exists) {
+            const listing = listingDoc.data();
+            const newReserved = Math.max(0, (listing.reservedQty || 0) - (item.quantity || 1));
+            const updateData = { reservedQty: newReserved };
+            if (listing.status === "reserved") {
+              updateData.status = "active";
+            }
+            await listingRef.update(updateData);
+          }
+        }
+      }
+
+      // Reverse realized gains proportionally to refund percent
+      const gainOnRecord = order.realizedGainOnShip || order.realizedGainOnDelivery || 0;
+      if (gainOnRecord && order.sellerId) {
+        const reversalAmount = gainOnRecord * (refundPercent / 100);
+        const sellerProfileRef = db.collection("artifacts").doc(APP_ID)
+          .collection("users").doc(order.sellerId).collection("data").doc("profile");
+        await sellerProfileRef.set({
+          realizedGains: admin.firestore.FieldValue.increment(-reversalAmount),
+        }, { merge: true });
+        console.log(`Reversed realized gains for seller ${order.sellerId}: -€${reversalAmount.toFixed(2)} (${refundPercent}% of ${gainOnRecord.toFixed(2)})`);
+      }
+
+      // Strike seller only for significant refunds (>50%)
+      if (refundPercent > 50) {
+        await addStrike(order.sellerId, `Dispute refund ${refundPercent}% on order ${orderId}`);
+      }
+
+      console.log(`Refund accepted: ${refundPercent}% (€${refundAmount.toFixed(2)}) on order ${orderId} [${isBalanceOrder ? "balance" : "stripe"}]`);
+      sendNotification(order.sellerId, "Refund accepted", `${summary}: €${refundAmount.toFixed(2)} refunded to buyer.`);
+
+      return { success: true, action: "refunded", refundAmount };
+    } else {
+      // Reject — reset to open so seller can propose again
+      await orderRef.update({
+        disputeStatus: "open",
+        proposedRefundPercent: null,
+        proposedRefundAmount: null,
+        proposedAt: null,
+      });
+
+      console.log(`Refund rejected by buyer on order ${orderId}`);
+      sendNotification(order.sellerId, "Refund rejected", `${summary}: Buyer rejected your proposal. Propose a different amount.`);
+
+      return { success: true, action: "rejected" };
+    }
+  }
+);
+
+/**
+ * cancelDispute — Callable, buyer only.
+ * Buyer withdraws the dispute, returning order to shipped status.
+ */
+exports.cancelDispute = onCall(
+  { region: "europe-west1", timeoutSeconds: 30, secrets: ["STRIPE_SECRET_KEY"] },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Must be signed in");
+    }
+
+    const uid = request.auth.uid;
+    const { orderId } = request.data;
+
+    if (!orderId) {
+      throw new HttpsError("invalid-argument", "orderId is required");
+    }
+
+    const orderRef = db.collection("artifacts").doc(APP_ID)
+      .collection("orders").doc(orderId);
+    const orderDoc = await orderRef.get();
+    if (!orderDoc.exists) {
+      throw new HttpsError("not-found", "Order not found");
+    }
+
+    const order = orderDoc.data();
+    if (order.buyerId !== uid) {
+      throw new HttpsError("permission-denied", "Only the buyer can cancel a dispute");
+    }
+    if (order.status !== "disputed") {
+      throw new HttpsError("failed-precondition", `Order status is ${order.status}, expected disputed`);
+    }
+
+    // Reset to shipped with fresh 7-day auto-release
+    const autoRelease = new Date();
+    autoRelease.setDate(autoRelease.getDate() + 7);
+
+    await orderRef.update({
+      status: "shipped",
+      disputeStatus: "cancelled",
+      autoReleaseAt: autoRelease.toISOString(),
+      proposedRefundPercent: null,
+      proposedRefundAmount: null,
+      proposedAt: null,
+    });
+
+    // Recalculate seller balance (order is back in escrow as "shipped")
+    await updateBalanceCache(order.sellerId);
+
+    console.log(`Dispute cancelled by buyer on order ${orderId}`);
+
+    const summary = orderItemsSummary(order.items);
+    sendNotification(order.sellerId, "Dispute cancelled", `${summary}: Buyer withdrew the dispute.`);
+
     return { success: true };
   }
 );
@@ -1524,6 +2602,7 @@ exports.autoReleaseOrders = onSchedule(
     timeZone: "Europe/Berlin",
     timeoutSeconds: 120,
     region: "europe-west1",
+    secrets: ["STRIPE_SECRET_KEY"],
   },
   async () => {
     const now = new Date().toISOString();
@@ -1546,73 +2625,834 @@ exports.autoReleaseOrders = onSchedule(
         deliveredAt: admin.firestore.FieldValue.serverTimestamp(),
       });
 
-      // Update seller stats
+      // Update seller stats (set+merge so doc is created if missing)
       const totalQty = (order.items || []).reduce((sum, item) => sum + (item.quantity || 1), 0);
       const sellerRef = db.collection("artifacts").doc(APP_ID)
         .collection("users").doc(order.sellerId)
         .collection("data").doc("sellerProfile");
-      await sellerRef.update({
+      await sellerRef.set({
         totalSales: admin.firestore.FieldValue.increment(totalQty),
         totalRevenue: admin.firestore.FieldValue.increment(order.sellerPayout || 0),
-      });
+      }, { merge: true });
 
       // Record sale prices for analytics
       await recordSales(order, doc.id);
 
+      // Realized gains already calculated in markShipped — no need here
+
       // Add purchased cards to buyer's collection
       await addItemsToCollection(order);
+
+      // Reduce listing quantities (mark sold if 0)
+      await finalizeListingQuantities(order.items || []);
+
+      // Recalculate seller balance (escrow → available)
+      await updateBalanceCache(order.sellerId);
+
+      // Notify buyer about auto-completion
+      sendNotification(order.buyerId, "Order auto-completed", "Your order was automatically completed.");
     }
 
     console.log(`autoReleaseOrders: completed ${snap.size} orders`);
 
-    // ── Auto-cancel overdue unshipped orders (7 days after payment) ──
-    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-    const overdueSnap = await ordersRef
+    // ── Day 5 Reminder: nudge sellers about unshipped orders ──
+    const fiveDaysAgo = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString();
+    const fourDaysAgo = new Date(Date.now() - 4 * 24 * 60 * 60 * 1000).toISOString();
+    const reminderSnap = await ordersRef
       .where("status", "==", "paid")
-      .where("paidAt", "<=", sevenDaysAgo)
+      .where("paidAt", ">=", fiveDaysAgo)
+      .where("paidAt", "<=", fourDaysAgo)
       .get();
 
-    for (const doc of overdueSnap.docs) {
+    for (const doc of reminderSnap.docs) {
       const order = doc.data();
-
-      // Cancel the order + refund
-      try {
-        const Stripe = require("stripe");
-        const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
-        if (order.stripePaymentIntentId) {
-          await stripe.refunds.create({ payment_intent: order.stripePaymentIntentId });
-        }
-      } catch (e) {
-        console.error(`Auto-cancel refund failed for ${doc.id}: ${e.message}`);
-      }
-
-      await doc.ref.update({
-        status: "cancelled",
-        cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-
-      // Release listing reservations
-      for (const item of (order.items || [])) {
-        if (item.listingId) {
-          const listingRef = db.collection("artifacts").doc(APP_ID)
-            .collection("listings").doc(item.listingId);
-          const listingDoc = await listingRef.get();
-          if (listingDoc.exists) {
-            const listing = listingDoc.data();
-            const newReserved = Math.max(0, (listing.reservedQty || 0) - (item.quantity || 1));
-            const updateData = { reservedQty: newReserved };
-            if (listing.status === "reserved") updateData.status = "active";
-            await listingRef.update(updateData);
-          }
-        }
-      }
-
-      // Add strike to seller for non-shipment
-      await addStrike(order.sellerId, "Non-shipment: order " + doc.id);
+      // Skip pre-release orders — reminders start after release date
+      if (order.preReleaseDate && new Date(order.preReleaseDate) > new Date()) continue;
+      sendNotification(order.sellerId, "Shipping reminder", "You have an unshipped order. Please ship soon.");
     }
 
-    if (!overdueSnap.empty) {
-      console.log(`autoReleaseOrders: auto-cancelled ${overdueSnap.size} overdue orders`);
+    if (!reminderSnap.empty) {
+      console.log(`autoReleaseOrders: sent ${reminderSnap.size} shipping reminder(s)`);
+    }
+
+    // ── Pre-Release: Release-day notifications ──
+    const todayStr = new Date().toISOString().substring(0, 10);
+    const preReleaseSnap = await ordersRef
+      .where("status", "==", "paid")
+      .where("preReleaseDate", "==", todayStr)
+      .get();
+
+    for (const doc of preReleaseSnap.docs) {
+      const order = doc.data();
+      sendNotification(order.sellerId, "Set released! 🎉", "Your pre-order is ready to ship. Please send it within 5 days.");
+      sendNotification(order.buyerId, "Set released! 🎉", "Your pre-order will be shipped soon.");
+    }
+    if (!preReleaseSnap.empty) {
+      console.log(`autoReleaseOrders: sent ${preReleaseSnap.size} release-day notification(s)`);
+    }
+
+  }
+);
+
+// ── Submit Review ──
+exports.submitReview = onCall(
+  { region: "europe-west1", timeoutSeconds: 15 },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) throw new HttpsError("unauthenticated", "Login required");
+
+    const { orderId, rating, comment, tags } = request.data;
+    if (!orderId) throw new HttpsError("invalid-argument", "orderId required");
+    if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+      throw new HttpsError("invalid-argument", "Rating must be 1-5");
+    }
+
+    // Validate tags — only allow predefined values
+    const allowedTags = ["Schneller Versand", "Wie beschrieben", "Gut verpackt", "Gute Kommunikation"];
+    const safeTags = Array.isArray(tags) ? tags.filter(t => allowedTags.includes(t)) : [];
+
+    const orderRef = db.collection("artifacts").doc(APP_ID).collection("orders").doc(orderId);
+    const orderDoc = await orderRef.get();
+    if (!orderDoc.exists) throw new HttpsError("not-found", "Order not found");
+
+    const order = orderDoc.data();
+    if (order.buyerId !== uid) throw new HttpsError("permission-denied", "Only buyer can rate");
+    if (order.status !== "delivered" && order.status !== "auto_completed") {
+      throw new HttpsError("failed-precondition", "Order not completed");
+    }
+    if (order.buyerRating) throw new HttpsError("already-exists", "Already rated");
+
+    // Trim and cap comment
+    const safeComment = (comment || "").trim().substring(0, 300);
+
+    // Write rating to order
+    await orderRef.update({
+      buyerRating: rating,
+      buyerComment: safeComment || null,
+      buyerTags: safeTags.length > 0 ? safeTags : null,
+      buyerRatingTimestamp: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    // Recalculate seller average: query all rated orders for this seller
+    const ratedSnap = await db.collection("artifacts").doc(APP_ID).collection("orders")
+      .where("sellerId", "==", order.sellerId)
+      .where("buyerRating", ">", 0)
+      .get();
+
+    let totalRating = 0;
+    let count = 0;
+    for (const doc of ratedSnap.docs) {
+      const r = doc.data().buyerRating;
+      if (r && r > 0) { totalRating += r; count++; }
+    }
+    // Include current rating (serverTimestamp may not be indexed yet)
+    if (!ratedSnap.docs.find(d => d.id === orderId)) {
+      totalRating += rating;
+      count++;
+    }
+
+    const avgRating = count > 0 ? Math.round((totalRating / count) * 10) / 10 : 0;
+
+    // Update seller profile
+    const sellerRef = db.collection("artifacts").doc(APP_ID)
+      .collection("users").doc(order.sellerId)
+      .collection("data").doc("sellerProfile");
+    await sellerRef.update({ rating: avgRating, reviewCount: count });
+
+    // Copy review to public reviews subcollection (no order/address data)
+    const buyerProfile = await db.collection("artifacts").doc(APP_ID)
+      .collection("users").doc(uid)
+      .collection("data").doc("profile").get();
+    const reviewerName = buyerProfile.exists
+      ? (buyerProfile.data().displayName || buyerProfile.data().username || "Buyer")
+      : "Buyer";
+
+    await db.collection("artifacts").doc(APP_ID)
+      .collection("users").doc(order.sellerId)
+      .collection("reviews").doc(orderId)
+      .set({
+        reviewerName,
+        rating,
+        comment: safeComment || null,
+        tags: safeTags.length > 0 ? safeTags : null,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+    // Notify seller
+    const stars = "★".repeat(rating) + "☆".repeat(5 - rating);
+    sendNotification(order.sellerId, "New review: " + stars, safeComment || "You received a rating.");
+
+    return { success: true, avgRating, reviewCount: count };
+  }
+);
+
+// ═══════════════════════════════════════════
+// ─── Wallet: Top-Up Balance ───
+// ═══════════════════════════════════════════
+
+/**
+ * topUpBalance — Callable, authenticated.
+ * Creates a Stripe PaymentIntent for wallet top-up.
+ * 3D Secure enforced on all card payments (liability shift).
+ * Returns { clientSecret } for the Flutter PaymentSheet.
+ */
+exports.topUpBalance = onCall(
+  { region: "europe-west1", timeoutSeconds: 30, secrets: ["STRIPE_SECRET_KEY"] },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Must be signed in");
+    }
+
+    const uid = request.auth.uid;
+    const { amount } = request.data; // Amount in cents
+
+    if (!amount || !Number.isInteger(amount)) {
+      throw new HttpsError("invalid-argument", "amount (integer cents) is required");
+    }
+
+    try {
+      // Suspended check
+      const trust = await getTrustLevel(uid);
+      if (trust.level === "suspended") {
+        throw new HttpsError("permission-denied", "Account suspended");
+      }
+      // Same limits for all accounts: €5 – €500
+      if (amount < 500) {
+        throw new HttpsError("invalid-argument", "Minimum top-up: €5");
+      }
+      if (amount > 50000) {
+        throw new HttpsError("invalid-argument", "Maximum top-up: €500");
+      }
+
+      // Rate limit: max 5 top-ups per day (all accounts)
+      const todayCount = await countTodayTopUps(uid);
+      if (todayCount >= 5) {
+        throw new HttpsError("resource-exhausted", "Daily top-up limit reached");
+      }
+
+      // Ensure Stripe Customer
+      const customerId = await ensureStripeCustomer(uid);
+      const stripe = getStripe();
+
+      // Create PaymentIntent with 3D Secure enforced
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount,
+        currency: "eur",
+        customer: customerId,
+        payment_method_options: {
+          card: { request_three_d_secure: "challenge" },
+        },
+        metadata: {
+          type: "top_up",
+          uid,
+        },
+      });
+
+      console.log(`Top-up PI ${paymentIntent.id} created for ${uid}: €${(amount / 100).toFixed(2)}`);
+      return { clientSecret: paymentIntent.client_secret };
+    } catch (e) {
+      if (e instanceof HttpsError) throw e;
+      console.error("topUpBalance unexpected error:", e);
+      throw new HttpsError("internal", e.message || "Top-up failed");
     }
   }
 );
+
+// ═══════════════════════════════════════════
+// ─── Wallet: Purchase with Balance ───
+// ═══════════════════════════════════════════
+
+/**
+ * purchaseWithBalance — Callable, authenticated.
+ * Deducts from buyer's Stripe Customer Balance, credits seller.
+ * No Stripe PaymentIntent — pure balance transfer.
+ * Supports single listing or cart mode.
+ */
+exports.purchaseWithBalance = onCall(
+  { region: "europe-west1", timeoutSeconds: 30, secrets: ["STRIPE_SECRET_KEY"] },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Must be signed in");
+    }
+
+    const uid = request.auth.uid;
+    const { listingId, quantity, items, shippingMethod, shippingAddress } = request.data;
+
+    const isCart = Array.isArray(items) && items.length > 0;
+    if (!isCart && (!listingId || !quantity)) {
+      throw new HttpsError("invalid-argument", "Missing required fields");
+    }
+    if (!shippingMethod || !shippingAddress) {
+      throw new HttpsError("invalid-argument", "Missing shipping info");
+    }
+
+    // Suspended check
+    const trust = await getTrustLevel(uid);
+    if (trust.level === "suspended") {
+      throw new HttpsError("permission-denied", "Account suspended");
+    }
+
+    // Rate limit: 50 purchases per hour (all accounts)
+    const hourlyCount = await countHourlyPurchases(uid);
+    if (hourlyCount >= 50) {
+      throw new HttpsError("resource-exhausted", "Hourly purchase limit reached");
+    }
+
+    // Fetch all listings
+    const cartEntries = isCart ? items : [{ listingId, quantity }];
+    const listingRefs = [];
+    const listingDocs = [];
+    const listingDataArr = [];
+
+    for (const entry of cartEntries) {
+      const ref = db.collection("artifacts").doc(APP_ID)
+        .collection("listings").doc(entry.listingId);
+      const doc = await ref.get();
+      if (!doc.exists) {
+        throw new HttpsError("not-found", `Listing ${entry.listingId} not found`);
+      }
+      const data = doc.data();
+      if (data.status !== "active" && data.status !== "reserved") {
+        throw new HttpsError("failed-precondition", `Listing ${entry.listingId} is not active`);
+      }
+      const available = data.quantity - (data.reservedQty || 0);
+      if ((entry.quantity || 1) > available) {
+        throw new HttpsError("failed-precondition", `Not enough qty for ${data.cardName}`);
+      }
+      listingRefs.push(ref);
+      listingDocs.push(doc);
+      listingDataArr.push(data);
+    }
+
+    // All listings must be from the same seller
+    const sellerId = listingDataArr[0].sellerId;
+    if (listingDataArr.some(l => l.sellerId !== sellerId)) {
+      throw new HttpsError("failed-precondition", "All cart items must be from the same seller");
+    }
+
+    // SELF-BUY CHECK
+    if (uid === sellerId) {
+      throw new HttpsError("permission-denied", "Cannot buy your own listings");
+    }
+
+    // Calculate amounts
+    const orderItems = [];
+    let subtotal = 0;
+    for (let i = 0; i < cartEntries.length; i++) {
+      const entry = cartEntries[i];
+      const listing = listingDataArr[i];
+      const qty = entry.quantity || 1;
+      const pricePerCard = listing.price;
+      subtotal += round2(pricePerCard * qty);
+      orderItems.push({
+        listingId: entry.listingId,
+        cardId: listing.cardId || "",
+        cardName: listing.cardName || "",
+        imageUrl: listing.imageUrl || null,
+        condition: listing.condition || "NM",
+        quantity: qty,
+        pricePerCard,
+      });
+    }
+    subtotal = round2(subtotal);
+
+    const rawFee = round2(subtotal * PLATFORM_FEE_RATE);
+    const platformFee = Math.min(rawFee, PLATFORM_FEE_CAP);
+    const sellerCountry = listingDataArr[0].sellerCountry || "";
+    const buyerCountry = (shippingAddress.country || "").toUpperCase();
+    const anyInsuredOnly = listingDataArr.some(l => l.insuredOnly);
+    const effectiveMethod = anyInsuredOnly ? "insured" : shippingMethod;
+    const shippingCost = round2(getShippingRate(sellerCountry, buyerCountry, effectiveMethod));
+    const totalPaid = round2(subtotal + shippingCost);
+    const sellerPayout = round2(subtotal - platformFee + shippingCost);
+
+    // Amounts in cents for Stripe balance ops
+    const totalCents = Math.round(totalPaid * 100);
+    const sellerPayoutCents = Math.round(sellerPayout * 100);
+
+    // Check buyer has enough available balance
+    const buyerAvailable = await getAvailableBalance(uid);
+    if (buyerAvailable < totalCents) {
+      throw new HttpsError("failed-precondition", "Not enough balance");
+    }
+
+    // Get buyer display name
+    const buyerProfileRef = db.collection("artifacts").doc(APP_ID)
+      .collection("users").doc(uid)
+      .collection("data").doc("profile");
+    const buyerProfileDoc = await buyerProfileRef.get();
+    const buyerName = buyerProfileDoc.exists
+      ? (buyerProfileDoc.data().displayName || "Buyer")
+      : "Buyer";
+
+    // Ensure both parties have Stripe Customers
+    const stripe = getStripe();
+    const buyerCustomerId = await getStripeCustomerId(uid);
+    const sellerCustomerId = await ensureStripeCustomer(sellerId);
+
+    // BALANCE TRANSFER: Deduct from buyer, credit to seller
+    const buyerCustomer = await stripe.customers.retrieve(buyerCustomerId);
+    await stripe.customers.update(buyerCustomerId, {
+      balance: buyerCustomer.balance + totalCents, // Makes balance less negative = less credit
+    });
+
+    const sellerCustomer = await stripe.customers.retrieve(sellerCustomerId);
+    await stripe.customers.update(sellerCustomerId, {
+      balance: sellerCustomer.balance - sellerPayoutCents, // Makes balance more negative = more credit
+    });
+
+    // Create order doc
+    const orderRef = db.collection("artifacts").doc(APP_ID)
+      .collection("orders").doc();
+    const orderId = orderRef.id;
+
+    const requiresTracking = subtotal >= 25;
+
+    await orderRef.set({
+      buyerId: uid,
+      sellerId,
+      items: orderItems,
+      subtotal,
+      platformFee,
+      shippingCost,
+      totalPaid,
+      sellerPayout,
+      shippingAddress,
+      shippingMethod: effectiveMethod,
+      paymentMethod: "balance",
+      currency: "EUR",
+      status: "paid",
+      requiresTracking,
+      buyerName,
+      sellerName: listingDataArr[0].sellerName || null,
+      preReleaseDate: listingDataArr[0].preReleaseDate || null,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      paidAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    // Reserve quantity on all listings
+    for (let i = 0; i < cartEntries.length; i++) {
+      const entry = cartEntries[i];
+      const listing = listingDataArr[i];
+      const ref = listingRefs[i];
+      const qty = entry.quantity || 1;
+      const newReserved = (listing.reservedQty || 0) + qty;
+      const updateData = { reservedQty: newReserved };
+      if (newReserved >= listing.quantity) {
+        updateData.status = "reserved";
+      }
+      await ref.update(updateData);
+    }
+
+    // Transaction logs
+    await logTransaction(uid, "purchase", -totalCents, orderId,
+      `Kauf: ${orderItems.map(i => i.cardName).join(", ").substring(0, 200)}`);
+    await logTransaction(sellerId, "sale", sellerPayoutCents, orderId,
+      `Verkauf: ${orderItems.map(i => i.cardName).join(", ").substring(0, 200)}`, Math.round(platformFee * 100));
+
+    // Update balance caches
+    await updateBalanceCache(uid);
+    await updateBalanceCache(sellerId);
+
+    // Notify seller
+    const summary = orderItemsSummary(orderItems);
+    sendNotification(sellerId, "New order!", `${summary} — €${totalPaid.toFixed(2)}. Ship within 7 days.`);
+
+    console.log(`Balance purchase: order ${orderId}, €${totalPaid} from ${uid} to ${sellerId}`);
+    return { orderId, total: totalPaid };
+  }
+);
+
+// ═══════════════════════════════════════════
+// ─── Wallet: Request Payout ───
+// ═══════════════════════════════════════════
+
+/**
+ * requestPayout — Callable, authenticated.
+ * Transfers from user's Stripe Customer Balance to their Connected Account (→ bank).
+ * Requires Stripe Connect onboarding (IBAN).
+ */
+exports.requestPayout = onCall(
+  { region: "europe-west1", timeoutSeconds: 30, secrets: ["STRIPE_SECRET_KEY"] },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Must be signed in");
+    }
+
+    const uid = request.auth.uid;
+    const { amount } = request.data; // Amount in cents
+
+    if (!amount || !Number.isInteger(amount)) {
+      throw new HttpsError("invalid-argument", "amount (integer cents) is required");
+    }
+
+    // 1. Suspended check
+    const trust = await getTrustLevel(uid);
+    if (trust.level === "suspended") {
+      throw new HttpsError("permission-denied", "Account suspended");
+    }
+
+    // 2. Email verified check
+    const profileRef = db.collection("artifacts").doc(APP_ID)
+      .collection("users").doc(uid)
+      .collection("data").doc("sellerProfile");
+    const profileDoc = await profileRef.get();
+    if (!profileDoc.exists || !profileDoc.data().emailVerified) {
+      throw new HttpsError("failed-precondition", "Please verify your email first");
+    }
+
+    // 3. Stripe Connect (IBAN) set up
+    const stripeAccountId = profileDoc.data().stripeAccountId;
+    if (!stripeAccountId) {
+      throw new HttpsError("failed-precondition", "Set up bank connection first (Stripe Connect)");
+    }
+
+    // 4. Account must be at least 7 days old
+    const userRecord = await admin.auth().getUser(uid);
+    const accountCreated = new Date(userRecord.metadata.creationTime);
+    const accountAgeMs = Date.now() - accountCreated.getTime();
+    const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+    if (accountAgeMs < sevenDaysMs) {
+      const daysLeft = Math.ceil((sevenDaysMs - accountAgeMs) / (24 * 60 * 60 * 1000));
+      throw new HttpsError("failed-precondition",
+        `Payouts available from day 8. ${daysLeft} day${daysLeft > 1 ? "s" : ""} remaining.`);
+    }
+
+    // 5. Minimum €5
+    if (amount < 500) {
+      throw new HttpsError("invalid-argument", "Minimum payout: €5");
+    }
+
+    // 6. Maximum €2,000 per day
+    const todayTotal = await getTodayPayoutTotal(uid);
+    if (todayTotal + amount > 200000) {
+      const remaining = Math.max(200000 - todayTotal, 0);
+      throw new HttpsError("resource-exhausted",
+        `Daily limit €2,000. €${(remaining / 100).toFixed(2)} remaining today.`);
+    }
+
+    // 7. Available balance (minus escrow)
+    const available = await getAvailableBalance(uid);
+    if (amount > available) {
+      throw new HttpsError("failed-precondition", "Not enough available balance");
+    }
+
+    // Execute payout — instant, no hold period
+    const stripe = getStripe();
+
+    const customerId = await getStripeCustomerId(uid);
+    const customer = await stripe.customers.retrieve(customerId);
+
+    // Deduct from customer balance first
+    await stripe.customers.update(customerId, {
+      balance: customer.balance + amount, // Less negative = less credit
+    });
+
+    let transfer;
+    try {
+      transfer = await stripe.transfers.create({
+        amount,
+        currency: "eur",
+        destination: stripeAccountId,
+        metadata: { uid, type: "payout" },
+      });
+    } catch (stripeErr) {
+      // Rollback: restore customer balance
+      await stripe.customers.update(customerId, {
+        balance: customer.balance,
+      });
+      console.error(`Payout transfer failed for ${uid}:`, stripeErr.message);
+
+      if (stripeErr.code === "balance_insufficient") {
+        throw new HttpsError("unavailable",
+          "Payout temporarily unavailable — platform funds are settling. Please try again later.");
+      }
+      throw new HttpsError("internal", "Payout failed: " + stripeErr.message);
+    }
+
+    await logTransaction(uid, "payout", -amount, null,
+      "Payout to bank account", 0, transfer.id);
+
+    await updateBalanceCache(uid);
+
+    sendNotification(uid, "Payout initiated",
+      `€${(amount / 100).toFixed(2)} will arrive in 2-7 business days.`);
+
+    console.log(`Payout: ${uid} → €${(amount / 100).toFixed(2)} via transfer ${transfer.id}`);
+    return { transferId: transfer.id };
+  }
+);
+
+// ═══════════════════════════════════════════
+// ─── Wallet: Get Balance (read-only) ───
+// ═══════════════════════════════════════════
+
+/**
+ * getWalletBalance — Callable, authenticated.
+ * Returns cached balance for the Flutter UI.
+ */
+exports.getWalletBalance = onCall(
+  { region: "europe-west1", timeoutSeconds: 15, secrets: ["STRIPE_SECRET_KEY"] },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Must be signed in");
+    }
+
+    const uid = request.auth.uid;
+
+    // Ensure customer exists (creates wallet docs if first time)
+    await ensureStripeCustomer(uid);
+
+    // Return fresh balance
+    const balance = await updateBalanceCache(uid);
+    return balance;
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════
+// ── Automatic Meta Deck Import ──
+// ══════════════════════════════════════════════════════════════════════
+
+const CARDS_LOOKUP = require("./cards_lookup.json");
+
+function resolveCardId(name) {
+  const card = CARDS_LOOKUP[name];
+  return card ? card.id : null;
+}
+
+function resolveDeckMap(raw) {
+  const result = {};
+  for (const [name, qty] of Object.entries(raw)) {
+    const id = resolveCardId(name);
+    if (id) result[id] = (result[id] || 0) + qty;
+  }
+  return result;
+}
+
+function resolveBattlefields(names) {
+  return names.map((name) => {
+    const card = CARDS_LOOKUP[name];
+    return card
+      ? { id: card.id, name: card.name, imageUrl: card.imageUrl || "" }
+      : { id: name, name, imageUrl: "" };
+  });
+}
+
+function parseDecklistPage(bodyText) {
+  const decks = [];
+  const pattern =
+    /\n\n\n+([^\n]+)\nLegend Rank:\s*(\d+)\s*\/\s*(\d+)\s*players?\nOverall Ranking:\s*#(\d+)\s*\n+Legend:\n1\s+([^\n]+)\s*\n+Champion:\n1\s+([^\n]+)\s*\n+Main Deck:\n([\s\S]*?)\n+Battlefields:\n([\s\S]*?)\n+Rune Pool:\n([\s\S]*?)\n+Sideboard:\n([\s\S]*?)(?=\n\n\n|$)/g;
+
+  let m;
+  while ((m = pattern.exec(bodyText)) !== null) {
+    const parseCards = (block) => {
+      const r = {};
+      for (const line of block.trim().split("\n")) {
+        const cm = line.match(/^(\d+)\s+(.+)$/);
+        if (cm) r[cm[2].trim()] = parseInt(cm[1]);
+      }
+      return r;
+    };
+    decks.push({
+      player: m[1].trim(),
+      legendRank: parseInt(m[2]),
+      legendTotal: parseInt(m[3]),
+      overall: parseInt(m[4]),
+      legend: m[5].trim(),
+      champion: m[6].trim(),
+      mainDeck: parseCards(m[7]),
+      battlefields: m[8]
+        .trim()
+        .split("\n")
+        .map((l) => {
+          const x = l.match(/^1\s+(.+)$/);
+          return x ? x[1].trim() : null;
+        })
+        .filter(Boolean),
+      runes: parseCards(m[9]),
+      sideboard: parseCards(m[10]),
+    });
+  }
+
+  // Deduplicate by player+overall
+  const seen = new Set();
+  return decks.filter((d) => {
+    const key = d.player.toLowerCase() + "#" + d.overall;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function buildMetaDeck(deck, tournamentName, tournamentDate, sourceUrl) {
+  const legend = CARDS_LOOKUP[deck.legend];
+  const domains = Object.keys(deck.runes || {});
+  const d1 = (domains[0] || "").replace(" Rune", "");
+  const d2 = (domains[1] || "").replace(" Rune", "");
+  const r1 = deck.runes[domains[0]] || 0;
+  const r2 = deck.runes[domains[1]] || 0;
+  const legendShort = deck.legend.split(",")[0];
+
+  const isTop8 = deck.overall <= 8;
+  let placement;
+  if (deck.overall === 1) placement = "1st";
+  else if (deck.overall === 2) placement = "2nd";
+  else if (deck.overall === 3) placement = "3rd";
+  else if (deck.overall <= 4) placement = "Top 4";
+  else if (deck.overall <= 8) placement = "Top 8";
+  else placement = "Best of";
+  const slug = deck.player.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+  const tSlug = tournamentName.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+  const deckId = isTop8
+    ? `meta-${tSlug}-${deck.overall}-${slug}`
+    : `meta-${tSlug}-best-${legendShort.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
+
+  return {
+    id: deckId,
+    name: isTop8 ? `${legendShort} ${d1}/${d2}` : `Best ${legendShort}`,
+    description: `${tournamentName} ${placement} by ${deck.player} (Overall #${deck.overall})`,
+    legendId: legend ? legend.id : "",
+    legendName: legend ? legend.name : deck.legend,
+    legendImageUrl: legend ? legend.imageUrl || "" : "",
+    domains: [d1, d2],
+    runeCount1: r1,
+    runeCount2: r2,
+    mainDeck: resolveDeckMap(deck.mainDeck),
+    sideboard: resolveDeckMap(deck.sideboard),
+    battlefields: resolveBattlefields(deck.battlefields),
+    placement,
+    playerName: deck.player,
+    source: tournamentName,
+    tournamentName,
+    sourceUrl,
+    sets: [],
+    createdAt: tournamentDate,
+    updatedAt: tournamentDate,
+  };
+}
+
+// Scheduled: Check daily for new tournament decklists
+exports.checkNewTournamentDecks = onSchedule(
+  { schedule: "every day 08:00", timeoutSeconds: 300, memory: "1GiB", region: "us-central1" },
+  async () => {
+    const scheduleRef = db.collection("artifacts").doc(APP_ID).collection("meta_tournament_schedule");
+    const metaRef = db.collection("artifacts").doc(APP_ID).collection("meta_decks");
+    const tournRef = db.collection("artifacts").doc(APP_ID).collection("meta_tournaments");
+
+    const now = new Date();
+    const snap = await scheduleRef.where("imported", "==", false).get();
+    if (snap.empty) {
+      console.log("No pending tournaments to check.");
+      return;
+    }
+
+    // Lazy-load Puppeteer only when needed
+    const chromium = require("@sparticuz/chromium");
+    const puppeteer = require("puppeteer-core");
+    let browser;
+
+    try {
+      browser = await puppeteer.launch({
+        args: chromium.args,
+        defaultViewport: chromium.defaultViewport,
+        executablePath: await chromium.executablePath(),
+        headless: chromium.headless,
+      });
+
+      for (const doc of snap.docs) {
+        const t = doc.data();
+        const eventDate = new Date(t.eventDate);
+        if (eventDate > now) {
+          console.log(`Skipping ${t.name} — event date ${t.eventDate} is in the future.`);
+          continue;
+        }
+
+        console.log(`Checking ${t.name} (${t.eventDate})...`);
+        const slugs = t.urlSlugs || [];
+        const baseUrl = "https://riftbound.leagueoflegends.com/en-us/news/organizedplay/";
+        let foundUrl = null;
+        let pageText = null;
+
+        for (const slug of slugs) {
+          const url = baseUrl + slug + "/";
+          try {
+            const page = await browser.newPage();
+            await page.goto(url, { waitUntil: "networkidle2", timeout: 30000 });
+            const text = await page.evaluate(() => document.body.innerText);
+            await page.close();
+
+            if (text && text.includes("Overall Ranking")) {
+              foundUrl = url;
+              pageText = text;
+              console.log(`  Found decklists at ${url}`);
+              break;
+            }
+          } catch (e) {
+            console.log(`  ${slug}: ${e.message}`);
+          }
+        }
+
+        if (!pageText) {
+          console.log(`  No decklists found yet for ${t.name}. Will retry tomorrow.`);
+          continue;
+        }
+
+        // Parse decks
+        const rawDecks = parseDecklistPage(pageText);
+        console.log(`  Parsed ${rawDecks.length} decks from ${foundUrl}`);
+
+        if (rawDecks.length === 0) continue;
+
+        // Build and write meta decks
+        const metaDecks = rawDecks.map((d) =>
+          buildMetaDeck(d, t.name, t.eventDate, foundUrl)
+        );
+
+        let batch = db.batch();
+        let count = 0;
+        for (const md of metaDecks) {
+          batch.set(metaRef.doc(md.id), md);
+          count++;
+          if (count % 400 === 0) {
+            await batch.commit();
+            batch = db.batch();
+          }
+        }
+
+        // Mark tournament as imported
+        batch.update(doc.ref, { imported: true, importedAt: admin.firestore.FieldValue.serverTimestamp(), deckCount: metaDecks.length, sourceUrl: foundUrl });
+
+        // Update/create tournament doc
+        const tId = t.name.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+        batch.set(tournRef.doc(tId), {
+          name: t.name,
+          date: t.eventDate,
+          deckCount: metaDecks.length,
+          sourceUrl: foundUrl,
+          importedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+
+        await batch.commit();
+        console.log(`  ✅ Imported ${metaDecks.length} decks for ${t.name}`);
+      }
+    } finally {
+      if (browser) await browser.close();
+    }
+  }
+);
+
+// Manual trigger for testing
+exports.checkNewTournamentDecksManual = onRequest(
+  { timeoutSeconds: 300, memory: "1GiB", region: "us-central1" },
+  async (req, res) => {
+    // Re-use the same logic
+    try {
+      await exports.checkNewTournamentDecks.run();
+      res.json({ success: true });
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ error: e.message });
+    }
+  }
+);
+
