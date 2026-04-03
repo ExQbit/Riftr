@@ -48,10 +48,45 @@ class CardPriceData {
   double getWeekChange(bool foil) => foil ? foilWeekChange : nonFoilWeekChange;
   double getMonthChange(bool foil) => foil ? foilMonthChange : nonFoilMonthChange;
 
+  /// Promo sets exist only as foil — no non-foil variant.
+  static const _promoSets = {'OGNX', 'SFDX', 'OGSX'};
+  bool get isPromoSet => _promoSets.contains((setId ?? '').toUpperCase());
+
+  /// Whether the Foil/Non-Foil toggle should be shown in card detail.
+  /// Only Common/Uncommon in base sets (OGN, SFD, UNL) have both variants
+  /// physically. Everything else is single-variant:
+  ///   OGS → Non-Foil only
+  ///   Rare+ in OGN/SFD/UNL → Foil only
+  ///   OGNX/SFDX/OGSX → Foil only
+  bool get showVariantToggle {
+    if (!hasBothVariants) return false;
+    final s = (setId ?? '').toUpperCase();
+    if (s == 'OGS') return false;             // NF-only set
+    if (_promoSets.contains(s)) return false;  // Foil-only promo sets
+    final r = (rarity ?? '').toLowerCase();
+    if (r != 'common' && r != 'uncommon') return false; // Rare+ = Foil-only
+    return true; // Common/Uncommon in OGN/SFD/UNL
+  }
+
+  /// Whether this card is single-variant (no toggle, force one view).
+  /// Used to determine chart + price display mode.
+  bool get isFoilOnly {
+    final s = (setId ?? '').toUpperCase();
+    if (s == 'OGS') return false; // OGS is NF-only, not foil-only
+    if (_promoSets.contains(s)) return true;
+    final r = (rarity ?? '').toLowerCase();
+    return r != 'common' && r != 'uncommon';
+  }
+
+  /// OGS is entirely non-foil — always use NF history/prices.
+  bool get isNonFoilOnly => (setId ?? '').toUpperCase() == 'OGS';
+
   /// Whether this card's standard variant is non-foil.
   /// OGS cards are always non-foil. Common/Uncommon are non-foil.
+  /// Promo sets (OGNX, SFDX, OGSX) are always foil — never non-foil standard.
   bool get _isNonFoilStandard {
     final s = (setId ?? '').toUpperCase();
+    if (_promoSets.contains(s)) return false; // foil-only sets
     if (s == 'OGS') return true;
     final r = (rarity ?? '').toLowerCase();
     return r == 'common' || r == 'uncommon';

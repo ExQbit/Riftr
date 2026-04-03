@@ -1,5 +1,12 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import '../main.dart';
+import '../widgets/riftr_toast.dart';
+import '../models/cart_item.dart';
+import '../services/cart_service.dart';
+import 'cart_screen.dart';
+import '../services/notification_inbox_service.dart';
 import '../widgets/drag_to_dismiss.dart';
 import '../theme/app_theme.dart';
 import '../data/shipping_rates.dart';
@@ -52,7 +59,13 @@ enum HoldingsMetric {
 
 class MarketScreen extends StatefulWidget {
   final ValueChanged<bool>? onFullscreenChanged;
-  const MarketScreen({super.key, this.onFullscreenChanged});
+  final void Function(String authorId, String authorName)? onNavigateToAuthor;
+  const MarketScreen({super.key, this.onFullscreenChanged, this.onNavigateToAuthor});
+
+  /// Sub-tab badge: unread order events (new order, status change, rating)
+  static bool hasUnreadOrders = false;
+  static bool hasUnreadSales = false;
+  static bool hasUnreadPurchases = false;
 
   @override
   State<MarketScreen> createState() => MarketScreenState();
@@ -77,18 +90,16 @@ class MarketScreenState extends State<MarketScreen> {
   List<CardPriceData> _filteredResults = [];
   String? _activeQuickFilter;
 
+  // Recently viewed cards (local, max 10)
+  static const _recentlyViewedKey = 'recently_viewed_cards';
+  List<String> _recentlyViewedIds = [];
+
   // Missing cards filter (from Decks screen)
   Map<String, int>? _missingCardIds;
 
   String? _demoCountry; // Country selection stored locally in demo mode
   final List<MarketListing> _demoListings = []; // Local demo listings
   String _orderSubTab = 'purchases'; // 'purchases' | 'sales'
-
-  // Cart: listingId → {listing, quantity}
-  final Map<String, _CartEntry> _cart = {};
-  int get _cartCount => _cart.values.fold(0, (sum, e) => sum + e.quantity);
-  String? get _cartSellerId =>
-      _cart.isNotEmpty ? _cart.values.first.listing.sellerId : null;
 
   bool get _isDemo => DemoService.instance.isActive;
   MarketService get _market => MarketService.instance;
@@ -122,6 +133,25 @@ class MarketScreenState extends State<MarketScreen> {
     _market.addListener(_refresh);
     _listings.addListener(_refresh);
     OrderService.instance.addListener(_refresh);
+    NotificationInboxService.instance.addListener(_refresh);
+    CartService.instance.addListener(_refresh);
+    _loadRecentlyViewed();
+  }
+
+  Future<void> _loadRecentlyViewed() async {
+    final prefs = await SharedPreferences.getInstance();
+    final ids = prefs.getStringList(_recentlyViewedKey) ?? [];
+    if (mounted) setState(() => _recentlyViewedIds = ids);
+  }
+
+  Future<void> _addRecentlyViewed(String cardId) async {
+    _recentlyViewedIds.remove(cardId); // deduplicate
+    _recentlyViewedIds.insert(0, cardId); // newest first
+    if (_recentlyViewedIds.length > 10) {
+      _recentlyViewedIds = _recentlyViewedIds.sublist(0, 10);
+    }
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList(_recentlyViewedKey, _recentlyViewedIds);
   }
 
   void _refresh() {
@@ -135,12 +165,22 @@ class MarketScreenState extends State<MarketScreen> {
     _market.removeListener(_refresh);
     _listings.removeListener(_refresh);
     OrderService.instance.removeListener(_refresh);
+    NotificationInboxService.instance.removeListener(_refresh);
+    CartService.instance.removeListener(_refresh);
     super.dispose();
   }
 
   bool _loadingHistory = false;
 
+  /// Navigate to a card by its ID (called from other tabs, e.g. Social)
+  void navigateToCardById(String cardId) {
+    final card = _market.getPrice(cardId);
+    if (card == null) return;
+    _navigateToCard(card);
+  }
+
   void _navigateToCard(CardPriceData card, {bool isFoil = false}) {
+    _addRecentlyViewed(card.cardId);
     setState(() {
       _viewBeforeDetail = _view;
       _selectedCard = card;
@@ -244,30 +284,84 @@ class MarketScreenState extends State<MarketScreen> {
       'cardDetail' => _buildCardDetail(),
       'listings' => _buildMyListings(),
       'orders' => _buildOrders(),
-      'cart' => _buildCart(),
       _ => _buildPortfolio(),
     };
 
-    // FAB only on portfolio view, always fixed to screen bottom
-    final showFab = !_isDemo &&
+    // Wallet FAB only on portfolio view
+    final showWalletFab = !_isDemo &&
         _view != 'discover' &&
         _view != 'cardDetail' &&
         _view != 'listings' &&
-        _view != 'orders' &&
-        _view != 'cart';
+        _view != 'orders';
 
-    if (!showFab) return content;
+    // Cart FAB on ALL Market views (except cardDetail)
+    final showCartFab = !_isDemo &&
+        _view != 'cardDetail' &&
+        CartService.instance.totalItems > 0;
+
+    if (!showWalletFab && !showCartFab) return content;
 
     final viewPadding = MediaQuery.of(context).viewPadding;
     return Stack(
       fit: StackFit.expand,
       children: [
         content,
-        Positioned(
-          right: AppSpacing.lg,
-          bottom: 60 + viewPadding.bottom,
-          child: _buildWalletFab(),
-        ),
+        // FABs synced with NavBar slide — same Transform.translate
+        ValueListenableBuilder<double>(
+          valueListenable: AppShell.navSlideNotifier,
+          builder: (context, navT, child) {
+            return Transform.translate(
+              offset: Offset(0, (1 - navT) * 80),
+              child: child,
+            );
+          },
+          child: Stack(children: [
+        // Cart FAB (all Market views when cart has items)
+        if (showCartFab)
+          Positioned(
+            right: AppSpacing.lg,
+            bottom: (showWalletFab ? 133 : 68) + viewPadding.bottom,
+            child: GestureDetector(
+              onTap: () => Navigator.of(context).push(
+                PageRouteBuilder(
+                  opaque: false,
+                  pageBuilder: (_, __, ___) => CartScreen(
+                    onViewAuthor: widget.onNavigateToAuthor != null
+                        ? (id, name) {
+                            Navigator.of(context).pop(); // Close cart
+                            widget.onNavigateToAuthor!(id, name);
+                          }
+                        : null,
+                  ),
+                  transitionsBuilder: (_, anim, __, child) =>
+                      FadeTransition(opacity: anim, child: child),
+                  transitionDuration: const Duration(milliseconds: 200),
+                  reverseTransitionDuration: const Duration(milliseconds: 150),
+                ),
+              ),
+              child: Stack(clipBehavior: Clip.none, children: [
+                _CartFab(pulse: true),
+                Positioned(right: -4, top: -4, child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: AppColors.error,
+                    borderRadius: BorderRadius.circular(AppRadius.iconButton),
+                    border: Border.all(color: AppColors.background, width: 2),
+                  ),
+                  child: Text('${CartService.instance.totalItems}',
+                    style: AppTextStyles.sectionLabel.copyWith(color: AppColors.textPrimary, letterSpacing: 0)),
+                )),
+              ]),
+            ),
+          ),
+        if (showWalletFab)
+          Positioned(
+            right: AppSpacing.lg,
+            bottom: 68 + viewPadding.bottom,
+            child: _buildWalletFab(),
+          ),
+          ]), // FAB Stack (child of VLB)
+        ), // ValueListenableBuilder
       ],
     );
   }
@@ -510,191 +604,8 @@ class MarketScreenState extends State<MarketScreen> {
   // ─── CART VIEW ───
   // ═══════════════════════════════════════════
 
-  Widget _buildCart() {
-    final entries = _cart.values.toList();
-    final subtotal = entries.fold(0.0, (sum, e) => sum + e.listing.price * e.quantity);
+  // ═══════════════════════════════════════════
 
-    return _wrapWithDismiss(SingleChildScrollView(
-      padding: const EdgeInsets.only(top: 36),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const GoldOrnamentHeader(title: 'CART'),
-          const SizedBox(height: AppSpacing.sm),
-          _buildViewToggle(),
-          const SizedBox(height: AppSpacing.base),
-
-          if (entries.isEmpty)
-            RiftrEmptyState(
-              icon: Icons.shopping_cart_outlined,
-              title: 'Cart is Empty',
-              subtitle: 'Add cards from the listing page to your cart',
-              buttonLabel: 'Browse Market',
-              buttonIcon: Icons.search,
-              onButtonPressed: () {
-                setState(() { _view = 'discover'; });
-                widget.onFullscreenChanged?.call(true);
-              },
-            )
-          else ...[
-            // Seller info
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
-              child: Text(
-                'from ${entries.first.listing.sellerName}',
-                style: AppTextStyles.small,
-              ),
-            ),
-            const SizedBox(height: AppSpacing.sm),
-
-            // Cart items
-            ...entries.map((entry) => Padding(
-              padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: 3),
-              child: Container(
-                padding: const EdgeInsets.all(AppSpacing.md),
-                decoration: BoxDecoration(
-                  color: AppColors.surface,
-                  borderRadius: AppRadius.baseBR,
-                  border: Border.all(color: AppColors.border),
-                ),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            entry.listing.cardName,
-                            style: AppTextStyles.caption.copyWith(
-                              color: AppColors.textPrimary,
-                              fontWeight: FontWeight.w700,
-                            ),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                          const SizedBox(height: AppSpacing.xs),
-                          Row(
-                            children: [
-                              ConditionBadge(condition: entry.listing.condition),
-                              const SizedBox(width: AppSpacing.sm),
-                              Text(
-                                '×${entry.quantity}',
-                                style: AppTextStyles.tiny.copyWith(
-                                  color: AppColors.textMuted,
-                                  fontWeight: FontWeight.w600,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ],
-                      ),
-                    ),
-                    Text(
-                      '€${(entry.listing.price * entry.quantity).toStringAsFixed(2)}',
-                      style: AppTextStyles.bodySmall.copyWith(
-                        color: AppColors.textPrimary,
-                        fontWeight: FontWeight.w900,
-                      ),
-                    ),
-                    const SizedBox(width: 10),
-                    GestureDetector(
-                      onTap: () => setState(() => _cart.remove(entry.listing.id)),
-                      child: Container(
-                        padding: const EdgeInsets.all(6),
-                        decoration: BoxDecoration(
-                          color: AppColors.loss.withValues(alpha: 0.15),
-                          borderRadius: BorderRadius.circular(AppRadius.sm),
-                        ),
-                        child: const Icon(Icons.close, size: 12, color: AppColors.loss),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            )),
-            const SizedBox(height: AppSpacing.base),
-
-            // Subtotal
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
-              child: Container(
-                padding: const EdgeInsets.all(AppSpacing.md),
-                decoration: BoxDecoration(
-                  color: AppColors.surface,
-                  borderRadius: AppRadius.baseBR,
-                  border: Border.all(color: AppColors.border),
-                ),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    const Text(
-                      'Subtotal',
-                      style: AppTextStyles.caption,
-                    ),
-                    Text(
-                      '€${subtotal.toStringAsFixed(2)} + shipping',
-                      style: AppTextStyles.bodyBold.copyWith(
-                        color: AppColors.textPrimary,
-                        fontWeight: FontWeight.w900,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-            const SizedBox(height: AppSpacing.base),
-
-            // Checkout + Clear buttons
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
-              child: Row(
-                children: [
-                  GestureDetector(
-                    onTap: () => setState(() => _cart.clear()),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(vertical: AppSpacing.base, horizontal: AppSpacing.lg),
-                      decoration: BoxDecoration(
-                        color: AppColors.loss.withValues(alpha: 0.1),
-                        borderRadius: AppRadius.baseBR,
-                        border: Border.all(color: AppColors.loss.withValues(alpha: 0.2)),
-                      ),
-                      child: Text(
-                        'Clear',
-                        style: AppTextStyles.bodySmall.copyWith(color: AppColors.loss, fontWeight: FontWeight.w700),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: AppSpacing.md),
-                  Expanded(
-                    child: GestureDetector(
-                      onTap: _openCartCheckout,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(vertical: AppSpacing.base),
-                        decoration: BoxDecoration(
-                          color: AppColors.win.withValues(alpha: 0.2),
-                          borderRadius: AppRadius.baseBR,
-                          border: Border.all(color: AppColors.win.withValues(alpha: 0.4)),
-                        ),
-                        child: Text(
-                          'Checkout €${subtotal.toStringAsFixed(2)}',
-                          textAlign: TextAlign.center,
-                          style: AppTextStyles.bodyBold.copyWith(
-                            color: AppColors.win,
-                            fontWeight: FontWeight.w800,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: AppSpacing.lg),
-          ],
-        ],
-      ),
-    ));
-  }
 
   Widget _buildWalletFab() {
     return ListenableBuilder(
@@ -757,13 +668,6 @@ class MarketScreenState extends State<MarketScreen> {
               decoration: BoxDecoration(
                 color: AppColors.amber400,
                 borderRadius: AppRadius.pillBR,
-                boxShadow: [
-                  BoxShadow(
-                    color: AppColors.amber400.withValues(alpha: 0.5),
-                    blurRadius: 16,
-                    spreadRadius: 2,
-                  ),
-                ],
               ),
               child: Row(
                 mainAxisSize: MainAxisSize.min,
@@ -801,62 +705,32 @@ class MarketScreenState extends State<MarketScreen> {
             setState(() { _view = 'orders'; });
             widget.onFullscreenChanged?.call(true);
             resetScroll();
-          }),
+          }, showDot: NotificationInboxService.instance.unseenOrderCount > 0),
           const SizedBox(width: AppSpacing.sm),
           _toggleButton('Discover', _view == 'discover', () {
             setState(() { _view = 'discover'; });
             widget.onFullscreenChanged?.call(true);
             resetScroll();
           }),
-          if (_cart.isNotEmpty) ...[
-            const SizedBox(width: AppSpacing.sm),
-            GestureDetector(
-              onTap: () {
-                setState(() { _view = 'cart'; });
-                widget.onFullscreenChanged?.call(true);
-                resetScroll();
-              },
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.sm),
-                decoration: BoxDecoration(
-                  color: _view == 'cart' ? AppColors.amber600 : AppColors.amber500.withValues(alpha: 0.15),
-                  borderRadius: BorderRadius.circular(AppRadius.iconButton),
-                  border: Border.all(
-                    color: _view == 'cart' ? AppColors.amber600 : AppColors.amber500.withValues(alpha: 0.4),
-                  ),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(
-                      Icons.shopping_cart,
-                      size: 12,
-                      color: _view == 'cart' ? AppColors.textPrimary : AppColors.amber500,
-                    ),
-                    const SizedBox(width: AppSpacing.xs),
-                    Text(
-                      '$_cartCount',
-                      style: AppTextStyles.caption.copyWith(
-                        color: _view == 'cart' ? AppColors.textPrimary : AppColors.amber500,
-                        fontWeight: FontWeight.w800,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ],
         ],
       ),
     );
   }
 
-  Widget _toggleButton(String label, bool active, VoidCallback onTap) {
+  Widget _toggleButton(String label, bool active, VoidCallback onTap, {bool showDot = false}) {
     return Expanded(
-      child: RiftrPill(
-        label: label,
-        isActive: active,
-        onTap: onTap,
+      child: Stack(
+        clipBehavior: Clip.none,
+        children: [
+          RiftrPill(label: label, isActive: active, onTap: onTap),
+          if (showDot && !active)
+            Positioned(
+              top: -2, right: 4,
+              child: Container(width: 8, height: 8, decoration: const BoxDecoration(
+                color: AppColors.amber400, shape: BoxShape.circle,
+              )),
+            ),
+        ],
       ),
     );
   }
@@ -1004,7 +878,6 @@ class MarketScreenState extends State<MarketScreen> {
     final myListings = _isDemo ? _demoListings : _listings.myListings;
 
     return _wrapWithDismiss(SingleChildScrollView(
-      padding: const EdgeInsets.only(top: 36),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -1115,7 +988,7 @@ class MarketScreenState extends State<MarketScreen> {
     final role = _orderSubTab == 'purchases' ? OrderRole.buyer : OrderRole.seller;
 
     return _wrapWithDismiss(SingleChildScrollView(
-      padding: const EdgeInsets.only(top: 36, bottom: 100),
+      padding: const EdgeInsets.only(bottom: 100),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -1162,10 +1035,11 @@ class MarketScreenState extends State<MarketScreen> {
                       if (mounted) {
                         final qty = order.totalQuantity;
                         final label = qty == 1 ? 'Card' : 'Cards';
-                        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                          content: Text(ok ? 'Shipped! $label removed from your collection.' : 'Failed to mark shipped'),
-                          backgroundColor: ok ? AppColors.win : AppColors.loss,
-                        ));
+                        if (ok) {
+                          RiftrToast.success(context, 'Shipped! $label removed from your collection.');
+                        } else {
+                          RiftrToast.error(context, 'Failed to mark shipped');
+                        }
                       }
                     },
                     onConfirmDelivery: (id) async {
@@ -1173,37 +1047,62 @@ class MarketScreenState extends State<MarketScreen> {
                       if (mounted) {
                         final qty = order.totalQuantity;
                         final label = qty == 1 ? 'Card' : 'Cards';
-                        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                          content: Text(ok ? '$label added to your collection!' : 'Failed to confirm'),
-                          backgroundColor: ok ? AppColors.win : AppColors.loss,
-                        ));
+                        if (ok) {
+                          RiftrToast.success(context, '$label added to your collection!');
+                        } else {
+                          RiftrToast.error(context, 'Failed to confirm');
+                        }
                       }
                     },
                     onCancel: (id) async {
+                      final confirmed = await showRiftrSheet<bool>(
+                        context: context,
+                        builder: (ctx) => Padding(
+                          padding: const EdgeInsets.fromLTRB(AppSpacing.base, 0, AppSpacing.base, AppSpacing.lg),
+                          child: Column(mainAxisSize: MainAxisSize.min, children: [
+                            Text('Cancel Order?', style: AppTextStyles.h2.copyWith(fontWeight: FontWeight.w900)),
+                            const SizedBox(height: AppSpacing.md),
+                            Text('Are you sure you want to cancel this order? This action cannot be undone.',
+                              style: AppTextStyles.body.copyWith(color: AppColors.textSecondary), textAlign: TextAlign.center),
+                            const SizedBox(height: AppSpacing.lg),
+                            Row(children: [
+                              Expanded(child: RiftrButton(label: 'No, keep it', style: RiftrButtonStyle.secondary,
+                                onPressed: () => Navigator.pop(ctx, false))),
+                              const SizedBox(width: AppSpacing.md),
+                              Expanded(child: RiftrButton(label: 'Yes, cancel', style: RiftrButtonStyle.danger,
+                                onPressed: () => Navigator.pop(ctx, true))),
+                            ]),
+                          ]),
+                        ),
+                      );
+                      if (confirmed != true || !mounted) return;
                       final ok = await OrderService.instance.cancelOrder(id);
                       if (mounted) {
-                        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                          content: Text(ok ? 'Order cancelled' : 'Failed to cancel'),
-                          backgroundColor: ok ? AppColors.amber500 : AppColors.loss,
-                        ));
+                        if (ok) {
+                          RiftrToast.info(context, 'Order cancelled');
+                        } else {
+                          RiftrToast.error(context, 'Failed to cancel');
+                        }
                       }
                     },
                     onOpenDispute: (id, reason, description) async {
                       final ok = await OrderService.instance.openDispute(id, reason, description: description);
                       if (mounted) {
-                        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                          content: Text(ok ? 'Dispute opened' : 'Failed to open dispute'),
-                          backgroundColor: ok ? AppColors.amber500 : AppColors.loss,
-                        ));
+                        if (ok) {
+                          RiftrToast.info(context, 'Dispute opened');
+                        } else {
+                          RiftrToast.error(context, 'Failed to open dispute');
+                        }
                       }
                     },
                     onSubmitReview: (id, rating, comment, tags) async {
                       final ok = await OrderService.instance.submitReview(id, rating, comment, tags: tags);
                       if (mounted) {
-                        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                          content: Text(ok ? 'Review submitted!' : 'Failed to submit review'),
-                          backgroundColor: ok ? AppColors.win : AppColors.loss,
-                        ));
+                        if (ok) {
+                          RiftrToast.success(context, 'Review submitted!');
+                        } else {
+                          RiftrToast.error(context, 'Failed to submit review');
+                        }
                       }
                     },
                     onViewDispute: () {
@@ -1224,24 +1123,48 @@ class MarketScreenState extends State<MarketScreen> {
   Widget _orderSubTabButton(String label, String value) {
     final active = _orderSubTab == value;
     final color = value == 'purchases' ? AppColors.win : AppColors.amber500;
+    // Sub-tab dots: live check from Firestore inbox (role-based)
+    final inbox = NotificationInboxService.instance;
+    final expectedRole = value == 'sales' ? 'seller' : 'buyer';
+    final showDot = inbox.unseen.any((n) => n.type == 'order' && n.role == expectedRole);
     return Expanded(
       child: GestureDetector(
-        onTap: () => setState(() => _orderSubTab = value),
-        child: Container(
-          padding: const EdgeInsets.symmetric(vertical: AppSpacing.sm),
-          decoration: BoxDecoration(
-            color: active ? color : AppColors.surface,
-            borderRadius: BorderRadius.circular(AppRadius.md),
-            border: active ? null : Border.all(color: AppColors.border),
-          ),
-          child: Text(
-            label,
-            textAlign: TextAlign.center,
-            style: AppTextStyles.small.copyWith(
-              color: active ? AppColors.background : AppColors.textMuted,
-              fontWeight: FontWeight.w700,
+        onTap: () {
+          setState(() => _orderSubTab = value);
+          // Don't mark as seen here — dots persist until user opens the specific order card.
+        },
+        child: Stack(
+          clipBehavior: Clip.none,
+          children: [
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(vertical: AppSpacing.sm),
+              decoration: BoxDecoration(
+                color: active ? color : AppColors.surface,
+                borderRadius: BorderRadius.circular(AppRadius.md),
+                border: active ? null : Border.all(color: AppColors.border),
+              ),
+              child: Text(
+                label,
+                textAlign: TextAlign.center,
+                style: AppTextStyles.small.copyWith(
+                  color: active ? AppColors.background : AppColors.textMuted,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
             ),
-          ),
+            if (showDot)
+              Positioned(
+                top: -3, right: -3,
+                child: Container(
+                  width: 8, height: 8,
+                  decoration: const BoxDecoration(
+                    color: AppColors.amber400,
+                    shape: BoxShape.circle,
+                  ),
+                ),
+              ),
+          ],
         ),
       ),
     );
@@ -1251,7 +1174,7 @@ class MarketScreenState extends State<MarketScreen> {
   // ─── DISCOVER FILTER LOGIC ───
   // ═══════════════════════════════════════════
 
-  static const _rarityOrder = {'Common': 0, 'Uncommon': 1, 'Rare': 2, 'Epic': 3, 'Showcase': 4, 'Metal': 5};
+  static const _rarityOrder = {'Common': 0, 'Uncommon': 1, 'Rare': 2, 'Epic': 3, 'Showcase': 4, 'Ultimate': 5, 'Metal': 6};
 
   void _refreshFilteredResults() {
     final query = _searchController.text;
@@ -1266,10 +1189,29 @@ class MarketScreenState extends State<MarketScreen> {
     // Include all cards: priced + unpriced (e.g. UNL pre-release)
     var results = _market.allCardsWithFallback;
 
-    // Text search
+    // Text search (name, display name, card text, collector number, keywords)
     if (query.isNotEmpty) {
       final lower = query.toLowerCase();
-      results = results.where((p) => p.cardName.toLowerCase().contains(lower)).toList();
+      final lookup = CardService.getLookup();
+      results = results.where((p) {
+        // Name match (from price data)
+        if (p.cardName.toLowerCase().contains(lower)) return true;
+        // Cross-reference with full card data for deeper search
+        final card = lookup[p.cardId];
+        if (card == null) return false;
+        if (card.displayName.toLowerCase().contains(lower)) return true;
+        if (card.textPlain?.toLowerCase().contains(lower) == true) return true;
+        // Keyword match
+        if (card.keywords.any((k) => k.toLowerCase().contains(lower))) return true;
+        // Collector number match (e.g. "#186" or "SFD 32")
+        final cn = lower.startsWith('#') ? lower.substring(1) : lower;
+        final cnNum = cn.replaceAll(RegExp(r'[^0-9]'), '');
+        final cnSuffix = cn.replaceAll(RegExp(r'[0-9]'), '');
+        if (cnNum.isNotEmpty && card.collectorNumber != null &&
+            card.collectorNumber!.startsWith(cnNum) &&
+            (cnSuffix.isEmpty || card.collectorNumber!.endsWith(cnSuffix))) return true;
+        return false;
+      }).toList();
     }
 
     // Rarity
@@ -1322,6 +1264,11 @@ class MarketScreenState extends State<MarketScreen> {
           return true;
         });
       }).toList();
+    }
+
+    // Hide €0.00 cards in browse/filter mode, but KEEP them in search results
+    if (query.isEmpty) {
+      results = results.where((p) => p.currentPrice > 0).toList();
     }
 
     // Sort
@@ -1381,12 +1328,92 @@ class MarketScreenState extends State<MarketScreen> {
   // ─── DISCOVER VIEW ───
   // ═══════════════════════════════════════════
 
+  Widget _buildRecentlyViewedList() {
+    final cards = _recentlyViewedIds
+        .map((id) => _market.getPrice(id))
+        .where((p) => p != null)
+        .cast<CardPriceData>()
+        .toList();
+    if (cards.isEmpty) return const SizedBox.shrink();
+
+    return SizedBox(
+      height: 195,
+      child: ListView.builder(
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.symmetric(horizontal: AppSpacing.base),
+        itemCount: cards.length,
+        itemBuilder: (context, index) {
+          final card = cards[index];
+          return Padding(
+            padding: const EdgeInsets.only(right: AppSpacing.sm),
+            child: GestureDetector(
+              onTap: () => _navigateToCard(card),
+              child: SizedBox(
+                width: 105,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // Card image (portrait ratio ~63:88)
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(AppRadius.sm),
+                      child: card.imageUrl != null
+                          ? CardImage(
+                              imageUrl: card.imageUrl,
+                              fallbackText: card.cardName,
+                              width: 105,
+                              height: 147,
+                              fit: BoxFit.cover,
+                            )
+                          : Container(
+                              width: 105, height: 147,
+                              color: AppColors.surfaceLight,
+                              child: const Icon(Icons.style, color: AppColors.textMuted),
+                            ),
+                    ),
+                    const SizedBox(height: AppSpacing.xs),
+                    // Name
+                    Text(
+                      card.cardName,
+                      style: AppTextStyles.small.copyWith(fontWeight: FontWeight.w700),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    // Price + daily change
+                    if (card.currentPrice > 0)
+                      Row(
+                        children: [
+                          Text(
+                            '€${card.currentPrice.toStringAsFixed(2)}',
+                            style: AppTextStyles.micro.copyWith(color: AppColors.textSecondary),
+                          ),
+                          const SizedBox(width: 3),
+                          Text(
+                            '${card.dayChange >= 0 ? '+' : ''}${card.dayChange.toStringAsFixed(1)}%',
+                            style: AppTextStyles.micro.copyWith(
+                              color: card.dayChange > 0 ? AppColors.win : card.dayChange < 0 ? AppColors.loss : AppColors.textMuted,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ],
+                      )
+                    else
+                      Text('—', style: AppTextStyles.micro.copyWith(color: AppColors.textSecondary)),
+                  ],
+                ),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
   Widget _buildDiscover() {
     final hasActiveFilter = !_discoverFilter.isEmpty || _searchController.text.isNotEmpty;
 
     return _wrapWithDismiss(SingleChildScrollView(
       controller: _scrollController,
-      padding: const EdgeInsets.only(bottom: 100, top: 36),
+      padding: const EdgeInsets.only(bottom: 100),
       child: Column(
         children: [
           const GoldOrnamentHeader(title: 'DISCOVER'),
@@ -1485,15 +1512,17 @@ class MarketScreenState extends State<MarketScreen> {
                 ),
               ),
           ]
-          // Browse mode: Trending + Gainers + Losers
+          // Browse mode: Recently Viewed + Gainers + Losers
           else ...[
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
-              child: SectionDivider(icon: Icons.local_fire_department, label: 'TRENDING'),
-            ),
-            const SizedBox(height: AppSpacing.xs),
-            GainersLosersList(cards: _market.trending, isGainers: true, onCardTap: _navigateToCard),
-            const SizedBox(height: AppSpacing.base),
+            if (_recentlyViewedIds.isNotEmpty) ...[
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
+                child: SectionDivider(icon: Icons.history, label: 'RECENTLY VIEWED'),
+              ),
+              const SizedBox(height: AppSpacing.xs),
+              _buildRecentlyViewedList(),
+              const SizedBox(height: AppSpacing.base),
+            ],
 
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
@@ -1659,7 +1688,12 @@ class MarketScreenState extends State<MarketScreen> {
     final card = _selectedCard;
     if (card == null) return const SizedBox.shrink();
 
-    final chartData = _filterByRange(card.priceHistory, _selectedRange);
+    final chartData = _filterByRange(
+      card.isNonFoilOnly ? card.nonFoilHistory
+          : card.isFoilOnly ? _getFoilOnlyChartData(card)
+          : card.priceHistory,
+      _selectedRange,
+    );
     final liveListings = _listings.getListings(card.cardId);
     final listings = _isDemo
         ? ([...liveListings, ..._demoListings.where((l) => l.cardId == card.cardId)]
@@ -1752,8 +1786,10 @@ class MarketScreenState extends State<MarketScreen> {
                 )
               else ...[
               // Show selected variant price (foil or non-foil)
+              // Promo sets: always foil (standardPrice already returns foil via _isNonFoilStandard)
               Builder(builder: (_) {
-                final displayPrice = _detailShowFoil
+                final showFoil = _detailShowFoil || card.isFoilOnly;
+                final displayPrice = showFoil
                     ? (card.foilPrice > 0 ? card.foilPrice : card.currentPrice)
                     : (card.standardPrice > 0 ? card.standardPrice : card.currentPrice);
                 return Text(
@@ -1779,7 +1815,8 @@ class MarketScreenState extends State<MarketScreen> {
               ),
 
               // Variant price badges (foil + non-foil) — tappable
-              if (card.hasBothVariants)
+              // Toggle only for Common/Uncommon in base sets (both variants exist)
+              if (card.showVariantToggle)
                 Padding(
                   padding: const EdgeInsets.only(top: 6),
                   child: Row(
@@ -1833,11 +1870,15 @@ class MarketScreenState extends State<MarketScreen> {
                 Padding(
                   padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
                   child: PriceChart(
-                    data: _detailShowFoil
-                        ? _getFoilChartData(card)
-                        : _getStandardChartData(card),
+                    data: card.isNonFoilOnly
+                        ? _filterByRange(card.nonFoilHistory, _selectedRange)
+                        : card.isFoilOnly
+                            ? _filterByRange(_getFoilOnlyChartData(card), _selectedRange)
+                            : (_detailShowFoil
+                                ? _getFoilChartData(card)
+                                : _getStandardChartData(card)),
                     isPositive: rangePositive,
-                    secondaryData: card.hasBothVariants
+                    secondaryData: card.showVariantToggle
                         ? (_detailShowFoil
                             ? _getStandardChartData(card)
                             : _getPremiumChartData(card))
@@ -1850,7 +1891,7 @@ class MarketScreenState extends State<MarketScreen> {
               // Price overview
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
-                child: PriceOverviewCard(data: card, showFoil: _detailShowFoil),
+                child: PriceOverviewCard(data: card, showFoil: _detailShowFoil || card.isFoilOnly),
               ),
               const SizedBox(height: AppSpacing.base),
               ], // end of price data section
@@ -1962,20 +2003,35 @@ class MarketScreenState extends State<MarketScreen> {
       ),
       child: Row(
         children: [
+          // Thumbnail
+          SizedBox(
+            width: 40,
+            height: 56,
+            child: Transform.scale(
+              scale: 1.25,
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(AppRadius.sm),
+                child: CardImage(
+                  imageUrl: listing.imageUrl,
+                  fallbackText: listing.cardName,
+                  width: 40,
+                  height: 56,
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(width: AppSpacing.md),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
                   listing.cardName,
-                  style: AppTextStyles.caption.copyWith(
-                    color: AppColors.textPrimary,
-                    fontWeight: FontWeight.w700,
-                  ),
+                  style: AppTextStyles.bodySmall.copyWith(fontWeight: FontWeight.w800),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                 ),
-                const SizedBox(height: AppSpacing.xs),
+                const SizedBox(height: 6),
                 Row(
                   children: [
                     ConditionBadge(condition: listing.condition),
@@ -1992,10 +2048,7 @@ class MarketScreenState extends State<MarketScreen> {
                     const SizedBox(width: AppSpacing.sm),
                     Text(
                       '€${listing.price.toStringAsFixed(2)}',
-                      style: AppTextStyles.caption.copyWith(
-                        color: AppColors.textPrimary,
-                        fontWeight: FontWeight.w800,
-                      ),
+                      style: AppTextStyles.bodySmall.copyWith(fontWeight: FontWeight.w900),
                     ),
                     if (listing.isPreRelease) ...[
                       const SizedBox(width: AppSpacing.sm),
@@ -2020,14 +2073,13 @@ class MarketScreenState extends State<MarketScreen> {
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.sm),
               decoration: BoxDecoration(
-                color: AppColors.loss.withValues(alpha: 0.1),
+                color: AppColors.loss,
                 borderRadius: BorderRadius.circular(AppRadius.md),
-                border: Border.all(color: AppColors.loss.withValues(alpha: 0.2)),
               ),
               child: Text(
                 'Cancel',
                 style: AppTextStyles.small.copyWith(
-                  color: AppColors.loss,
+                  color: AppColors.textPrimary,
                   fontWeight: FontWeight.w700,
                 ),
               ),
@@ -2071,25 +2123,17 @@ class MarketScreenState extends State<MarketScreen> {
     if (_isDemo) {
       setState(() => _demoListings.removeWhere((l) => l.id == listing.id));
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Listing cancelled (Demo Mode)'),
-          backgroundColor: AppColors.win,
-          duration: Duration(seconds: 2),
-        ),
-      );
+      RiftrToast.success(context, 'Listing cancelled (Demo Mode)');
       return;
     }
 
     final success = await _listings.cancelListing(listing.id);
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(success ? 'Listing cancelled' : 'Failed to cancel'),
-        backgroundColor: success ? AppColors.win : AppColors.loss,
-        duration: const Duration(seconds: 2),
-      ),
-    );
+    if (success) {
+      RiftrToast.success(context, 'Listing cancelled');
+    } else {
+      RiftrToast.error(context, 'Failed to cancel');
+    }
   }
 
   Widget _sellButton(CardPriceData card) {
@@ -2141,13 +2185,7 @@ class MarketScreenState extends State<MarketScreen> {
             }
           : () {
               HapticFeedback.lightImpact();
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                  content: Text('No listings available'),
-                  backgroundColor: AppColors.textMuted,
-                  duration: Duration(seconds: 2),
-                ),
-              );
+              RiftrToast.info(context, 'No listings available');
             },
       child: Container(
         height: 56,
@@ -2185,76 +2223,14 @@ class MarketScreenState extends State<MarketScreen> {
     );
   }
 
-  void _addToCart(MarketListing listing) {
-    // All cart items must be from the same seller
-    if (_cart.isNotEmpty && _cartSellerId != listing.sellerId) {
-      setState(() => _cart.clear());
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Cart cleared — different seller.'),
-          backgroundColor: AppColors.amber500,
-          duration: Duration(seconds: 2),
-        ),
-      );
-    }
-
-    setState(() {
-      final existing = _cart[listing.id];
-      if (existing != null) {
-        if (existing.quantity < listing.availableQty) {
-          existing.quantity++;
-        }
-      } else {
-        _cart[listing.id] = _CartEntry(listing: listing);
-      }
-    });
-
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text('Added to cart ($_cartCount items)'),
-        backgroundColor: AppColors.win,
-        duration: const Duration(seconds: 1),
-      ),
-    );
-  }
-
-  Future<void> _openCartCheckout() async {
-    if (_cart.isEmpty) return;
-
-    // Use first listing for the checkout sheet (seller info stays the same)
-    final entries = _cart.values.toList();
-    final firstListing = entries.first.listing;
-
-    final cartItems = entries.map((e) => CartCheckoutItem(
-      listing: e.listing,
-      quantity: e.quantity,
-    )).toList();
-
-    final result = await Navigator.push<dynamic>(
-      context,
-      PageRouteBuilder(
-        opaque: false,
-        barrierColor: Colors.black54,
-        pageBuilder: (_, __, ___) => _CheckoutFullScreen(
-          listing: firstListing,
-          cartItems: cartItems,
-        ),
-        transitionsBuilder: (_, anim, __, child) =>
-            SlideTransition(position: Tween(begin: const Offset(0, 1), end: Offset.zero).animate(anim), child: child),
-      ),
-    );
-
+  Future<void> _addToCart(MarketListing listing) async {
+    HapticFeedback.lightImpact();
+    final ok = await CartService.instance.addItem(CartItem.fromListing(listing));
     if (!mounted) return;
-
-    if (result is String) {
-      setState(() => _cart.clear());
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(result == 'demo-order' ? 'Order placed (Demo Mode)' : 'Order placed!'),
-          backgroundColor: AppColors.win,
-          duration: const Duration(seconds: 3),
-        ),
-      );
+    if (ok) {
+      RiftrToast.cart(context, 'Added to cart');
+    } else {
+      RiftrToast.error(context, 'Not available');
     }
   }
 
@@ -2274,13 +2250,7 @@ class MarketScreenState extends State<MarketScreen> {
 
     // Wallet purchase returns orderId string, demo returns 'demo-order'
     if (result is String) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(result == 'demo-order' ? 'Order placed (Demo Mode)' : 'Order placed!'),
-          backgroundColor: AppColors.win,
-          duration: const Duration(seconds: 3),
-        ),
-      );
+      RiftrToast.success(context, result == 'demo-order' ? 'Order placed (Demo Mode)' : 'Order placed!');
     }
   }
 
@@ -2290,10 +2260,7 @@ class MarketScreenState extends State<MarketScreen> {
       final profile = SellerService.instance.profile;
       if (profile != null && profile.suspended) {
         if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-            content: Text('Your seller account is suspended. You cannot create listings.'),
-            backgroundColor: AppColors.loss,
-          ));
+          RiftrToast.error(context, 'Your seller account is suspended. You cannot create listings.');
         }
         return;
       }
@@ -2356,15 +2323,12 @@ class MarketScreenState extends State<MarketScreen> {
           listedAt: DateTime.now(),
         ));
       });
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Listing created (Demo Mode)'),
-          backgroundColor: AppColors.win,
-          duration: Duration(seconds: 2),
-        ),
-      );
+      RiftrToast.sale(context, 'Listing created (Demo Mode)');
       return;
     }
+
+    // Look up full card data for set/collector info
+    final fullCard = CardService.getLookup()[card.cardId];
 
     final listingId = await _listings.createListing(
       cardId: card.cardId,
@@ -2376,6 +2340,8 @@ class MarketScreenState extends State<MarketScreen> {
       insuredOnly: result['insuredOnly'] as bool? ?? false,
       language: result['language'] as String? ?? 'EN',
       setId: card.setId,
+      setCode: fullCard?.setId ?? card.setId,
+      collectorNumber: fullCard?.collectorNumber,
     );
 
     // Add new lots to collection if needed
@@ -2395,21 +2361,16 @@ class MarketScreenState extends State<MarketScreen> {
 
     if (!mounted) return;
     final newLots = isNewCards ? quantity : (quantity - collectionQty).clamp(0, quantity);
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(
-          listingId != null
-              ? newLots > 0
-                  ? newLots > 1
-                      ? 'Listed for sale! $newLots cards added to your collection.'
-                      : 'Listed for sale! Card added to your collection.'
-                  : 'Listed for sale!'
-              : 'Failed to create listing',
-        ),
-        backgroundColor: listingId != null ? AppColors.win : AppColors.loss,
-        duration: const Duration(seconds: 2),
-      ),
-    );
+    if (listingId != null) {
+      final msg = newLots > 0
+          ? newLots > 1
+              ? 'Listed for sale! $newLots cards added to your collection.'
+              : 'Listed for sale! Card added to your collection.'
+          : 'Listed for sale!';
+      RiftrToast.sale(context, msg);
+    } else {
+      RiftrToast.error(context, 'Failed to create listing');
+    }
   }
 
   Future<String?> _showCountryPicker() async {
@@ -2501,8 +2462,19 @@ class MarketScreenState extends State<MarketScreen> {
   // ─── HELPERS ───
   // ═══════════════════════════════════════════
 
+  /// Best available history for foil-only cards: foil preferred, NF fallback
+  /// (e.g. Nexus Night promos have NF-only history on Cardmarket)
+  List<PricePoint> _getFoilOnlyChartData(CardPriceData card) {
+    if (card.priceHistory.isNotEmpty) return card.priceHistory;
+    return card.nonFoilHistory;
+  }
+
   /// Standard variant chart data: nf history for Common/Uncommon, foil for Rare+
   List<PricePoint> _getStandardChartData(CardPriceData card) {
+    // OGS: always non-foil history
+    if (card.isNonFoilOnly) return _filterByRange(card.nonFoilHistory, _selectedRange);
+    // Foil-only cards: foil history, NF fallback if foil empty
+    if (card.isFoilOnly) return _filterByRange(_getFoilOnlyChartData(card), _selectedRange);
     final r = (card.rarity ?? '').toLowerCase();
     final isCommonUncommon = r == 'common' || r == 'uncommon';
     // Common/Uncommon standard = non-foil → use nonFoilHistory
@@ -2575,10 +2547,33 @@ class _HoldingEntry {
   double get dayChangePct => data.dayChange;
 }
 
-class _CartEntry {
-  final MarketListing listing;
-  int quantity;
-  _CartEntry({required this.listing, this.quantity = 1});
+/// Pulsing Cart FAB — same style as Shop FAB in Deck Viewer but with cart icon.
+/// Cart FAB using CartService.pulse (shared ValueNotifier) for synchronized animation.
+class _CartFab extends StatelessWidget {
+  final bool pulse;
+  const _CartFab({required this.pulse});
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<double>(
+      valueListenable: CartService.pulse,
+      builder: (context, t, child) {
+        final scale = pulse ? 1.0 + 0.08 * t : 1.0; // 1.0 → 1.08
+        final glowAlpha = pulse ? 0.4 + 0.4 * t : 0.4; // 0.4 → 0.8
+        return Transform.scale(
+          scale: scale,
+          child: Container(
+            width: 56, height: 56,
+            decoration: const BoxDecoration(
+              shape: BoxShape.circle,
+              color: AppColors.amber400,
+            ),
+            child: const Icon(Icons.shopping_cart, color: AppColors.textPrimary, size: 24),
+          ),
+        );
+      },
+    );
+  }
 }
 
 /// Full-screen checkout overlay with DragToDismiss.

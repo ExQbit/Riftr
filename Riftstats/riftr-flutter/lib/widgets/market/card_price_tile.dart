@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../../models/market/card_price_data.dart';
+import '../../services/card_service.dart';
 import '../../theme/app_components.dart';
 import '../../theme/app_theme.dart';
 import '../card_image.dart';
@@ -32,6 +33,14 @@ class CardPriceTile extends StatelessWidget {
     this.changePositive,
   });
 
+  String get _setCollectorLabel {
+    final parts = <String>[];
+    if (data.setId != null) parts.add(data.setId!.toUpperCase());
+    final card = CardService.getLookup()[data.cardId];
+    if (card?.collectorNumber != null) parts.add('#${card!.collectorNumber!}');
+    return parts.join(' ');
+  }
+
   @override
   Widget build(BuildContext context) {
     final isPositive = changePositive ?? data.isPositive;
@@ -45,31 +54,34 @@ class CardPriceTile extends StatelessWidget {
           children: [
             // Card image (battlefields rotated to fit portrait thumbnail)
             SizedBox(
-              width: 32,
-              height: 44,
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(AppRadius.badge),
-                child: data.imageUrl != null
-                    ? (data.isBattlefield
-                        ? RotatedBox(
-                            quarterTurns: 1,
-                            child: CardImage(
+              width: 40,
+              height: 56,
+              child: Transform.scale(
+                scale: 1.25,
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(AppRadius.sm),
+                  child: data.imageUrl != null
+                      ? (data.isBattlefield
+                          ? RotatedBox(
+                              quarterTurns: 1,
+                              child: CardImage(
+                                imageUrl: data.imageUrl,
+                                fallbackText: data.cardName,
+                                fit: BoxFit.cover,
+                              ),
+                            )
+                          : CardImage(
                               imageUrl: data.imageUrl,
                               fallbackText: data.cardName,
+                              width: 40,
+                              height: 56,
                               fit: BoxFit.cover,
-                            ),
-                          )
-                        : CardImage(
-                            imageUrl: data.imageUrl,
-                            fallbackText: data.cardName,
-                            width: 32,
-                            height: 44,
-                            fit: BoxFit.cover,
-                          ))
-                    : _placeholder(),
+                            ))
+                      : _placeholder(),
+                ),
               ),
             ),
-            const SizedBox(width: 10),
+            const SizedBox(width: AppSpacing.md),
 
             // Name + set + quantity
             Expanded(
@@ -78,10 +90,7 @@ class CardPriceTile extends StatelessWidget {
                 children: [
                   Text(
                     data.cardName,
-                    style: AppTextStyles.captionBold.copyWith(
-                      color: AppColors.textPrimary,
-                      fontWeight: FontWeight.w700,
-                    ),
+                    style: AppTextStyles.bodySmall.copyWith(fontWeight: FontWeight.w800),
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                   ),
@@ -90,8 +99,9 @@ class CardPriceTile extends StatelessWidget {
                     children: [
                       if (data.setId != null)
                         Text(
-                          data.setId!.toUpperCase(),
-                          style: AppTextStyles.micro.copyWith(
+                          _setCollectorLabel,
+                          style: AppTextStyles.tiny.copyWith(
+                            color: AppColors.textMuted,
                             fontWeight: FontWeight.w600,
                           ),
                         ),
@@ -99,9 +109,8 @@ class CardPriceTile extends StatelessWidget {
                         const SizedBox(width: AppSpacing.xs),
                         Text(
                           '★',
-                          style: AppTextStyles.micro.copyWith(
+                          style: AppTextStyles.tiny.copyWith(
                             color: AppColors.amber300,
-                            fontWeight: FontWeight.normal,
                           ),
                         ),
                       ],
@@ -133,21 +142,24 @@ class CardPriceTile extends StatelessWidget {
             Column(
               crossAxisAlignment: CrossAxisAlignment.end,
               children: [
-                Text(
-                  '€${(priceOverride ?? data.currentPrice).toStringAsFixed(2)}',
-                  style: AppTextStyles.captionBold.copyWith(
-                    color: AppColors.textPrimary,
-                    fontWeight: FontWeight.w800,
+                if ((priceOverride ?? data.currentPrice) <= 0)
+                  Text('—', style: AppTextStyles.bodySmall.copyWith(
+                    fontWeight: FontWeight.w900, color: AppColors.textSecondary,
+                  ))
+                else ...[
+                  Text(
+                    '€${(priceOverride ?? data.currentPrice).toStringAsFixed(2)}',
+                    style: AppTextStyles.bodySmall.copyWith(fontWeight: FontWeight.w900),
                   ),
-                ),
-                const SizedBox(height: 2),
-                Text(
-                  changeText ?? '$changeSign${data.dayChange.toStringAsFixed(1)}%',
-                  style: AppTextStyles.tiny.copyWith(
-                    color: changeColor,
-                    fontWeight: FontWeight.w700,
+                  const SizedBox(height: 2),
+                  Text(
+                    changeText ?? '$changeSign${data.dayChange.toStringAsFixed(1)}%',
+                    style: AppTextStyles.tiny.copyWith(
+                      color: changeColor,
+                      fontWeight: FontWeight.w700,
+                    ),
                   ),
-                ),
+                ],
               ],
             ),
           ],
@@ -157,11 +169,11 @@ class CardPriceTile extends StatelessWidget {
 
   Widget _placeholder() {
     return Container(
-      width: 32,
-      height: 44,
+      width: 40,
+      height: 56,
       decoration: BoxDecoration(
         color: AppColors.surfaceLight,
-        borderRadius: BorderRadius.circular(AppRadius.badge),
+        borderRadius: BorderRadius.circular(AppRadius.sm),
       ),
       child: const Icon(Icons.style, size: 16, color: AppColors.textMuted),
     );

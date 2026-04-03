@@ -1,0 +1,644 @@
+import 'dart:async';
+import 'dart:typed_data';
+import 'dart:ui';
+import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
+import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
+import '../models/card_model.dart';
+import '../models/card_fingerprint.dart';
+import 'card_lookup_service.dart';
+
+/// Result of a scan with confidence level.
+enum ScanConfidence { high, medium, low }
+
+class OcrMatch {
+  final ScanResult? scanResult;
+  final RiftCard card;
+  final List<RiftCard> alternatives;
+  final ScanConfidence confidence;
+  final int score;
+  final Map<String, int> breakdown;
+
+  const OcrMatch({
+    this.scanResult,
+    required this.card,
+    this.alternatives = const [],
+    required this.confidence,
+    this.score = 0,
+    this.breakdown = const {},
+  });
+}
+
+/// OCR scanner with multi-point fingerprint scoring.
+class OcrService {
+  OcrService._();
+  static final OcrService instance = OcrService._();
+
+  final _textRecognizer = TextRecognizer(script: TextRecognitionScript.latin);
+  bool _isProcessing = false;
+  bool debugMode = false;
+
+  // ── Regex patterns ──
+
+  /// CN with optional /max: "SFD 097/221", "S0-143", "0GN 022298", "SO-84m"
+  /// Requires 2+ digits for CN (1-digit like "OGN 1" is too ambiguous)
+  /// Exception: 1 digit OK if followed by / (e.g. "SFD 1/221")
+  static final _patternCN = RegExp(
+    r'(OGN|SFD|OGS|UNL|SFO|OGM|OG5|OGH|SFE|SF0|0GN|0GS|0G5|O6S|06S|065|O65|D6S|DGS|0N|GN|S0|SO|SD|DGN)\s*[A-Z>]?\s*[·.•:\- ]{0,3}\s*(\d{2,3})([a*b])?',
+    caseSensitive: false,
+  );
+
+  /// Single-digit CN only if followed by / (e.g. "SFD 1/221")
+  static final _patternCNSingleDigit = RegExp(
+    r'(OGN|SFD|OGS|UNL|SFO|OGM|OG5|OGH|SFE|SF0|0GN|0GS|0G5|O6S|06S|065|O65|D6S|DGS|0N|GN|S0|SO|SD|DGN)\s*[A-Z>]?\s*[·.•:\- ]{0,3}\s*(\d)([a*b])?\s*/',
+    caseSensitive: false,
+  );
+
+  /// "FND-249/298" (Project K)
+  static final _patternFnd = RegExp(
+    r'(FND)\s*[-–\s]?\s*(\d{1,3})([a*b])?\s*/\s*(\d{1,3})',
+    caseSensitive: false,
+  );
+
+  /// Token CN: "SFD T03", "OGN T01" etc.
+  static final _patternTokenCN = RegExp(
+    r'(OGN|SFD|OGS|UNL|SFO|OGM|OG5|OGH|SFE|SF0|0GN|0GS|0G5|O6S|06S|065|O65|D6S|DGS|DGN)\s*[·.•:\- ]?\s*T\s*0?(\d{1,2})',
+    caseSensitive: false,
+  );
+
+  /// Detect set code standalone in text.
+  static final _setInText = RegExp(
+    r'\b(OGN|SFD|OGS|UNL|FND|SFO|OGM|OGH|SFE)\b',
+    caseSensitive: false,
+  );
+
+  /// Extract data points from a camera frame without scoring.
+  /// Set [tryRotate90] to also try 90° CW for landscape battlefields.
+  Future<OcrExtraction?> extractFrame(CameraImage image, CameraDescription camera, {bool tryRotate90 = false}) async {
+    if (_isProcessing) return null;
+    _isProcessing = true;
+    try {
+      final inputImage = _convertCameraImage(image, camera);
+      if (inputImage == null) return null;
+      final recognized = await _textRecognizer.processImage(inputImage);
+
+      OcrExtraction? result;
+      if (recognized.blocks.isNotEmpty) {
+        final allText = recognized.blocks.map((b) => b.text).join(' | ');
+        if (debugMode) debugPrint('OCR raw: $allText');
+        final allTextLower = allText.toLowerCase();
+        final allLines = <String>[];
+        final blocks = recognized.blocks.toList()
+          ..sort((a, b) => b.boundingBox.top.compareTo(a.boundingBox.top));
+        for (final block in blocks) {
+          for (final line in block.lines) {
+            allLines.add(line.text);
+          }
+        }
+        result = _extract(allLines, allTextLower, recognized);
+      }
+
+      // Try 90° CW for landscape battlefields
+      if (tryRotate90) {
+        final rot90 = _convertRotated90CW(image, camera);
+        if (rot90 != null) {
+          final rot90Recognized = await _textRecognizer.processImage(rot90);
+          if (rot90Recognized.blocks.isNotEmpty) {
+            final rotText = rot90Recognized.blocks.map((b) => b.text).join(' | ');
+            if (debugMode) debugPrint('OCR rot90: $rotText');
+            final rotLower = rotText.toLowerCase();
+            final rotLines = <String>[];
+            for (final block in rot90Recognized.blocks) {
+              for (final line in block.lines) {
+                rotLines.add(line.text);
+              }
+            }
+            final rotExtraction = _extract(rotLines, rotLower, rot90Recognized);
+            if (result == null) {
+              result = rotExtraction;
+            } else {
+              // Merge rot90 data INTO existing result
+              result = OcrExtraction(
+                setCode: result!.setCode ?? rotExtraction.setCode,
+                collectorNumber: result!.collectorNumber ?? rotExtraction.collectorNumber,
+                cnSuffix: result!.cnSuffix ?? rotExtraction.cnSuffix,
+                cnRaw: result!.cnRaw ?? rotExtraction.cnRaw,
+                cnHasSetPrefix: result!.cnHasSetPrefix || rotExtraction.cnHasSetPrefix,
+                namesFound: {...result!.namesFound, ...rotExtraction.namesFound},
+                keywordsFound: {...result!.keywordsFound, ...rotExtraction.keywordsFound},
+                typesFound: {...result!.typesFound, ...rotExtraction.typesFound},
+                regionsFound: {...result!.regionsFound, ...rotExtraction.regionsFound},
+                manaCost: result!.manaCost ?? rotExtraction.manaCost,
+                rawTextLower: '${result!.rawTextLower} ${rotExtraction.rawTextLower}',
+                fuzzyTextLower: '${result!.fuzzyTextLower} ${rotExtraction.fuzzyTextLower}',
+                softSetHint: result!.softSetHint ?? rotExtraction.softSetHint,
+              );
+            }
+          }
+        }
+      }
+
+      return result;
+    } catch (e) {
+      debugPrint('OcrService: Error: $e');
+      return null;
+    } finally {
+      _isProcessing = false;
+    }
+  }
+
+  /// Process a camera image. Returns best OcrMatch or null.
+  /// Set [tryFlip] to attempt 180° rotation on failure (slower, use sparingly).
+  Future<OcrMatch?> processImage(CameraImage image, CameraDescription camera, {bool tryFlip = false}) async {
+    if (_isProcessing) return null;
+    _isProcessing = true;
+
+    try {
+      final inputImage = _convertCameraImage(image, camera);
+      if (inputImage == null) return null;
+
+      // Try normal orientation
+      final recognized = await _textRecognizer.processImage(inputImage);
+      final match = await _analyze(recognized, minScore: 35);
+      if (match != null) return match;
+
+      if (!tryFlip) return null;
+
+      // Try 180° flip (upside-down cards)
+      final flipped = _convertCameraImageFlipped(image, camera);
+      if (flipped != null) {
+        final flippedRecognized = await _textRecognizer.processImage(flipped);
+        final flipMatch = await _analyze(flippedRecognized, minScore: 35);
+        if (flipMatch != null) return flipMatch;
+      }
+
+      // Try 90° CW (landscape battlefields) — physical pixel rotation
+      final rot90 = _convertRotated90CW(image, camera);
+      if (rot90 != null) {
+        final rot90Recognized = await _textRecognizer.processImage(rot90);
+        final rot90Match = await _analyze(rot90Recognized, minScore: 25);
+        if (rot90Match != null) return rot90Match;
+      }
+
+      return null;
+    } catch (e) {
+      debugPrint('OcrService: Error: $e');
+      return null;
+    } finally {
+      _isProcessing = false;
+    }
+  }
+
+  /// Multi-point analysis using fingerprint scoring.
+  Future<OcrMatch?> _analyze(RecognizedText text, {int minScore = 25}) async {
+    if (text.blocks.isEmpty) return null;
+
+    // Collect all text
+    final allText = text.blocks.map((b) => b.text).join(' | ');
+    if (debugMode) debugPrint('OCR raw: $allText');
+    final allTextLower = allText.toLowerCase();
+
+    // Collect lines bottom-first
+    final allLines = <String>[];
+    final blocks = text.blocks.toList()
+      ..sort((a, b) => b.boundingBox.top.compareTo(a.boundingBox.top));
+    for (final block in blocks) {
+      for (final line in block.lines) {
+        allLines.add(line.text);
+      }
+    }
+
+    // ── Extract all data points ──
+    final extraction = _extract(allLines, allTextLower, text);
+
+    // ── Score all candidates (in isolate) ──
+    final lookup = CardLookupService.instance;
+    final matches = await lookup.findBestMatches(extraction, minScore: minScore);
+
+    if (matches.isEmpty) return null;
+
+    final best = matches.first;
+    final card = best.fingerprint.card;
+
+    // Determine confidence
+    final confidence = best.score >= 60
+        ? ScanConfidence.high
+        : best.score >= 40
+            ? ScanConfidence.medium
+            : ScanConfidence.low;
+
+    debugPrint('OCR MATCH: ${card.name} (${card.setId} #${card.collectorNumber}) '
+        'score=${best.score} ${best.breakdown}');
+
+    // Get alternatives (same name, different sets)
+    final altFps = lookup.nameIndex[best.fingerprint.nameLower] ?? [];
+    final alternatives = altFps
+        .where((fp) => fp.cardId != card.id)
+        .map((fp) => fp.card)
+        .toList();
+
+    return OcrMatch(
+      card: card,
+      alternatives: alternatives,
+      confidence: confidence,
+      score: best.score,
+      breakdown: best.breakdown,
+    );
+  }
+
+  /// Extract all recognizable data points from OCR text.
+  OcrExtraction _extract(List<String> lines, String allTextLower, RecognizedText recognized) {
+    // Remove pipe separators so multi-block names like "production | surge" match
+    allTextLower = allTextLower.replaceAll(' | ', ' ');
+    final lookup = CardLookupService.instance;
+
+    // 1. CN extraction
+    String? setCode;
+    String? softSetHint;
+    int? collectorNumber;
+    String? cnSuffix;
+    String? cnRaw;
+    bool cnHasSetPrefix = false;
+
+    // OCR misreads 1↔L/l in CN digits: "20L"→"201", "L36"→"136"
+    // Only fix L/l AFTER the set code to protect UNL etc.
+    final _setCodePattern = RegExp(
+      r'(OGN|SFD|OGS|UNL|SFO|OGM|OG5|OGH|SFE|SF0|0GN|0GS|0G5|O6S|06S|065|O65|D6S|DGS|0N|GN|S0|SO|SD|DGN|FND)',
+      caseSensitive: false,
+    );
+    final _fixL = RegExp(r'(?<=\d)[Ll]');
+    final _fixLBefore = RegExp(r'[Ll](?=\d)');
+
+    String _fixLineL(String line) {
+      final setMatch = _setCodePattern.firstMatch(line);
+      if (setMatch != null) {
+        // Only fix L/l in the part AFTER the set code
+        final prefix = line.substring(0, setMatch.end);
+        final rest = line.substring(setMatch.end);
+        return prefix + rest.replaceAll(_fixL, '1').replaceAll(_fixLBefore, '1');
+      }
+      // No set code found — fix entire line (fallback CN path)
+      return line.replaceAll(_fixL, '1').replaceAll(_fixLBefore, '1');
+    }
+
+    for (final line in lines) {
+      final fixedLine = _fixLineL(line);
+      if (debugMode) debugPrint('CN scan line: "$fixedLine"${fixedLine != line ? ' (was: "$line")' : ''}');
+      // 1a. Standard CN (2+ digits): "SFD 097/221", "S0-143", "0GN 022"
+      final m1 = _patternCN.firstMatch(fixedLine);
+      if (m1 != null) {
+        setCode = CardLookupService.fixSetCode(m1.group(1)!);
+        cnRaw = m1.group(2)!;
+        collectorNumber = int.tryParse(cnRaw!.replaceFirst(RegExp(r'^0+'), ''));
+        cnSuffix = m1.group(3);
+        cnHasSetPrefix = true;
+        if (debugMode) debugPrint('CN match: set=$setCode cn=$collectorNumber raw="$cnRaw" suffix=$cnSuffix');
+        break;
+      }
+      // 1b. Single-digit CN only if followed by / (e.g. "SFD 1/221")
+      final m1b = _patternCNSingleDigit.firstMatch(fixedLine);
+      if (m1b != null) {
+        setCode = CardLookupService.fixSetCode(m1b.group(1)!);
+        cnRaw = m1b.group(2)!;
+        collectorNumber = int.tryParse(cnRaw!);
+        cnSuffix = m1b.group(3);
+        cnHasSetPrefix = true;
+        if (debugMode) debugPrint('CN match (1dig): set=$setCode cn=$collectorNumber');
+        break;
+      }
+      // 2. FND: "FND-249/298"
+      final m2 = _patternFnd.firstMatch(fixedLine);
+      if (m2 != null) {
+        setCode = 'FND';
+        cnRaw = m2.group(2)!;
+        collectorNumber = int.tryParse(cnRaw!.replaceFirst(RegExp(r'^0+'), ''));
+        cnSuffix = m2.group(3);
+        if (debugMode) debugPrint('CN match (FND): cn=$collectorNumber');
+        break;
+      }
+      // 3. Token CN: "SFD T03"
+      final m3 = _patternTokenCN.firstMatch(fixedLine);
+      if (m3 != null) {
+        setCode = CardLookupService.fixSetCode(m3.group(1)!);
+        cnRaw = 'T${m3.group(2)!}';
+        collectorNumber = null;
+        if (debugMode) debugPrint('CN match (token): set=$setCode raw=$cnRaw');
+        break;
+      }
+    }
+
+    // 1c. Rune CN: "SFD R01", "SFO RI3", "SFD RDL"
+    // Rune digits are 01-06: OCR misreads 0→I/O/D, 1→L
+    if (collectorNumber == null) {
+      final runeCN = RegExp(
+        r'(OGN|SFD|OGS|UNL|SFO|OGM|OG5|OGH|SFE|SF0|0GN|0GS|0G5|O6S|06S|065|O65|D6S|DGS|0N|GN|S0|SO|SD|DGN)\s*[-·.•:\s]{0,3}R\s*([0-9IODLl]{1,2})([a-z*])?',
+        caseSensitive: false,
+      );
+      for (final line in lines) {
+        final m = runeCN.firstMatch(line);
+        if (m != null) {
+          setCode = CardLookupService.fixSetCode(m.group(1)!);
+          var runeDigits = m.group(2)!.toUpperCase();
+          runeDigits = runeDigits
+              .replaceAll('I', '0').replaceAll('O', '0')
+              .replaceAll('D', '0').replaceAll('L', '1');
+          cnRaw = 'R${runeDigits.padLeft(2, '0')}';
+          collectorNumber = int.tryParse(runeDigits.replaceFirst(RegExp(r'^0+'), ''));
+          cnSuffix = m.group(3);
+          cnHasSetPrefix = true;
+          if (debugMode) debugPrint('CN match (rune): set=$setCode cn=$collectorNumber raw=$cnRaw digits="${m.group(2)}"→$runeDigits');
+          break;
+        }
+      }
+    }
+
+    // 1d. Soft-alias: 3-letter/digit prefix not in strict list, Levenshtein 1 to known set
+    if (collectorNumber == null) {
+      final softCN = RegExp(r'([A-Z0-9]{3})\s*[·.•:\- ]{0,3}\s*(\d{2,3})([a*b])?');
+      for (final line in lines) {
+        final fixedLine = _fixLineL(line);
+        final m = softCN.firstMatch(fixedLine);
+        if (m != null) {
+          final rawPrefix = m.group(1)!.toUpperCase();
+          final resolved = CardLookupService.softAliasResolve(rawPrefix);
+          if (resolved != null) {
+            softSetHint = resolved;
+            cnRaw = m.group(2)!;
+            collectorNumber = int.tryParse(cnRaw!.replaceFirst(RegExp(r'^0+'), ''));
+            cnSuffix = m.group(3);
+            cnHasSetPrefix = true;
+            if (debugMode) debugPrint('CN soft-alias: "$rawPrefix"→$resolved cn=$collectorNumber');
+            break;
+          }
+        }
+      }
+    }
+
+    // 4. Fallback: CN without set prefix: "-076/221", "076/221"
+    // Only on longer text (>50 chars) to avoid false matches on garbled flip-frames
+    if (collectorNumber == null && allTextLower.length > 50) {
+      final noSetCN = RegExp(r'[-–]?\s*(\d{2,3})\s*/\s*(\d{2,3})');
+      for (final line in lines) {
+        // No set code in fallback → fix L/l on entire line
+        final fixedLine = line.replaceAll(_fixL, '1').replaceAll(_fixLBefore, '1');
+        final m = noSetCN.firstMatch(fixedLine);
+        if (m != null) {
+          cnRaw = m.group(1)!;
+          collectorNumber = int.tryParse(cnRaw!.replaceFirst(RegExp(r'^0+'), ''));
+          if (debugMode) debugPrint('CN fallback (no set): cn=$collectorNumber raw="$cnRaw"');
+          break;
+        }
+      }
+    }
+
+    if (debugMode && collectorNumber == null) debugPrint('CN: no match found');
+
+    // Standalone set code detection — also catches OCR misreads like "O6N", "S0"
+    if (setCode == null) {
+      final setMatch = _setInText.firstMatch(allTextLower);
+      if (setMatch != null) {
+        setCode = CardLookupService.fixSetCode(setMatch.group(1)!);
+      }
+    }
+    // Extended fuzzy set detection in raw text
+    if (setCode == null) {
+      if (allTextLower.contains('o6n') || allTextLower.contains('0gn') || allTextLower.contains('ogh')) {
+        setCode = 'OGN';
+      } else if (allTextLower.contains('sfo') || allTextLower.contains('sf0') || allTextLower.contains('sfe')) {
+        setCode = 'SFD';
+      } else if (allTextLower.contains('og5') || allTextLower.contains('0gs')) {
+        setCode = 'OGS';
+      }
+    }
+
+    // 2. Find known card names in text (exact match, min 4 chars)
+    // No blocklist — score system resolves conflicts automatically
+    final namesFound = <String>{};
+    for (final name in lookup.nameIndex.keys) {
+      if (name.length >= 4 && allTextLower.contains(name)) {
+        namesFound.add(name);
+      }
+    }
+
+    // 3. Find known keywords in text (exact only — fuzzy moved to _scoreCandidate)
+    final keywordsFound = <String>{};
+    for (final kw in lookup.allKeywords) {
+      if (kw.length >= 4 && allTextLower.contains(kw)) {
+        keywordsFound.add(kw);
+      }
+    }
+
+    // 4. Find card types — ONLY match UPPERCASE standalone type headers
+    // "SPELL", "CHAMPION UNIT", "UNIT", "GEAR", "RUNE", "BATTLEFIELD"
+    // NOT "unit" in "unit token" or "gear token" (lowercase in card text)
+    final typesFound = <String>{};
+    final allTextOriginal = recognized.blocks.map((b) => b.text).join(' | ');
+    for (final t in CardLookupService.cardTypes) {
+      final upper = t.toUpperCase();
+      if (allTextOriginal.contains(upper)) {
+        typesFound.add(t);
+      } else {
+        for (final v in CardLookupService.typeVariants(t)) {
+          if (allTextOriginal.contains(v.toUpperCase())) {
+            typesFound.add(t);
+            break;
+          }
+        }
+      }
+    }
+
+    // Equipment signal: "attach this to a unit" appears on every Equipment card
+    if (!typesFound.contains('gear') && allTextLower.contains('attach')) {
+      typesFound.add('gear');
+    }
+    // EQUIP partial match for garbled EQUIPMENT: "EOUIP", "EQUIP", "EPO"
+    if (!typesFound.contains('gear')) {
+      if (allTextOriginal.contains('EQUIP') || allTextOriginal.contains('EOUIP')) {
+        typesFound.add('gear');
+      }
+    }
+
+    // 5. Find regions/factions (exact only — fuzzy too expensive per-frame)
+    final regionsFound = <String>{};
+    for (final r in CardLookupService.regionNames) {
+      if (allTextLower.contains(r)) {
+        regionsFound.add(r);
+      }
+    }
+
+    // 6. Mana cost — look for single digit at start of a block (often top-left of card)
+    int? manaCost;
+    if (recognized.blocks.isNotEmpty) {
+      final topBlocks = recognized.blocks.toList()
+        ..sort((a, b) {
+          final dy = a.boundingBox.top.compareTo(b.boundingBox.top);
+          return dy != 0 ? dy : a.boundingBox.left.compareTo(b.boundingBox.left);
+        });
+      for (final block in topBlocks.take(3)) {
+        final trimmed = block.text.trim();
+        if (trimmed.length <= 2 && RegExp(r'^\d{1,2}$').hasMatch(trimmed)) {
+          manaCost = int.tryParse(trimmed);
+          break;
+        }
+      }
+    }
+
+    return OcrExtraction(
+      setCode: setCode,
+      collectorNumber: collectorNumber,
+      cnSuffix: cnSuffix,
+      cnRaw: cnRaw,
+      cnHasSetPrefix: cnHasSetPrefix,
+      namesFound: namesFound,
+      keywordsFound: keywordsFound,
+      typesFound: typesFound,
+      regionsFound: regionsFound,
+      manaCost: manaCost,
+      rawTextLower: allTextLower,
+      fuzzyTextLower: allTextLower, // single frame = same as raw
+      softSetHint: softSetHint,
+    );
+  }
+
+  // ══════════════════════════════════════════════
+  // ── Camera image conversion ──
+  // ══════════════════════════════════════════════
+
+  InputImage? _convertCameraImage(CameraImage image, CameraDescription camera) {
+    final rotation = InputImageRotationValue.fromRawValue(camera.sensorOrientation);
+    if (rotation == null) return null;
+    if (image.planes.isEmpty) return null;
+
+    final format = InputImageFormatValue.fromRawValue(image.format.raw);
+    if (format == null) return null;
+
+    final Uint8List bytes;
+    if (image.planes.length > 1) {
+      final allBytes = WriteBuffer();
+      for (final plane in image.planes) {
+        allBytes.putUint8List(plane.bytes);
+      }
+      bytes = allBytes.done().buffer.asUint8List();
+    } else {
+      bytes = image.planes.first.bytes;
+    }
+
+    return InputImage.fromBytes(
+      bytes: bytes,
+      metadata: InputImageMetadata(
+        size: Size(image.width.toDouble(), image.height.toDouble()),
+        rotation: rotation,
+        format: format,
+        bytesPerRow: image.planes.first.bytesPerRow,
+      ),
+    );
+  }
+
+  /// Physically rotate Y-plane 90° CW for landscape battlefield detection.
+  /// Transposes rows↔cols: pixel at (x,y) moves to (height-1-y, x).
+  InputImage? _convertRotated90CW(CameraImage image, CameraDescription camera) {
+    final rotation = InputImageRotationValue.fromRawValue(camera.sensorOrientation);
+    if (rotation == null) return null;
+    if (image.planes.isEmpty) return null;
+    final format = InputImageFormatValue.fromRawValue(image.format.raw);
+    if (format == null) return null;
+
+    final width = image.width;
+    final height = image.height;
+    final yPlane = image.planes.first;
+    final yBytes = yPlane.bytes;
+    final bytesPerRow = yPlane.bytesPerRow;
+
+    // After 90° CW: new dimensions are height × width
+    final newWidth = height;
+    final newHeight = width;
+    final rotated = Uint8List(newWidth * newHeight);
+
+    for (int y = 0; y < height; y++) {
+      final srcRow = y * bytesPerRow;
+      for (int x = 0; x < width; x++) {
+        // 90° CW: (x, y) → (height-1-y, x) in new image
+        // new image: row = x, col = height-1-y
+        final dstIdx = x * newWidth + (height - 1 - y);
+        if (srcRow + x < yBytes.length && dstIdx < rotated.length) {
+          rotated[dstIdx] = yBytes[srcRow + x];
+        }
+      }
+    }
+
+    // For multi-plane YUV: only Y is rotated, UV planes passed as-is
+    // ML Kit primarily uses Y for text recognition
+    final Uint8List allBytes;
+    if (image.planes.length > 1) {
+      final buffer = WriteBuffer();
+      buffer.putUint8List(rotated);
+      for (int i = 1; i < image.planes.length; i++) {
+        buffer.putUint8List(image.planes[i].bytes);
+      }
+      allBytes = buffer.done().buffer.asUint8List();
+    } else {
+      allBytes = rotated;
+    }
+
+    return InputImage.fromBytes(
+      bytes: allBytes,
+      metadata: InputImageMetadata(
+        size: Size(newWidth.toDouble(), newHeight.toDouble()),
+        rotation: rotation,
+        format: format,
+        bytesPerRow: newWidth,
+      ),
+    );
+  }
+
+  /// Pixel-level 180° flip for upside-down cards.
+  InputImage? _convertCameraImageFlipped(CameraImage image, CameraDescription camera) {
+    final rotation = InputImageRotationValue.fromRawValue(camera.sensorOrientation);
+    if (rotation == null) return null;
+    if (image.planes.isEmpty) return null;
+
+    final format = InputImageFormatValue.fromRawValue(image.format.raw);
+    if (format == null) return null;
+
+    final width = image.width;
+    final height = image.height;
+    final yPlane = image.planes.first;
+    final yBytes = yPlane.bytes;
+    final bytesPerRow = yPlane.bytesPerRow;
+
+    final flipped = Uint8List(yBytes.length);
+    for (int y = 0; y < height; y++) {
+      final srcRow = y * bytesPerRow;
+      final dstRow = (height - 1 - y) * bytesPerRow;
+      for (int x = 0; x < bytesPerRow; x++) {
+        flipped[dstRow + (bytesPerRow - 1 - x)] = yBytes[srcRow + x];
+      }
+    }
+
+    final Uint8List allBytes;
+    if (image.planes.length > 1) {
+      final buffer = WriteBuffer();
+      buffer.putUint8List(flipped);
+      for (int i = 1; i < image.planes.length; i++) {
+        buffer.putUint8List(image.planes[i].bytes);
+      }
+      allBytes = buffer.done().buffer.asUint8List();
+    } else {
+      allBytes = flipped;
+    }
+
+    return InputImage.fromBytes(
+      bytes: allBytes,
+      metadata: InputImageMetadata(
+        size: Size(width.toDouble(), height.toDouble()),
+        rotation: rotation,
+        format: format,
+        bytesPerRow: bytesPerRow,
+      ),
+    );
+  }
+
+  void dispose() {
+    _textRecognizer.close();
+  }
+}

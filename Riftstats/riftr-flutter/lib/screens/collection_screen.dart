@@ -1,6 +1,7 @@
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import '../main.dart';
 import '../theme/app_components.dart';
 import '../theme/app_theme.dart';
 import '../models/card_model.dart';
@@ -14,6 +15,8 @@ import '../widgets/gold_header.dart';
 import '../widgets/section_divider.dart';
 import '../widgets/filter_chip_dropdown.dart';
 import '../widgets/gold_line.dart';
+import '../widgets/riftr_toast.dart';
+import 'scanner_screen.dart';
 
 
 class CollectionScreen extends StatefulWidget {
@@ -32,6 +35,7 @@ class CollectionScreenState extends State<CollectionScreen> {
   final _demo = DemoService.instance;
   final _searchController = TextEditingController();
   final _filterScrollController = ScrollController();
+  final _listScrollController = ScrollController();
 
   String _ownershipFilter = 'all'; // 'all', 'owned', 'missing'
   bool _setsExpanded = false;
@@ -100,13 +104,7 @@ class CollectionScreenState extends State<CollectionScreen> {
       final newTotal = _collectionService.getTotalQuantity(cardId) - 1;
       final warning = _collectionService.canReduce(cardId, newTotal);
       if (warning != null) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(warning),
-            backgroundColor: AppColors.loss,
-            duration: const Duration(seconds: 3),
-          ),
-        );
+        RiftrToast.error(context, warning);
         return;
       }
       _collectionService.decrement(cardId, foil: foil);
@@ -126,13 +124,7 @@ class CollectionScreenState extends State<CollectionScreen> {
     // Show toast if listings were auto-adjusted
     final msg = _collectionService.consumeListingSyncMessage();
     if (msg != null && mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(msg),
-          backgroundColor: AppColors.amber500,
-          duration: const Duration(seconds: 3),
-        ),
-      );
+      RiftrToast.info(context, msg);
     }
   }
 
@@ -210,6 +202,7 @@ class CollectionScreenState extends State<CollectionScreen> {
   void dispose() {
     _searchController.dispose();
     _filterScrollController.dispose();
+    _listScrollController.dispose();
     _collectionService.removeListener(_onCollectionChanged);
     _demo.removeListener(_onCollectionChanged);
     super.dispose();
@@ -217,6 +210,7 @@ class CollectionScreenState extends State<CollectionScreen> {
 
   void resetScroll() {
     if (_filterScrollController.hasClients) _filterScrollController.jumpTo(0);
+    if (_listScrollController.hasClients) _listScrollController.animateTo(0, duration: const Duration(milliseconds: 300), curve: Curves.easeOut);
   }
 
   @override
@@ -227,7 +221,40 @@ class CollectionScreenState extends State<CollectionScreen> {
       );
     }
 
-    return _buildCardGrid();
+    final viewPadding = MediaQuery.of(context).viewPadding;
+
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        _buildCardGrid(),
+        // Scanner FAB — synced with NavBar slide
+        Positioned(
+          right: AppSpacing.lg,
+          bottom: 68 + viewPadding.bottom,
+          child: ValueListenableBuilder<double>(
+            valueListenable: AppShell.navSlideNotifier,
+            builder: (context, navT, _) {
+              return Transform.translate(
+                offset: Offset(0, (1 - navT) * 80),
+                child: GestureDetector(
+                  onTap: () => Navigator.of(context).push(
+                    MaterialPageRoute(builder: (_) => const ScannerScreen()),
+                  ),
+                  child: Container(
+                    width: 56, height: 56,
+                    decoration: const BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: AppColors.amber400,
+                    ),
+                    child: const Icon(Icons.camera_alt, color: AppColors.textPrimary, size: 28),
+                  ),
+                ),
+              );
+            },
+          ),
+        ),
+      ],
+    );
   }
 
   // React: bg-slate-900 border border-amber-500/10 rounded-3xl p-6
@@ -611,6 +638,7 @@ class CollectionScreenState extends State<CollectionScreen> {
         final portraitHeight = colWidth * 1.5 + 18;
 
         return ListView.builder(
+          controller: _listScrollController,
           padding: const EdgeInsets.only(bottom: 80),
           itemCount: rows.length + 1, // +1 for header
           itemBuilder: (context, index) {
