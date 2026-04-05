@@ -426,67 +426,72 @@ class PhashService {
     final gw = (_gemCropW * cardW).round().clamp(1, cardW);
     final gh = (_gemCropH * cardH).round().clamp(1, cardH);
 
-    // 25 probes: ±8px in 4px steps
-    const step = 4;
-    const range = 8;
+    // Sliding window: ±15px in 3px steps = 11×11 = 121 probes
+    // Balance: enough for rect boundary error, not so much that false matches occur
+    const step = 3;
+    const range = 15;
 
-    // For each variant, find the best (lowest) SAD across all probe positions
-    final sadScores = <String, double>{};
+    // Strategy: Base is default. Only search for PROMO indicators.
+    // If any probe position matches a promo template well → Promo.
+    // If not → Base.
+    final promoVars = promoIds != null
+        ? withTemplates.where((id) => promoIds.contains(id)).toList()
+        : <String>[];
+    final baseVars = withTemplates.where((id) => !promoVars.contains(id)).toList();
 
-    for (final id in withTemplates) {
-      final template = _gemTemplates[id]!;
+    if (promoVars.isEmpty) return null;
+
+    // Search: does any probe position match a promo template?
+    String? bestPromoId;
+    double bestPromoSad = double.infinity;
+
+    for (final promoId in promoVars) {
+      final template = _gemTemplates[promoId]!;
       if (template.length != _gemTemplateW * _gemTemplateH) continue;
-
-      double bestSad = double.infinity;
 
       for (int dy = -range; dy <= range; dy += step) {
         for (int dx = -range; dx <= range; dx += step) {
           final gx = (baseGx + dx).clamp(0, cardW - gw);
           final gy = (baseGy + dy).clamp(0, cardH - gh);
 
-          // Extract and resize camera gem crop to template size
           final cropPixels = _extractAndResize(
             cameraCardPixels, cardW, cardH, gx, gy, gw, gh,
             _gemTemplateW, _gemTemplateH,
           );
           if (cropPixels == null) continue;
 
-          // Normalize camera crop to 0-255
           final normalized = _normalize(cropPixels);
 
-          // SAD: mean absolute difference
           double sum = 0;
           for (int i = 0; i < normalized.length; i++) {
             sum += (normalized[i] - template[i]).abs();
           }
           final meanSad = sum / normalized.length;
 
-          if (meanSad < bestSad) bestSad = meanSad;
+          if (meanSad < bestPromoSad) {
+            bestPromoSad = meanSad;
+            bestPromoId = promoId;
+          }
         }
       }
-
-      sadScores[id] = bestSad;
     }
 
-    if (sadScores.isEmpty) return null;
+    // Promo threshold: if best SAD < 35, promo badge was found
+    const promoThreshold = 42.0;
+    final isPromo = bestPromoSad < promoThreshold;
+    final defaultBaseId = baseVars.isNotEmpty ? baseVars.first : withTemplates.first;
+    final resultId = isPromo ? bestPromoId! : defaultBaseId;
 
-    // Find best (lowest SAD)
-    final sorted = sadScores.entries.toList()
-      ..sort((a, b) => a.value.compareTo(b.value));
-    final best = sorted.first;
-    final second = sorted.length > 1 ? sorted[1] : null;
-    final gap = second != null ? second.value - best.value : 0.0;
-
-    final comparisons = sorted.map((e) => PhashComparison(
-      cardId: e.key,
+    final comparisons = withTemplates.map((id) => PhashComparison(
+      cardId: id,
       fullDist: 0,
-      gemDist: e.value.round(),
+      gemDist: id == bestPromoId ? bestPromoSad.round() : 99,
     )).toList();
 
     return PhashResult(
-      bestId: best.key,
+      bestId: resultId,
       stage: 3,
-      reason: 'SAD template (${best.value.toStringAsFixed(1)} vs ${second?.value.toStringAsFixed(1)}, gap=${gap.toStringAsFixed(1)})',
+      reason: 'SAD promo-detect (best=${bestPromoSad.toStringAsFixed(1)}, thresh=$promoThreshold → ${isPromo ? "PROMO" : "base"})',
       comparisons: comparisons,
     );
   }

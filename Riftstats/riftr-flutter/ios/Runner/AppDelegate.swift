@@ -105,50 +105,51 @@ import Vision
       return
     }
 
-    let request = VNDetectRectanglesRequest { (req, error) in
-      guard error == nil,
-            let observations = req.results as? [VNRectangleObservation] else {
-        result(nil)
-        return
-      }
-
-      // Find best card-ratio rectangle
-      let cardRatio: Float = 0.716
-      var bestScore: Float = 0
-      var bestRect: [String: Int]? = nil
-
-      for obs in observations {
-        let box = obs.boundingBox
-        let x = Int(box.origin.x * CGFloat(width))
-        let y = Int((1.0 - box.origin.y - box.height) * CGFloat(height))
-        let w = Int(box.width * CGFloat(width))
-        let h = Int(box.height * CGFloat(height))
-        guard w > 0 && h > 0 else { continue }
-
-        let ratio = Float(w) / Float(h)
-        let ratioDiff = abs(ratio - cardRatio)
-        if ratioDiff > 0.20 { continue } // wider tolerance for perspective distortion
-
-        let area = Float(w * h) / Float(width * height)
-        let score = area * (1.0 - ratioDiff * 3)
-        if score > bestScore {
-          bestScore = score
-          bestRect = ["x": x, "y": y, "w": w, "h": h]
-        }
-      }
-
-      result(bestRect)
-    }
-
+    let request = VNDetectRectanglesRequest()
     request.minimumAspectRatio = 0.55
     request.maximumAspectRatio = 0.90
     request.minimumSize = 0.10
     request.maximumObservations = 10
     request.minimumConfidence = 0.2
 
-    DispatchQueue.global(qos: .userInitiated).async {
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       do {
-        try VNImageRequestHandler(cgImage: cgImage, options: [:]).perform([request])
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        try handler.perform([request])
+
+        // Find best card-ratio rectangle
+        let cardRatio: Float = 0.716
+        var bestScore: Float = 0
+        var bestRect: [String: Int]? = nil
+
+        if let observations = request.results as? [VNRectangleObservation] {
+          for obs in observations {
+            let box = obs.boundingBox
+            let x = Int(box.origin.x * CGFloat(width))
+            let y = Int((1.0 - box.origin.y - box.height) * CGFloat(height))
+            let w = Int(box.width * CGFloat(width))
+            let h = Int(box.height * CGFloat(height))
+            guard w > 0 && h > 0 else { continue }
+
+            let ratio = Float(w) / Float(h)
+            let ratioDiff = abs(ratio - cardRatio)
+            if ratioDiff > 0.20 { continue }
+
+            let area = Float(w * h) / Float(width * height)
+            let score = area * (1.0 - ratioDiff * 3)
+            if score > bestScore {
+              bestScore = score
+              bestRect = ["x": x, "y": y, "w": w, "h": h]
+            }
+          }
+        }
+
+        if bestRect != nil {
+          result(bestRect)
+          return
+        }
+
+        result(nil)
       } catch {
         result(nil)
       }

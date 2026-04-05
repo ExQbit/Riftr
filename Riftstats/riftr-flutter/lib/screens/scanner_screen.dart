@@ -69,7 +69,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
   Uint8List? _prevLuminance;
   double _motionPercent = 0;
   static const _motionThreshold = 18.0;
-  static const _stableThreshold = 2.0;
+  static const _stableThreshold = 8.0; // hand-held: 3-8% trembling is normal, not movement
   static const _rectMotionLimit = 10.0; // collect native rects during hand trembles (card still visible)
   Timer? _settlingTimer;
 
@@ -172,28 +172,22 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     _lastYHeight = height;
     _lastYStride = image.planes.first.bytesPerRow;
 
-    // ── Collect native rects every frame (overlay-cropped) ──
-    // Collect if: state is not MOTION (covers WAITING/SETTLING/SCANNING)
-    //         OR: motion is low enough even during MOTION state (hand trembles)
-    final _canCollectRect = _state != ScanState.motion || _motionPercent < _rectMotionLimit;
-    if (_nativeRects.length < 30 && _canCollectRect) {
-      final ow = (width * 0.90).round().clamp(1, width);
-      final oh = (ow * 7 ~/ 5).clamp(1, height);
-      final ox = ((width - ow) ~/ 2).clamp(0, width - ow);
-      final oy = ((height - oh) ~/ 2).clamp(0, height - oh);
+    // ── Collect native rects every frame (full frame, no crop) ──
+    // Collect when not in active movement (MOTION > 10%)
+    final canCollect = _state != ScanState.motion || _motionPercent < _rectMotionLimit;
+    if (_nativeRects.length < 30 && canCollect) {
+      // Strip stride padding and send full frame to Vision
+      final stripped = Uint8List(width * height);
       final stride = image.planes.first.bytesPerRow;
-
-      final cropped = Uint8List(ow * oh);
-      for (int row = 0; row < oh; row++) {
-        final src = (oy + row) * stride + ox;
-        cropped.setRange(row * ow, row * ow + ow, luma, src);
+      for (int row = 0; row < height; row++) {
+        stripped.setRange(row * width, row * width + width, luma, row * stride);
       }
 
       NativeRectService.instance.detectCardRect(
-        yPlane: cropped, width: ow, height: oh, bytesPerRow: ow,
+        yPlane: stripped, width: width, height: height, bytesPerRow: width,
       ).then((rect) {
         if (rect != null) {
-          _nativeRects.add([rect[0] + ox, rect[1] + oy, rect[2], rect[3]]);
+          _nativeRects.add(rect);
         }
       });
     }
@@ -301,7 +295,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
         final variantCount = (_lookup.nameIndex[nameLower] ?? []).length;
 
         if (variantCount > 1) {
-          // Variants exist → don't accept yet. Enter SCANNING to collect
+          // Variants exist, confident match → enter SCANNING to collect
           // more OCR frames (for CN suffix) and native rects (for pHash).
           _waitingMatch = match;
           _setState(ScanState.scanning);
@@ -452,112 +446,38 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
         debugPrint('Scanner F$_scanFrameCount score=0 (no candidates)');
       }
 
-      // ── Variant refinement mode: WAITING already identified the card,
-      // SCANNING collects native rects + OCR anchors for precise pHash.
+      // ── Variant refinement: WAITING already identified the card ──
       if (_waitingMatch != null) {
-        final calibrated = _calibrateCardRect(_waitingMatch!.card.type?.toLowerCase());
-        final hasGoodRect = calibrated != null && calibrated.score >= 0.85;
-
-        const minRefinementFrames = 5;
-        const maxVariantRefinement = 30;
-        if ((hasGoodRect && _scanFrameCount >= minRefinementFrames) || _scanFrameCount >= maxVariantRefinement) {
-          if (_debugMode) {
-            debugPrint('Scanner: Variant refinement done frame $_scanFrameCount '
-                '(rect: ${hasGoodRect ? "score=${calibrated!.score.toStringAsFixed(2)}" : "none"})');
-          }
+        if (_scanFrameCount >= _maxScanFrames) {
+          if (_debugMode) debugPrint('Scanner: Variant refinement done F$_scanFrameCount');
           final wm = _waitingMatch!;
           _waitingMatch = null;
           _acceptMatch(wm);
           return;
         }
-        // Keep scanning for better rect
         if (mounted) setState(() {});
         return;
       }
 
-      // ── Normal SCANNING mode (no prior match) ──
+      // ── Normal SCANNING: early-exit or max frames ──
 
-      // Early-exit: high cumulative score
       if (bestScore >= _earlyExitScore && matches.isNotEmpty) {
         final best = matches.first;
         final card = best.fingerprint.card;
-        final nameLower = card.name.toLowerCase();
-        final variantCount = (_lookup.nameIndex[nameLower] ?? []).length;
-
-        if (variantCount > 1) {
-          // Has variants → enter refinement mode to collect good rect
-          final match = OcrMatch(card: card, confidence: ScanConfidence.high,
-              score: best.score, breakdown: best.breakdown);
-          _waitingMatch = match;
-          if (_debugMode) {
-            debugPrint('Scanner: Early-exit F$_scanFrameCount score=$bestScore '
-                '"${card.name}" has $variantCount variants → refinement');
-          }
-          // Don't return — keep scanning for good rect
-        } else {
-          debugPrint('Scanner: Early-exit frame $_scanFrameCount score=$bestScore');
-          _acceptMatch(OcrMatch(card: card, confidence: ScanConfidence.high,
-              score: best.score, breakdown: best.breakdown));
-          return;
-        }
+        debugPrint('Scanner: Early-exit F$_scanFrameCount score=$bestScore');
+        _acceptMatch(OcrMatch(card: card, confidence: ScanConfidence.high,
+            score: best.score, breakdown: best.breakdown));
+        return;
       }
 
-      // Max frames reached
-      const maxVariantFrames = 30; // extended limit for variant cards
       if (_scanFrameCount >= _maxScanFrames) {
-        // If in variant refinement, accept now with whatever we have
-        if (_waitingMatch != null) {
-          if (_scanFrameCount < maxVariantFrames) {
-            // Still under extended limit — check for good rect
-            final cal = _calibrateCardRect(_waitingMatch!.card.type?.toLowerCase());
-            if (cal != null && cal.score >= 0.70) {
-              if (_debugMode) debugPrint('Scanner: Variant refinement got rect at F$_scanFrameCount');
-              final wm = _waitingMatch!;
-              _waitingMatch = null;
-              _acceptMatch(wm);
-              return;
-            }
-            // Keep scanning for better rect
-            if (mounted) setState(() {});
-            return;
-          }
-          if (_debugMode) debugPrint('Scanner: Variant refinement timeout at F$_scanFrameCount');
-          final wm = _waitingMatch!;
-          _waitingMatch = null;
-          _acceptMatch(wm);
-          return;
-        }
-
         if (bestScore >= _minAcceptScore && matches.isNotEmpty) {
           final best = matches.first;
           final card = best.fingerprint.card;
-          final nameLower = card.name.toLowerCase();
-          final variantCount = (_lookup.nameIndex[nameLower] ?? []).length;
-
-          // Variant card without good rect: extend scanning
-          if (variantCount > 1 && _scanFrameCount < maxVariantFrames) {
-            final cal = _calibrateCardRect(card.type?.toLowerCase());
-            if (cal == null || cal.score < 0.85) {
-              // No good rect yet — enter refinement and keep scanning
-              if (_waitingMatch == null) {
-                _waitingMatch = OcrMatch(card: card,
-                    confidence: bestScore >= 50 ? ScanConfidence.medium : ScanConfidence.low,
-                    score: best.score, breakdown: best.breakdown);
-                if (_debugMode) {
-                  debugPrint('Scanner: F$_scanFrameCount "${ card.name}" ($variantCount variants) '
-                      'no rect → extending scan');
-                }
-              }
-              if (mounted) setState(() {});
-              return;
-            }
-          }
-
-          final match = OcrMatch(card: card,
+          debugPrint('Scanner: Accept F$_scanFrameCount score=$bestScore');
+          _acceptMatch(OcrMatch(card: card,
               confidence: bestScore >= 50 ? ScanConfidence.medium : ScanConfidence.low,
-              score: best.score, breakdown: best.breakdown);
-          debugPrint('Scanner: Accept after $_scanFrameCount frames cumScore=$bestScore');
-          _acceptMatch(match);
+              score: best.score, breakdown: best.breakdown));
         } else {
           debugPrint('Scanner: No match after $_scanFrameCount frames (cumBest=$bestScore)');
           _debugOcr = 'no match (cum=$bestScore)';
@@ -638,26 +558,42 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
         final variantIds = allVariants.map((c) => c.id).toList();
         final promoIds = allVariants.where((c) => c.isPromo).map((c) => c.id).toSet();
 
-        // Card rect: only use scored + calibrated native rect.
-        // No blind fallbacks — bad rects produce wrong variant picks.
+        // Card rect: best calibrated native rect, or OCR-anchor fallback
         List<int>? cardRect;
 
+        // 1. Best scored native rect
         final calibrated = _calibrateCardRect(match.card.type?.toLowerCase());
         if (calibrated != null) {
           cardRect = calibrated.rect;
         }
 
+        // 2. OCR-anchor fallback (from name + CN text positions)
+        if (cardRect == null && _cumNameBox != null && _cumCnBox != null) {
+          final nameCY = (_cumNameBox![1] + _cumNameBox![3]) / 2;
+          final cnCY = (_cumCnBox![1] + _cumCnBox![3]) / 2;
+          final cnLeft = _cumCnBox![0];
+          final dist = (cnCY - nameCY).abs();
+          if (dist > 80) {
+            double nameYPct = 0.58;
+            final ct = match.card.type?.toLowerCase() ?? '';
+            if (ct == 'legend') nameYPct = 0.62;
+            else if (ct == 'rune') nameYPct = 0.72;
+            if (ct != 'battlefield') {
+              final cardH = dist / (0.97 - nameYPct);
+              final cardW = cardH * 0.716;
+              cardRect = [
+                (cnLeft - cardW * 0.09).round().clamp(0, _lastYWidth - 1),
+                (nameCY - nameYPct * cardH).round().clamp(0, _lastYHeight - 1),
+                cardW.round().clamp(1, _lastYWidth),
+                cardH.round().clamp(1, _lastYHeight),
+              ];
+              if (_debugMode) debugPrint('pHash OCR-anchor rect: (${cardRect[0]},${cardRect[1]}) ${cardRect[2]}x${cardRect[3]}');
+            }
+          }
+        }
+
         if (cardRect == null && _debugMode) {
-          debugPrint('pHash: no quality rect (${_nativeRects.length} native rects) → skipping variant detection');
-          for (int i = 0; i < _nativeRects.length; i++) {
-            final r = _nativeRects[i];
-            final ratio = r[2] > 0 && r[3] > 0 ? (r[2] / r[3]).toStringAsFixed(3) : '?';
-            debugPrint('  rejected[$i]: (${r[0]},${r[1]}) ${r[2]}x${r[3]} ratio=$ratio');
-          }
-          // Save debug frame with ALL rejected rects drawn
-          if (_nativeRects.isNotEmpty && _lastYPlane != null) {
-            _saveRejectedRectsDebug(match.card.name, _nativeRects);
-          }
+          debugPrint('pHash: no rect → skipping variant detection');
         }
 
         if (cardRect != null) {
