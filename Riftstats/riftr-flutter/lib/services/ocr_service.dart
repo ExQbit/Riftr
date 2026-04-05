@@ -342,8 +342,10 @@ class OcrService {
           runeDigits = runeDigits
               .replaceAll('I', '0').replaceAll('O', '0')
               .replaceAll('D', '0').replaceAll('L', '1');
+          final runeNum = int.tryParse(runeDigits);
+          if (runeNum == null || runeNum < 1 || runeNum > 6) continue; // R01-R06 only
           cnRaw = 'R${runeDigits.padLeft(2, '0')}';
-          collectorNumber = int.tryParse(runeDigits.replaceFirst(RegExp(r'^0+'), ''));
+          collectorNumber = runeNum;
           cnSuffix = m.group(3);
           cnHasSetPrefix = true;
           if (debugMode) debugPrint('CN match (rune): set=$setCode cn=$collectorNumber raw=$cnRaw digits="${m.group(2)}"→$runeDigits');
@@ -374,10 +376,10 @@ class OcrService {
       }
     }
 
-    // 4. Fallback: CN without set prefix: "-076/221", "076/221"
+    // 4. Fallback: CN without set prefix: "-076/221", "076/221", "180a/221"
     // Only on longer text (>50 chars) to avoid false matches on garbled flip-frames
     if (collectorNumber == null && allTextLower.length > 50) {
-      final noSetCN = RegExp(r'[-–]?\s*(\d{2,3})\s*/\s*(\d{2,3})');
+      final noSetCN = RegExp(r'[-–]?\s*(\d{2,3})([a*b])?\s*/\s*(\d{2,3})');
       for (final line in lines) {
         // No set code in fallback → fix L/l on entire line
         final fixedLine = line.replaceAll(_fixL, '1').replaceAll(_fixLBefore, '1');
@@ -385,7 +387,8 @@ class OcrService {
         if (m != null) {
           cnRaw = m.group(1)!;
           collectorNumber = int.tryParse(cnRaw!.replaceFirst(RegExp(r'^0+'), ''));
-          if (debugMode) debugPrint('CN fallback (no set): cn=$collectorNumber raw="$cnRaw"');
+          cnSuffix ??= m.group(2);
+          if (debugMode) debugPrint('CN fallback (no set): cn=$collectorNumber raw="$cnRaw" suffix=$cnSuffix');
           break;
         }
       }
@@ -483,6 +486,51 @@ class OcrService {
       }
     }
 
+    // 7. OCR-Anchor bounding boxes for pHash card rect calculation
+    // Find the bounding box of the recognized card name and CN in the camera frame
+    List<double>? nameBox;
+    List<double>? cnBox;
+
+    // Find name: search blocks for the first word(s) of the longest matching name
+    if (namesFound.isNotEmpty) {
+      final bestName = namesFound.reduce((a, b) => a.length > b.length ? a : b);
+      // Use first two words for stricter match ("eye of" not just "eye")
+      final words = bestName.toLowerCase().split(' ').where((w) => w.length >= 2).toList();
+      final searchPrefix = words.take(2).join(' ');
+
+      if (searchPrefix.isNotEmpty) {
+        for (final block in recognized.blocks) {
+          final blockText = block.text.toLowerCase().replaceAll('\n', ' ');
+          if (blockText.contains(searchPrefix)) {
+            final r = block.boundingBox;
+            nameBox = [r.left, r.top, r.right, r.bottom];
+            break;
+          }
+        }
+      }
+    }
+
+    // Find CN: search blocks for CN text that is BELOW the name anchor
+    // On a card, the CN is always below the name. Pick the closest one.
+    if (cnRaw != null) {
+      final nameBottomY = nameBox != null ? nameBox[3] : 0.0;
+      double bestDist = double.infinity;
+      for (final block in recognized.blocks) {
+        if (block.text.contains(cnRaw!)) {
+          final r = block.boundingBox;
+          final blockCenterY = (r.top + r.bottom) / 2;
+          // CN must be below name (or at least not above it)
+          if (nameBox != null && blockCenterY < nameBottomY - 20) continue;
+          // Pick the closest CN below the name
+          final dist = (blockCenterY - nameBottomY).abs();
+          if (dist < bestDist) {
+            bestDist = dist;
+            cnBox = [r.left, r.top, r.right, r.bottom];
+          }
+        }
+      }
+    }
+
     return OcrExtraction(
       setCode: setCode,
       collectorNumber: collectorNumber,
@@ -497,6 +545,8 @@ class OcrService {
       rawTextLower: allTextLower,
       fuzzyTextLower: allTextLower, // single frame = same as raw
       softSetHint: softSetHint,
+      nameBox: nameBox,
+      cnBox: cnBox,
     );
   }
 

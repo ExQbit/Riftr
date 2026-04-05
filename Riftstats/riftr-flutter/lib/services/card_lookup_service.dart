@@ -279,9 +279,11 @@ class CardLookupService {
     final kwIdx = <String, List<CardFingerprint>>{};
     final allKw = <String>{};
 
+    // Deduplicate: getLookup() stores cards by both ID and name,
+    // so the same card appears twice. Use a seen-set on card.id to skip dupes.
+    final seen = <String>{};
     for (final card in lookup.values) {
-      // Skip name-only lookup entries (CardService stores by ID and name)
-      if (card.collectorNumber == null && card.setId == null) continue;
+      if (!seen.add(card.id)) continue; // already processed this card
 
       final fp = CardFingerprint.fromCard(card);
       fps.add(fp);
