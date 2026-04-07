@@ -666,7 +666,7 @@ class OcrService {
       }
       final upperLimit = highestTextTop == double.infinity
           ? recognized.blocks.first.boundingBox.top
-          : highestTextTop - 150; // mana must be well above the type line
+          : highestTextTop - 250; // mana must be FAR above the type line (~50% of card height)
       if (debugMode) {
         debugPrint('Mana search: ${topBlocks.length} blocks, upperLimit=${upperLimit.round()}');
         for (int i = 0; i < topBlocks.length && i < 8; i++) {

@@ -474,6 +474,18 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
           _tryManaCropOcr();
         }
 
+        // ── Badge crop OCR: detect PROMO text on the badge ──
+        // Run every 3rd frame if we have enough grid anchors
+        if (!_cumPromoDetected &&
+            _scanFrameCount >= 3 &&
+            _scanFrameCount % 3 == 0 &&
+            (_gridAnchors.containsKey('type') || _gridAnchors.containsKey('name')) &&
+            _gridAnchors.containsKey('cn') &&
+            _lastYPlane != null) {
+          if (_debugMode) debugPrint('Badge OCR: attempting F$_scanFrameCount');
+          _tryBadgeCropOcr();
+        }
+
         _cumNames.addAll(extraction.namesFound);
         for (final kw in extraction.keywordsFound) {
           if (_cumKeywords.length >= 10) break;
@@ -654,7 +666,22 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
       }
     }
 
-    // pHash variant detection (fallback when no suffix available)
+    // Badge OCR promo detection — if "PROMO" was read on the badge, pick promo variant
+    if (allVariants.length > 1 && _cumPromoDetected) {
+      final promoVariant = allVariants.where((c) => c.isPromo).toList();
+      if (promoVariant.isNotEmpty) {
+        resolvedCard = promoVariant.first;
+        if (_debugMode) {
+          debugPrint('Variant resolved by badge OCR: '
+              '${resolvedCard.setId}#${resolvedCard.collectorNumber} (PROMO detected)');
+        }
+        final resolvedAlts = allVariants.where((c) => c.id != resolvedCard.id).toList();
+        _addCard(resolvedCard, resolvedAlts);
+        return;
+      }
+    }
+
+    // pHash variant detection (fallback when no suffix and no badge OCR)
     if (allVariants.length > 1 && _phash.isReady && _lastYPlane != null) {
       try {
         final variantIds = allVariants.map((c) => c.id).toList();
@@ -811,6 +838,78 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
         .toList();
 
     _addCard(resolvedCard, resolvedAlts);
+  }
+
+  // ══════════════════════════════════════════════
+  // ── Badge crop OCR: detect PROMO text on the badge ──
+  // ══════════════════════════════════════════════
+
+  /// Crop the badge region from the Y-plane and run OCR to detect "PROMO" text.
+  /// Uses the Grid to calculate where the badge should be.
+  void _tryBadgeCropOcr() async {
+    // Use any two anchors to get card geometry
+    final gridRect = _calculateCardRectFromGrid();
+    if (gridRect == null) return;
+
+    final cx = gridRect.rect[0].toDouble();
+    final cy = gridRect.rect[1].toDouble();
+    final cw = gridRect.rect[2].toDouble();
+    final ch = gridRect.rect[3].toDouble();
+
+    // Badge region: centered on the PROMO badge between card text and CN line
+    // PROMO text arc sits at ~90-93% Y. Use 90% start, 5% height.
+    final badgeX = (cx + cw * 0.30).round().clamp(0, _lastYWidth - 1);
+    final badgeY = (cy + ch * 0.90).round().clamp(0, _lastYHeight - 1);
+    final badgeW = (cw * 0.40).round().clamp(1, _lastYWidth - badgeX);
+    final badgeH = (ch * 0.05).round().clamp(1, _lastYHeight - badgeY);
+
+    if (_debugMode) debugPrint('Badge crop: ($badgeX,$badgeY) ${badgeW}x$badgeH');
+    if (badgeW < 30 || badgeH < 15) {
+      if (_debugMode) debugPrint('Badge crop: too small, skipping');
+      return;
+    }
+
+    // Crop Y-plane and convert to 3x upscaled BGRA grayscale
+    // ML Kit needs sufficient pixel density to read small text like "PROMO"
+    const scale = 3;
+    final scaledW = badgeW * scale;
+    final scaledH = badgeH * scale;
+    final bgra = Uint8List(scaledW * scaledH * 4);
+    for (int sy = 0; sy < scaledH; sy++) {
+      for (int sx = 0; sx < scaledW; sx++) {
+        final origX = badgeX + (sx ~/ scale);
+        final origY = badgeY + (sy ~/ scale);
+        final srcIdx = origY * _lastYStride + origX;
+        final v = srcIdx >= 0 && srcIdx < _lastYPlane!.length ? _lastYPlane![srcIdx] : 0;
+        final idx = (sy * scaledW + sx) * 4;
+        bgra[idx] = v; bgra[idx + 1] = v; bgra[idx + 2] = v; bgra[idx + 3] = 255;
+      }
+    }
+
+    try {
+      final recognized = await _ocr.recognizeCrop(bgra, scaledW, scaledH);
+      if (recognized == null || recognized.blocks.isEmpty) return;
+
+      final text = recognized.blocks.map((b) => b.text.toLowerCase()).join(' ');
+
+      // Check for PROMO and common OCR misreads
+      final promoPatterns = ['promo', 'prom0', 'pr0mo', 'promd', 'promq', 'prgmo'];
+      for (final p in promoPatterns) {
+        if (text.contains(p)) {
+          _cumPromoDetected = true;
+          if (_debugMode) {
+            debugPrint('Badge crop OCR: PROMO detected! text="$text" at ($badgeX,$badgeY) ${badgeW}x$badgeH');
+          }
+          return;
+        }
+      }
+
+      if (_debugMode) {
+        debugPrint('Badge crop OCR: no promo in "$text" at ($badgeX,$badgeY) ${badgeW}x$badgeH');
+      }
+    } catch (e) {
+      if (_debugMode) debugPrint('Badge crop OCR error: $e');
+    }
   }
 
   // ══════════════════════════════════════════════
