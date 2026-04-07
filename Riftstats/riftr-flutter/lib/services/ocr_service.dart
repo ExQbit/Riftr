@@ -1,8 +1,11 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:typed_data';
-import 'dart:ui';
+import 'dart:ui' as ui;
+import 'dart:ui' show Size;
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import '../models/card_model.dart';
 import '../models/card_fingerprint.dart';
@@ -74,13 +77,17 @@ class OcrService {
 
   /// Extract data points from a camera frame without scoring.
   /// Set [tryRotate90] to also try 90° CW for landscape battlefields.
+  /// Debug counter for saving OCR input images
+  int _ocrDebugFrameCount = 0;
+
   Future<OcrExtraction?> extractFrame(CameraImage image, CameraDescription camera, {bool tryRotate90 = false}) async {
     if (_isProcessing) return null;
     _isProcessing = true;
     try {
-      final inputImage = _convertCameraImage(image, camera);
-      if (inputImage == null) return null;
-      final recognized = await _textRecognizer.processImage(inputImage);
+      // Primary: grayscale — ML Kit reads stylized card names better without color
+      final grayInput = _convertCameraImage(image, camera, grayscaleOnly: true);
+      if (grayInput == null) return null;
+      final recognized = await _textRecognizer.processImage(grayInput);
 
       OcrExtraction? result;
       if (recognized.blocks.isNotEmpty) {
@@ -96,6 +103,49 @@ class OcrService {
           }
         }
         result = _extract(allLines, allTextLower, recognized);
+      }
+
+      // Fallback: color pass if grayscale found no names
+      if (result != null && result!.namesFound.isEmpty) {
+        final colorInput = _convertCameraImage(image, camera);
+        if (colorInput != null) {
+          final colorRecognized = await _textRecognizer.processImage(colorInput);
+          if (colorRecognized.blocks.isNotEmpty) {
+            final colorText = colorRecognized.blocks.map((b) => b.text).join(' | ');
+            if (debugMode) debugPrint('OCR color fallback: $colorText');
+            final colorLower = colorText.toLowerCase();
+            final colorLines = <String>[];
+            for (final block in colorRecognized.blocks) {
+              for (final line in block.lines) {
+                colorLines.add(line.text);
+              }
+            }
+            final colorExtraction = _extract(colorLines, colorLower, colorRecognized);
+            if (colorExtraction.namesFound.isNotEmpty) {
+              // Merge color names into grayscale result
+              result = OcrExtraction(
+                setCode: result!.setCode ?? colorExtraction.setCode,
+                collectorNumber: result!.collectorNumber ?? colorExtraction.collectorNumber,
+                cnSuffix: result!.cnSuffix ?? colorExtraction.cnSuffix,
+                cnRaw: result!.cnRaw ?? colorExtraction.cnRaw,
+                cnHasSetPrefix: result!.cnHasSetPrefix || colorExtraction.cnHasSetPrefix,
+                namesFound: {...result!.namesFound, ...colorExtraction.namesFound},
+                keywordsFound: {...result!.keywordsFound, ...colorExtraction.keywordsFound},
+                typesFound: {...result!.typesFound, ...colorExtraction.typesFound},
+                regionsFound: {...result!.regionsFound, ...colorExtraction.regionsFound},
+                manaCost: result!.manaCost ?? colorExtraction.manaCost,
+                rawTextLower: '${result!.rawTextLower} ${colorExtraction.rawTextLower}',
+                fuzzyTextLower: '${result!.fuzzyTextLower} ${colorExtraction.fuzzyTextLower}',
+                softSetHint: result!.softSetHint ?? colorExtraction.softSetHint,
+                manaBox: result!.manaBox ?? colorExtraction.manaBox,
+                typeBox: result!.typeBox ?? colorExtraction.typeBox,
+                nameBox: result!.nameBox ?? colorExtraction.nameBox,
+                cnBox: result!.cnBox ?? colorExtraction.cnBox,
+                promoDetected: result!.promoDetected || colorExtraction.promoDetected,
+              );
+            }
+          }
+        }
       }
 
       // Try 90° CW for landscape battlefields
@@ -154,13 +204,21 @@ class OcrService {
     _isProcessing = true;
 
     try {
-      final inputImage = _convertCameraImage(image, camera);
-      if (inputImage == null) return null;
+      // Primary: grayscale — ML Kit reads stylized card names better without color
+      final grayInput = _convertCameraImage(image, camera, grayscaleOnly: true);
+      if (grayInput != null) {
+        final grayRecognized = await _textRecognizer.processImage(grayInput);
+        final grayMatch = await _analyze(grayRecognized, minScore: 35);
+        if (grayMatch != null) return grayMatch;
+      }
 
-      // Try normal orientation
-      final recognized = await _textRecognizer.processImage(inputImage);
-      final match = await _analyze(recognized, minScore: 35);
-      if (match != null) return match;
+      // Fallback: color (native YUV) — in case grayscale misses something
+      final inputImage = _convertCameraImage(image, camera);
+      if (inputImage != null) {
+        final recognized = await _textRecognizer.processImage(inputImage);
+        final match = await _analyze(recognized, minScore: 35);
+        if (match != null) return match;
+      }
 
       if (!tryFlip) return null;
 
@@ -416,9 +474,15 @@ class OcrService {
 
     // 2. Find known card names in text (exact match, min 4 chars)
     // No blocklist — score system resolves conflicts automatically
+    // Use pipe-free text for name search: ML Kit may split "Eye of the | Herald"
+    // into separate blocks, breaking contains() for multi-word names.
+    final searchableNameText = allTextLower
+        .replaceAll('|', ' ')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
     final namesFound = <String>{};
     for (final name in lookup.nameIndex.keys) {
-      if (name.length >= 4 && allTextLower.contains(name)) {
+      if (name.length >= 4 && searchableNameText.contains(name)) {
         namesFound.add(name);
       }
     }
@@ -461,6 +525,22 @@ class OcrService {
       }
     }
 
+    // 4b. Find bounding box for the type line
+    List<double>? typeBox;
+    if (typesFound.isNotEmpty) {
+      for (final block in recognized.blocks) {
+        final blockUpper = block.text.toUpperCase();
+        for (final t in typesFound) {
+          if (blockUpper.contains(t.toUpperCase())) {
+            final r = block.boundingBox;
+            typeBox = [r.left, r.top, r.right, r.bottom];
+            break;
+          }
+        }
+        if (typeBox != null) break;
+      }
+    }
+
     // 5. Find regions/factions (exact only — fuzzy too expensive per-frame)
     final regionsFound = <String>{};
     for (final r in CardLookupService.regionNames) {
@@ -469,8 +549,37 @@ class OcrService {
       }
     }
 
+    // 5b. Promo badge detection — search for "PROMO" text on card
+    // The promo badge has curved "PROMO" text above the rarity gem.
+    // Also catch common OCR misreads: "PROM0", "PR0MO", "PROMD"
+    bool promoDetected = false;
+    final promoPatterns = ['promo', 'prom0', 'pr0mo', 'promd', 'promq'];
+    for (final p in promoPatterns) {
+      if (allTextLower.contains(p)) {
+        promoDetected = true;
+        break;
+      }
+    }
+    // Also check individual blocks for short "PROMO"-like text
+    if (!promoDetected) {
+      for (final block in recognized.blocks) {
+        final t = block.text.trim().toLowerCase();
+        if (t.length >= 4 && t.length <= 7) {
+          for (final p in promoPatterns) {
+            if (t.contains(p)) {
+              promoDetected = true;
+              break;
+            }
+          }
+          if (promoDetected) break;
+        }
+      }
+    }
+    if (debugMode && promoDetected) debugPrint('OCR: PROMO badge detected in text!');
+
     // 6. Mana cost — look for single digit at start of a block (often top-left of card)
     int? manaCost;
+    List<double>? manaBox;
     if (recognized.blocks.isNotEmpty) {
       final topBlocks = recognized.blocks.toList()
         ..sort((a, b) {
@@ -481,6 +590,8 @@ class OcrService {
         final trimmed = block.text.trim();
         if (trimmed.length <= 2 && RegExp(r'^\d{1,2}$').hasMatch(trimmed)) {
           manaCost = int.tryParse(trimmed);
+          final r = block.boundingBox;
+          manaBox = [r.left, r.top, r.right, r.bottom];
           break;
         }
       }
@@ -545,19 +656,131 @@ class OcrService {
       rawTextLower: allTextLower,
       fuzzyTextLower: allTextLower, // single frame = same as raw
       softSetHint: softSetHint,
+      manaBox: manaBox,
+      typeBox: typeBox,
       nameBox: nameBox,
       cnBox: cnBox,
+      promoDetected: promoDetected,
     );
+  }
+
+  // ══════════════════════════════════════════════
+  // ── OCR Debug: save input image with block boxes ──
+  // ══════════════════════════════════════════════
+
+  /// Save the camera Y-plane as grayscale PNG with all OCR block bounding boxes drawn.
+  void _saveOcrDebugImage(CameraImage image, RecognizedText recognized) async {
+    try {
+      final width = image.width;
+      final height = image.height;
+      final yPlane = image.planes.first.bytes;
+      final stride = image.planes.first.bytesPerRow;
+
+      // Build RGBA from Y-plane
+      final rgba = Uint8List(width * height * 4);
+      for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+          final v = yPlane[y * stride + x];
+          final idx = (y * width + x) * 4;
+          rgba[idx] = v; rgba[idx + 1] = v; rgba[idx + 2] = v; rgba[idx + 3] = 255;
+        }
+      }
+
+      // Draw each block's bounding box in different colors
+      final colors = [
+        [255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0],
+        [255, 0, 255], [0, 255, 255], [255, 128, 0], [128, 0, 255],
+      ];
+
+      for (int bi = 0; bi < recognized.blocks.length; bi++) {
+        final block = recognized.blocks[bi];
+        final r = block.boundingBox;
+        final color = colors[bi % colors.length];
+        final bx = r.left.round().clamp(0, width - 1);
+        final by = r.top.round().clamp(0, height - 1);
+        final bw = r.width.round().clamp(1, width - bx);
+        final bh = r.height.round().clamp(1, height - by);
+
+        // Draw border (2px)
+        for (int t = 0; t < 2; t++) {
+          for (int x = bx; x < bx + bw && x < width; x++) {
+            for (final yy in [by + t, by + bh - 1 - t]) {
+              if (yy >= 0 && yy < height) {
+                final idx = (yy * width + x) * 4;
+                rgba[idx] = color[0]; rgba[idx + 1] = color[1]; rgba[idx + 2] = color[2];
+              }
+            }
+          }
+          for (int y = by; y < by + bh && y < height; y++) {
+            for (final xx in [bx + t, bx + bw - 1 - t]) {
+              if (xx >= 0 && xx < width) {
+                final idx = (y * width + xx) * 4;
+                rgba[idx] = color[0]; rgba[idx + 1] = color[1]; rgba[idx + 2] = color[2];
+              }
+            }
+          }
+        }
+
+        debugPrint('OCR BLOCK[$bi]: "${block.text}" at (${bx},${by}) ${bw}x${bh}');
+      }
+
+      // Save as PNG
+      final completer = Completer<ui.Image>();
+      ui.decodeImageFromPixels(rgba, width, height, ui.PixelFormat.rgba8888, completer.complete);
+      final img = await completer.future;
+      final byteData = await img.toByteData(format: ui.ImageByteFormat.png);
+      if (byteData != null) {
+        final docsDir = await getApplicationDocumentsDirectory();
+        final dir = Directory('${docsDir.path}/phash_debug');
+        if (!dir.existsSync()) dir.createSync(recursive: true);
+        final ts = DateTime.now().millisecondsSinceEpoch;
+        final path = '${dir.path}/ocr_debug_${ts}.png';
+        await File(path).writeAsBytes(byteData.buffer.asUint8List());
+        debugPrint('OCR DEBUG IMAGE saved: $path (${recognized.blocks.length} blocks)');
+      }
+      img.dispose();
+    } catch (e) {
+      debugPrint('OCR debug image save failed: $e');
+    }
   }
 
   // ══════════════════════════════════════════════
   // ── Camera image conversion ──
   // ══════════════════════════════════════════════
 
-  InputImage? _convertCameraImage(CameraImage image, CameraDescription camera) {
+  InputImage? _convertCameraImage(CameraImage image, CameraDescription camera, {bool grayscaleOnly = false}) {
     final rotation = InputImageRotationValue.fromRawValue(camera.sensorOrientation);
     if (rotation == null) return null;
     if (image.planes.isEmpty) return null;
+
+    if (grayscaleOnly) {
+      // Convert Y-plane to BGRA grayscale — ML Kit needs a valid image format.
+      // Y-only as NV21 crashes because ML Kit expects UV data after Y.
+      final yBytes = image.planes.first.bytes;
+      final stride = image.planes.first.bytesPerRow;
+      final width = image.width;
+      final height = image.height;
+      final bgra = Uint8List(width * height * 4);
+      for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+          final v = yBytes[y * stride + x];
+          final idx = (y * width + x) * 4;
+          bgra[idx] = v;     // B
+          bgra[idx + 1] = v; // G
+          bgra[idx + 2] = v; // R
+          bgra[idx + 3] = 255; // A
+        }
+      }
+      return InputImage.fromBytes(
+        bytes: bgra,
+        metadata: InputImageMetadata(
+          size: Size(width.toDouble(), height.toDouble()),
+          rotation: rotation,
+          format: InputImageFormat.bgra8888,
+          bytesPerRow: width * 4,
+        ),
+      );
+    }
 
     final format = InputImageFormatValue.fromRawValue(image.format.raw);
     if (format == null) return null;

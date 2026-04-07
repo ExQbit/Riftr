@@ -105,6 +105,16 @@ class OcrExtraction {
   final String fuzzyTextLower;   // current frame only (for fuzzyContains — not cumulated)
   final String? softSetHint;    // Levenshtein-1 resolved set (e.g. "SED"→"SFD"), not cumulated
 
+  // OCR-Anchor bounding boxes for card rect calculation (pixel coordinates in camera frame)
+  // Each box: [left, top, right, bottom] in camera pixel coordinates
+  final List<double>? manaBox;  // mana cost (top-left corner)
+  final List<double>? typeBox;  // type line ("GEAR EQUIPMENT", "CHAMPION UNIT" etc.)
+  final List<double>? nameBox;  // card name
+  final List<double>? cnBox;    // collector number (bottom)
+
+  // Promo badge detection via OCR — "PROMO" text found on card
+  final bool promoDetected;
+
   const OcrExtraction({
     this.setCode,
     this.collectorNumber,
@@ -119,6 +129,11 @@ class OcrExtraction {
     required this.rawTextLower,
     this.fuzzyTextLower = '',
     this.softSetHint,
+    this.manaBox,
+    this.typeBox,
+    this.nameBox,
+    this.cnBox,
+    this.promoDetected = false,
   });
 }
 

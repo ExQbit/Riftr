@@ -20,16 +20,16 @@ class NativeRectService {
   /// [width] and [height] are the image dimensions.
   /// [bytesPerRow] is the stride (may differ from width due to padding).
   ///
-  /// Returns [x, y, width, height] of the detected rectangle in pixel
-  /// coordinates, or null if no card found.
-  Future<List<int>?> detectCardRect({
+  /// Returns list of [x, y, width, height] for ALL card-ratio rectangles,
+  /// or null if none found.
+  Future<List<List<int>>?> detectCardRects({
     required Uint8List yPlane,
     required int width,
     required int height,
     required int bytesPerRow,
   }) async {
     try {
-      final result = await _channel.invokeMethod<Map>('detectRect', {
+      final result = await _channel.invokeMethod('detectRect', {
         'yPlane': yPlane,
         'width': width,
         'height': height,
@@ -38,17 +38,30 @@ class NativeRectService {
 
       if (result == null) return null;
 
-      final x = (result['x'] as num).toInt();
-      final y = (result['y'] as num).toInt();
-      final w = (result['w'] as num).toInt();
-      final h = (result['h'] as num).toInt();
+      // Handle both array of rects and single rect
+      List<Map> maps = [];
+      if (result is List) {
+        for (final r in result) {
+          if (r is Map) maps.add(r);
+        }
+      } else if (result is Map) {
+        maps.add(result);
+      }
 
-      // Sanity check
-      if (w < 50 || h < 50) return null;
+      if (maps.isEmpty) return null;
 
-      return [x, y, w, h];
-    } on PlatformException catch (e) {
-      // Native API not available or failed
+      final rects = <List<int>>[];
+      for (final m in maps) {
+        final x = (m['x'] as num?)?.toInt();
+        final y = (m['y'] as num?)?.toInt();
+        final w = (m['w'] as num?)?.toInt();
+        final h = (m['h'] as num?)?.toInt();
+        if (x != null && y != null && w != null && h != null && w >= 50 && h >= 50) {
+          rects.add([x, y, w, h]);
+        }
+      }
+      return rects.isNotEmpty ? rects : null;
+    } on PlatformException {
       return null;
     } catch (e) {
       return null;

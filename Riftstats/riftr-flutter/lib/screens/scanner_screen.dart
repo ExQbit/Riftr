@@ -27,6 +27,25 @@ class ScannedCardEntry {
   ScannedCardEntry({required this.card, this.alternatives = const [], this.quantity = 1});
 }
 
+/// OCR Grid anchor — a recognized text element with known Y-position on the card.
+class GridAnchor {
+  final String label;       // 'mana', 'type', 'name', 'cn'
+  final double yPct;        // expected Y% on card (e.g. 0.03 for mana, 0.97 for CN)
+  final double xPct;        // expected X% on card (e.g. 0.09 for CN left edge)
+  final double observedCX;  // observed X center in camera frame
+  final double observedCY;  // observed Y center in camera frame
+  final double observedLeft; // observed left edge (for X offset calculation)
+
+  const GridAnchor({
+    required this.label,
+    required this.yPct,
+    required this.xPct,
+    required this.observedCX,
+    required this.observedCY,
+    required this.observedLeft,
+  });
+}
+
 /// Scanner states.
 enum ScanState { waiting, stable, motion, settling, scanning }
 
@@ -77,7 +96,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
   int _scanCycleId = 0; // incremented each new scan cycle to invalidate stale callbacks
   int _scanFrameCount = 0;
   static const _earlyExitScore = 70;
-  static const _maxScanFrames = 10;
+  static const _maxScanFrames = 20;
   static const _minAcceptScore = 20;
 
   // Cumulative extraction across frames
@@ -91,9 +110,14 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
   final Set<String> _cumKeywords = {};
   final Set<String> _cumTypes = {};
   final Set<String> _cumRegions = {};
-  List<double>? _cumNameBox;  // OCR-anchor: best name bounding box
-  List<double>? _cumCnBox;    // OCR-anchor: best CN bounding box
+  List<double>? _cumNameBox;  // OCR-anchor: best name bounding box (paired with CN)
+  List<double>? _cumCnBox;    // OCR-anchor: best CN bounding box (paired with name)
+  List<double>? _cumNameBoxSolo; // name box without requiring CN in same frame
+  bool _cumPromoDetected = false; // OCR saw "PROMO" text on badge
   final StringBuffer _cumText = StringBuffer();
+
+  // ── OCR Grid: cross-frame anchor accumulation ──
+  final Map<String, GridAnchor> _gridAnchors = {}; // best anchor per label
 
   // ── Debug stats ──
   int _processedFrames = 0;
@@ -183,12 +207,14 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
         stripped.setRange(row * width, row * width + width, luma, row * stride);
       }
 
-      NativeRectService.instance.detectCardRect(
+      NativeRectService.instance.detectCardRects(
         yPlane: stripped, width: width, height: height, bytesPerRow: width,
-      ).then((rect) {
-        if (rect != null) {
-          _nativeRects.add(rect);
+      ).then((rects) {
+        if (rects != null && rects.isNotEmpty) {
+          _nativeRects.addAll(rects);
         }
+      }).catchError((e) {
+        if (_debugMode) debugPrint('Native rect error: $e');
       });
     }
 
@@ -290,6 +316,11 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
         if (match == null || !mounted) return;
         _updateDebug(match);
 
+        // Name required: reject matches without card name recognized
+        final hasName = match.breakdown.containsKey('name') ||
+            match.breakdown.containsKey('name_fuzzy');
+        if (!hasName) return; // ignore garbage CN-only matches
+
         // Check if this card has multiple variants
         final nameLower = match.card.name.toLowerCase();
         final variantCount = (_lookup.nameIndex[nameLower] ?? []).length;
@@ -351,6 +382,12 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
         )));
       }
 
+      // Debug: dump raw text at frame 10 (always, to diagnose OCR issues)
+      if (_debugMode && _scanFrameCount == 10 && extraction != null) {
+        debugPrint('Scanner F10 RAW: "${extraction.rawTextLower.substring(0, extraction.rawTextLower.length.clamp(0, 400))}"');
+        debugPrint('Scanner F10 namesFound: ${extraction.namesFound}');
+      }
+
       // Current frame text for fuzzyContains (NOT cumulated)
       final currentFrameText = extraction?.rawTextLower ?? '';
 
@@ -364,14 +401,35 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
             suffix: extraction.cnSuffix,
             raw: extraction.cnRaw,
           ));
-          // First-wins for scoring (so OCR scoring can use CN during accumulation)
+          // First-wins for scoring, with prefix-upgrade:
+          // "15" → "153" is a more complete reading of the same CN
           if (_cumCN == null) {
             _cumCN = extraction.collectorNumber;
             _cumCNSuffix = extraction.cnSuffix;
             _cumCNRaw = extraction.cnRaw;
+          } else {
+            final newRaw = extraction.cnRaw ?? '';
+            final oldRaw = _cumCNRaw ?? '';
+            // Upgrade if new CN contains old as prefix (15 → 153)
+            if (newRaw.length > oldRaw.length && newRaw.startsWith(oldRaw)) {
+              _cumCN = extraction.collectorNumber;
+              _cumCNSuffix = extraction.cnSuffix;
+              _cumCNRaw = extraction.cnRaw;
+            }
           }
         }
         if (extraction.manaCost != null) _cumMana ??= extraction.manaCost;
+        // Promo badge OCR detection — sticky (once seen = promo)
+        if (extraction.promoDetected) {
+          if (!_cumPromoDetected && _debugMode) {
+            debugPrint('Scanner: PROMO badge detected via OCR!');
+          }
+          _cumPromoDetected = true;
+        }
+        // Solo name box: store name position even without CN (for name-only fallback)
+        if (extraction.nameBox != null) {
+          _cumNameBoxSolo ??= extraction.nameBox;
+        }
         // Locked anchor pair: only save when BOTH name and CN are in the same frame,
         // CN is below name, distance > 80px (prevents two lines from same text block),
         // and horizontal alignment is plausible.
@@ -395,6 +453,9 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
             }
           }
         }
+        // ── OCR Grid: accumulate anchors from this frame ──
+        _accumulateGridAnchors(extraction);
+
         _cumNames.addAll(extraction.namesFound);
         for (final kw in extraction.keywordsFound) {
           if (_cumKeywords.length >= 10) break;
@@ -424,7 +485,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
 
       if (_debugMode) {
         debugPrint('Scanner F$_scanFrameCount cum: set=$_cumSetCode cn=$_cumCN raw=$_cumCNRaw '
-            'names=$_cumNames kw=$_cumKeywords types=$_cumTypes');
+            'names=$_cumNames kw=$_cumKeywords types=$_cumTypes${_cumPromoDetected ? ' PROMO✓' : ''}');
       }
 
       final lookup = CardLookupService.instance;
@@ -461,17 +522,39 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
 
       // ── Normal SCANNING: early-exit or max frames ──
 
-      if (bestScore >= _earlyExitScore && matches.isNotEmpty) {
+      // Name required for early-exit too
+      final earlyHasName = matches.isNotEmpty &&
+          (matches.first.breakdown.containsKey('name') ||
+           matches.first.breakdown.containsKey('name_fuzzy'));
+      if (bestScore >= _earlyExitScore && earlyHasName) {
         final best = matches.first;
         final card = best.fingerprint.card;
-        debugPrint('Scanner: Early-exit F$_scanFrameCount score=$bestScore');
-        _acceptMatch(OcrMatch(card: card, confidence: ScanConfidence.high,
-            score: best.score, breakdown: best.breakdown));
-        return;
+        final nameLower = card.name.toLowerCase();
+        final variantCount = (_lookup.nameIndex[nameLower] ?? []).length;
+
+        // Variant cards: don't early-exit, enter refinement to collect more rects
+        if (variantCount > 1 && _waitingMatch == null) {
+          _waitingMatch = OcrMatch(card: card, confidence: ScanConfidence.high,
+              score: best.score, breakdown: best.breakdown);
+          if (_debugMode) {
+            debugPrint('Scanner: F$_scanFrameCount score=$bestScore '
+                '"${card.name}" ($variantCount variants) → refinement');
+          }
+          // Continue scanning — don't return
+        } else if (_waitingMatch == null) {
+          debugPrint('Scanner: Early-exit F$_scanFrameCount score=$bestScore');
+          _acceptMatch(OcrMatch(card: card, confidence: ScanConfidence.high,
+              score: best.score, breakdown: best.breakdown));
+          return;
+        }
       }
 
       if (_scanFrameCount >= _maxScanFrames) {
-        if (bestScore >= _minAcceptScore && matches.isNotEmpty) {
+        // Name required: no match without the card name being recognized
+        final hasName = matches.isNotEmpty &&
+            (matches.first.breakdown.containsKey('name') ||
+             matches.first.breakdown.containsKey('name_fuzzy'));
+        if (bestScore >= _minAcceptScore && hasName) {
           final best = matches.first;
           final card = best.fingerprint.card;
           debugPrint('Scanner: Accept F$_scanFrameCount score=$bestScore');
@@ -558,45 +641,80 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
         final variantIds = allVariants.map((c) => c.id).toList();
         final promoIds = allVariants.where((c) => c.isPromo).map((c) => c.id).toSet();
 
-        // Card rect: best calibrated native rect, or OCR-anchor fallback
+        // Card rect: 4-step fallback chain
         List<int>? cardRect;
+        String rectMethod = '';
 
-        // 1. Best scored native rect
-        final calibrated = _calibrateCardRect(match.card.type?.toLowerCase());
-        if (calibrated != null) {
-          cardRect = calibrated.rect;
+        // 1. OCR Grid (primary) — uses any 2+ text anchors with 20%+ vertical distance
+        final gridResult = _calculateCardRectFromGrid();
+        if (gridResult != null) {
+          cardRect = gridResult.rect;
+          rectMethod = 'grid(${gridResult.pair})';
         }
 
-        // 2. OCR-anchor fallback (from name + CN text positions)
-        if (cardRect == null && _cumNameBox != null && _cumCnBox != null) {
-          final nameCY = (_cumNameBox![1] + _cumNameBox![3]) / 2;
-          final cnCY = (_cumCnBox![1] + _cumCnBox![3]) / 2;
-          final cnLeft = _cumCnBox![0];
-          final dist = (cnCY - nameCY).abs();
-          if (dist > 80) {
-            double nameYPct = 0.58;
-            final ct = match.card.type?.toLowerCase() ?? '';
-            if (ct == 'legend') nameYPct = 0.62;
-            else if (ct == 'rune') nameYPct = 0.72;
-            if (ct != 'battlefield') {
-              final cardH = dist / (0.97 - nameYPct);
-              final cardW = cardH * 0.716;
-              cardRect = [
-                (cnLeft - cardW * 0.09).round().clamp(0, _lastYWidth - 1),
-                (nameCY - nameYPct * cardH).round().clamp(0, _lastYHeight - 1),
-                cardW.round().clamp(1, _lastYWidth),
-                cardH.round().clamp(1, _lastYHeight),
-              ];
-              if (_debugMode) debugPrint('pHash OCR-anchor rect: (${cardRect[0]},${cardRect[1]}) ${cardRect[2]}x${cardRect[3]}');
-            }
+        // 2. Best scored native rect (validated by OCR)
+        if (cardRect == null) {
+          final calibrated = _calibrateCardRect(match.card.type?.toLowerCase());
+          if (calibrated != null) {
+            cardRect = calibrated.rect;
+            rectMethod = calibrated.method;
           }
         }
 
-        if (cardRect == null && _debugMode) {
-          debugPrint('pHash: no rect → skipping variant detection');
+        // 3. OCR name-only fallback (rougher estimate from just the name position)
+        if (cardRect == null && _cumNameBoxSolo != null) {
+          final nameLeft = _cumNameBoxSolo![0];
+          final nameCY = (_cumNameBoxSolo![1] + _cumNameBoxSolo![3]) / 2;
+          double nameYPct = 0.58;
+          final ct = match.card.type?.toLowerCase() ?? '';
+          if (ct == 'legend') nameYPct = 0.62;
+          else if (ct == 'rune') nameYPct = 0.72;
+          if (ct != 'battlefield') {
+            final cardW = (_lastYWidth * 0.47).roundToDouble();
+            final cardH = cardW / 0.716;
+            final cardTop = nameCY - nameYPct * cardH;
+            final cardLeft = nameLeft - cardW * 0.09;
+            cardRect = [
+              cardLeft.round().clamp(0, _lastYWidth - 1),
+              cardTop.round().clamp(0, _lastYHeight - 1),
+              cardW.round().clamp(1, _lastYWidth),
+              cardH.round().clamp(1, _lastYHeight),
+            ];
+            rectMethod = 'name-only';
+            if (_debugMode) debugPrint('pHash name-only anchor rect: (${cardRect[0]},${cardRect[1]}) ${cardRect[2]}x${cardRect[3]}');
+          }
         }
 
-        if (cardRect != null) {
+        // 4. Center-crop fallback (assume card is roughly centered in frame)
+        if (cardRect == null) {
+          final cardW = (_lastYWidth * 0.47).round();
+          final cardH = (cardW / 0.716).round();
+          final cardX = (_lastYWidth - cardW) ~/ 2;
+          final cardY = (_lastYHeight - cardH) ~/ 2;
+          cardRect = [cardX, cardY, cardW, cardH];
+          rectMethod = 'center-crop';
+          if (_debugMode) debugPrint('pHash center-crop fallback rect: ($cardX,$cardY) ${cardW}x$cardH');
+        }
+
+        if (_debugMode) debugPrint('pHash: rect via $rectMethod → (${cardRect[0]},${cardRect[1]}) ${cardRect[2]}x${cardRect[3]}');
+
+        // Log ALL native rects for debugging
+        if (_debugMode && _nativeRects.isNotEmpty) {
+          debugPrint('pHash: ${_nativeRects.length} native rects collected:');
+          for (int i = 0; i < _nativeRects.length && i < 10; i++) {
+            final r = _nativeRects[i];
+            final ratio = r[2] > 0 && r[3] > 0 ? (r[2] / r[3]).toStringAsFixed(3) : '?';
+            debugPrint('  [$i]: (${r[0]},${r[1]}) ${r[2]}x${r[3]} ratio=$ratio');
+          }
+          if (_nativeRects.length > 10) debugPrint('  ... +${_nativeRects.length - 10} more');
+        }
+
+        // Save debug frame with ALL rects drawn (not just the best)
+        if (_debugMode && _nativeRects.isNotEmpty && _lastYPlane != null) {
+          _saveRejectedRectsDebug(match.card.name, _nativeRects);
+        }
+
+        {
         // Strip stride padding from last Y-plane
         Uint8List yPlane;
         if (_lastYStride == _lastYWidth) {
@@ -662,7 +780,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
             resolvedCard = bestCard;
           }
         }
-        } // end if (cardRect != null)
+        } // end rect block
       } catch (e) {
         debugPrint('pHash: Error: $e');
       }
@@ -677,25 +795,154 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
   }
 
   // ══════════════════════════════════════════════
+  // ── OCR Grid: anchor accumulation + card rect calculation ──
+  // ══════════════════════════════════════════════
+
+  /// Y-percentages per card element (typ-independent unless noted).
+  static const _gridManaYPct = 0.03;
+  static const _gridTypeYPct = 0.52;
+  static const _gridCnYPct = 0.97;
+  // Name Y% varies by card type — resolved at accumulation time.
+  static double _gridNameYPct(String? cardType) {
+    final ct = cardType ?? '';
+    if (ct == 'legend') return 0.62;
+    if (ct == 'rune') return 0.72;
+    return 0.58;
+  }
+
+  /// X-percentages (where the left edge of the text sits on the card).
+  static const _gridManaXPct = 0.08;  // mana top-left
+  static const _gridTypeXPct = 0.12;  // type line left
+  static const _gridNameXPct = 0.08;  // name left
+  static const _gridCnXPct = 0.09;    // CN left
+
+  /// Accumulate grid anchors from a single OCR frame extraction.
+  void _accumulateGridAnchors(OcrExtraction extraction) {
+    if (_debugMode && _gridAnchors.isEmpty) {
+      final has = <String>[];
+      if (extraction.manaBox != null) has.add('mana');
+      if (extraction.typeBox != null) has.add('type');
+      if (extraction.nameBox != null) has.add('name');
+      if (extraction.cnBox != null) has.add('cn');
+      if (has.isNotEmpty) debugPrint('Grid: first anchors from this frame: ${has.join(",")}');
+    }
+    void _addAnchor(String label, double yPct, double xPct, List<double>? box) {
+      if (box == null) return;
+      final cx = (box[0] + box[2]) / 2;
+      final cy = (box[1] + box[3]) / 2;
+      _gridAnchors[label] = GridAnchor(
+        label: label,
+        yPct: yPct,
+        xPct: xPct,
+        observedCX: cx,
+        observedCY: cy,
+        observedLeft: box[0],
+      );
+    }
+
+    _addAnchor('mana', _gridManaYPct, _gridManaXPct, extraction.manaBox);
+    _addAnchor('type', _gridTypeYPct, _gridTypeXPct, extraction.typeBox);
+    // Name Y% depends on card type — use best known type so far
+    final bestType = _cumTypes.isNotEmpty ? _cumTypes.first : null;
+    _addAnchor('name', _gridNameYPct(bestType), _gridNameXPct, extraction.nameBox);
+    _addAnchor('cn', _gridCnYPct, _gridCnXPct, extraction.cnBox);
+  }
+
+  /// Calculate card rect from accumulated grid anchors.
+  /// Returns null if not enough anchors with sufficient vertical distance.
+  ({List<int> rect, double score, String method, String pair})? _calculateCardRectFromGrid() {
+    if (_gridAnchors.length < 2) return null;
+
+    final fw = _lastYWidth.toDouble();
+    final fh = _lastYHeight.toDouble();
+    if (fw <= 0 || fh <= 0) return null;
+
+    final anchors = _gridAnchors.values.toList();
+    const minYGap = 0.20; // minimum 20% vertical distance between anchors
+
+    // Evaluate all pairs, pick best by vertical distance
+    GridAnchor? bestA, bestB;
+    double bestGap = 0;
+
+    for (int i = 0; i < anchors.length; i++) {
+      for (int j = i + 1; j < anchors.length; j++) {
+        final a = anchors[i];
+        final b = anchors[j];
+        final yGap = (a.yPct - b.yPct).abs();
+        if (yGap < minYGap) continue;
+
+        // Horizontal consistency check: both should predict similar cardLeft
+        // Skip if horizontal difference is too large (different cards)
+        final hDiff = (a.observedLeft - b.observedLeft).abs();
+        if (hDiff > fw * 0.35) continue;
+
+        if (yGap > bestGap) {
+          bestGap = yGap;
+          // Ensure a is the upper anchor (smaller yPct)
+          if (a.yPct < b.yPct) {
+            bestA = a;
+            bestB = b;
+          } else {
+            bestA = b;
+            bestB = a;
+          }
+        }
+      }
+    }
+
+    if (bestA == null || bestB == null) return null;
+
+    // Calculate card dimensions from the anchor pair
+    final observedDist = bestB.observedCY - bestA.observedCY;
+    if (observedDist <= 0) return null;
+
+    final cardH = observedDist / (bestB.yPct - bestA.yPct);
+    final cardW = cardH * _idealRatio;
+    final cardTop = bestA.observedCY - bestA.yPct * cardH;
+
+    // X offset: use the lower anchor's left edge (usually CN, most reliable)
+    final cardLeft = bestB.observedLeft - bestB.xPct * cardW;
+
+    // Clamp to frame bounds
+    final rect = [
+      cardLeft.round().clamp(0, _lastYWidth - 1),
+      cardTop.round().clamp(0, _lastYHeight - 1),
+      cardW.round().clamp(1, _lastYWidth),
+      cardH.round().clamp(1, _lastYHeight),
+    ];
+
+    // Score: based on vertical gap (more = better)
+    final score = (bestGap / 0.94).clamp(0.0, 1.0); // 94% gap = perfect score
+
+    final pair = '${bestA.label}(${bestA.yPct})+${bestB.label}(${bestB.yPct})';
+
+    if (_debugMode) {
+      debugPrint('Grid rect: $pair gap=${(bestGap * 100).round()}% '
+          '(${rect[0]},${rect[1]}) ${rect[2]}x${rect[3]} score=${score.toStringAsFixed(2)} '
+          '[${_gridAnchors.length} anchors: ${_gridAnchors.keys.join(",")}]');
+    }
+
+    return (rect: rect, score: score, method: 'grid', pair: pair);
+  }
+
+  // ══════════════════════════════════════════════
   // ── Calibrated card rect: score + OCR cross-validation ──
   // ══════════════════════════════════════════════
 
   static const _idealRatio = 0.716; // card w/h = 63mm / 88mm
-  static const _idealWidthPct = 0.48; // card fills ~48% of frame width (measured from debug images)
 
-  /// Score native rects against ideal geometry, cross-validate with OCR anchors,
-  /// and optionally calibrate for sub-pixel alignment.
-  /// Returns null if no native rect scores above threshold.
+  /// Select the best native rect for pHash/SAD.
+  ///
+  /// 1. Hard filter: ratio 0.68-0.75, width ≥ 30% frame, center in middle 70%
+  /// 2. Score: ratio (70%) + size (30%) → sort descending
+  /// 3. OCR gate: from best down, first rect where card name sits at ~58% → use it
+  /// 4. Calibrate: nudge rect ±20px to align OCR landmarks
   ({List<int> rect, double score, String method})? _calibrateCardRect(String? cardType) {
     if (_nativeRects.isEmpty) return null;
 
     final fw = _lastYWidth.toDouble();
     final fh = _lastYHeight.toDouble();
     if (fw <= 0 || fh <= 0) return null;
-
-    final expectedW = fw * _idealWidthPct;
-    final frameCX = fw / 2;
-    final frameCY = fh / 2;
 
     // Layout profile
     double nameYPct = 0.58;
@@ -704,92 +951,86 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     if (ct == 'legend') nameYPct = 0.62;
     else if (ct == 'rune') nameYPct = 0.72;
 
+    // OCR anchors
     final hasOcr = _cumNameBox != null && _cumCnBox != null && ct != 'battlefield';
-    final nameBox = _cumNameBox;
-    final cnBox = _cumCnBox;
     double? nameCY, cnCY, cnLeft;
     if (hasOcr) {
-      nameCY = (nameBox![1] + nameBox[3]) / 2;
-      cnCY = (cnBox![1] + cnBox[3]) / 2;
-      cnLeft = cnBox[0];
+      nameCY = (_cumNameBox![1] + _cumNameBox![3]) / 2;
+      cnCY = (_cumCnBox![1] + _cumCnBox![3]) / 2;
+      cnLeft = _cumCnBox![0];
     }
 
-    // Size filter: keep rects ≥50% of max area
-    final areas = _nativeRects.map((r) => r[2] * r[3]).toList();
-    final maxArea = areas.reduce((a, b) => a > b ? a : b);
+    // ── Step 1: Hard filter ──
+    final minWidth = fw * 0.30;
+    final centerXMin = fw * 0.15, centerXMax = fw * 0.85;
+    final centerYMin = fh * 0.15, centerYMax = fh * 0.85;
 
-    double bestScore = -1;
-    List<int>? bestRect;
-    int bestIdx = -1;
+    final candidates = <({List<int> rect, double score, int idx})>[];
 
     for (int i = 0; i < _nativeRects.length; i++) {
-      if (areas[i] < maxArea * 0.50) continue;
-
       final r = _nativeRects[i];
-      final rx = r[0].toDouble(), ry = r[1].toDouble();
       final rw = r[2].toDouble(), rh = r[3].toDouble();
       if (rw <= 0 || rh <= 0) continue;
 
-      // ── Geometry score ──
       final ratio = rw / rh;
+      if (ratio < 0.68 || ratio > 0.75) continue; // hard ratio filter
+      if (rw < minWidth) continue; // hard min width
+      final cx = r[0] + rw / 2, cy = r[1] + rh / 2;
+      if (cx < centerXMin || cx > centerXMax || cy < centerYMin || cy > centerYMax) continue;
+
+      // ── Step 2: Score = ratio 70% + size 30% ──
       final ratioErr = (ratio - _idealRatio).abs() / _idealRatio;
       final ratioScore = (1.0 - ratioErr * 5.0).clamp(0.0, 1.0);
+      final sizeScore = (rw / fw).clamp(0.0, 1.0); // bigger = better
+      final score = ratioScore * 0.70 + sizeScore * 0.30;
 
-      final widthErr = (rw - expectedW).abs() / expectedW;
-      final sizeScore = (1.0 - widthErr * 3.0).clamp(0.0, 1.0);
+      candidates.add((rect: r, score: score, idx: i));
+    }
 
-      final cx = rx + rw / 2, cy = ry + rh / 2;
-      final dxNorm = (cx - frameCX).abs() / (fw * 0.15);
-      final dyNorm = (cy - frameCY).abs() / (fh * 0.10);
-      final dist = (dxNorm * dxNorm + dyNorm * dyNorm);
-      final centerScore = (1.0 - (dist > 0 ? sqrt(dist) : 0.0)).clamp(0.0, 1.0);
+    if (candidates.isEmpty) return null;
 
-      final geoScore = ratioScore * 0.35 + sizeScore * 0.30 + centerScore * 0.35;
-      if (geoScore < 0.40) continue;
+    // Sort by score descending
+    candidates.sort((a, b) => b.score.compareTo(a.score));
 
-      // ── OCR cross-validation ──
-      double totalScore;
-      if (hasOcr) {
+    // ── Step 3: OCR gate — from best down, find first with valid OCR alignment ──
+    List<int>? bestRect;
+    double bestScore = 0;
+    int bestIdx = -1;
+
+    if (hasOcr) {
+      for (final c in candidates) {
+        final ry = c.rect[1].toDouble(), rh = c.rect[3].toDouble();
         final predNameY = ry + nameYPct * rh;
-        final nameYErr = (nameCY! - predNameY).abs();
-        final nameYScore = (1.0 - nameYErr / 30.0).clamp(0.0, 1.0);
-
-        final predCnY = ry + cnYPct * rh;
-        final cnYErr = (cnCY! - predCnY).abs();
-        final cnYScore = (1.0 - cnYErr / 30.0).clamp(0.0, 1.0);
-
-        final predCnLeft = rx + 0.09 * rw;
-        final leftErr = (cnLeft! - predCnLeft).abs();
-        final leftScore = (1.0 - leftErr / 40.0).clamp(0.0, 1.0);
-
-        final ocrScore = nameYScore * 0.40 + cnYScore * 0.35 + leftScore * 0.25;
-        totalScore = geoScore * 0.50 + ocrScore * 0.50;
-      } else {
-        totalScore = geoScore;
-      }
-
-      if (totalScore > bestScore) {
-        bestScore = totalScore;
-        bestRect = r;
-        bestIdx = i;
+        final nameErr = (nameCY! - predNameY).abs();
+        // Name must be within 40px of expected position
+        if (nameErr < 40) {
+          bestRect = c.rect;
+          bestScore = c.score;
+          bestIdx = c.idx;
+          break;
+        }
       }
     }
 
-    if (bestRect == null || bestScore < 0.40) return null;
+    // No OCR or no rect passed OCR gate → use best scoring rect
+    if (bestRect == null) {
+      final best = candidates.first;
+      bestRect = best.rect;
+      bestScore = best.score;
+      bestIdx = best.idx;
+    }
 
-    // ── Calibration: nudge rect to align OCR landmarks ──
+    // ── Step 4: Calibration — nudge rect to align OCR landmarks ──
     var method = 'scored';
     var finalRect = bestRect;
 
-    if (hasOcr && bestScore >= 0.40 && bestScore < 0.90) {
+    if (hasOcr) {
       var rx = bestRect[0].toDouble(), ry = bestRect[1].toDouble();
       var rw = bestRect[2].toDouble(), rh = bestRect[3].toDouble();
 
-      // Y-shift: move top so name lands at expected position
       final predNameY = ry + nameYPct * rh;
       final yShift = (nameCY! - predNameY).clamp(-20.0, 20.0);
 
-      // Height correction: adjust so name-CN span matches layout profile
       final observedSpan = cnCY! - nameCY;
       final expectedSpan = (cnYPct - nameYPct) * rh;
       if (expectedSpan > 0 && observedSpan > 0) {
@@ -797,19 +1038,15 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
         final calH = rh * spanRatio;
         final calW = calH * _idealRatio;
         final calTop = ry + yShift;
-
-        // X-shift: align CN left edge
         final predCnLeft = rx + 0.09 * rw;
         final xShift = (cnLeft! - predCnLeft).clamp(-15.0, 15.0);
         final calLeft = rx + xShift;
 
-        // Validate calibration improved alignment
-        final origNameErr = (nameCY - predNameY).abs();
-        final origCnErr = (cnCY - (ry + cnYPct * rh)).abs();
-        final calNameErr = (nameCY - (calTop + nameYPct * calH)).abs();
-        final calCnErr = (cnCY - (calTop + cnYPct * calH)).abs();
+        // Only apply if calibration improves alignment
+        final origErr = (nameCY - predNameY).abs() + (cnCY - (ry + cnYPct * rh)).abs();
+        final calErr = (nameCY - (calTop + nameYPct * calH)).abs() + (cnCY - (calTop + cnYPct * calH)).abs();
 
-        if (calNameErr + calCnErr < origNameErr + origCnErr) {
+        if (calErr < origErr) {
           finalRect = [
             calLeft.round().clamp(0, _lastYWidth - 1),
             calTop.round().clamp(0, _lastYHeight - 1),
@@ -824,7 +1061,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     if (_debugMode) {
       debugPrint('pHash rect $method score=${bestScore.toStringAsFixed(2)} '
           '(${finalRect[0]},${finalRect[1]}) ${finalRect[2]}x${finalRect[3]} '
-          '[best of ${_nativeRects.length} rects, idx=$bestIdx]');
+          '[best of ${_nativeRects.length} rects, idx=$bestIdx, ${candidates.length} passed filter]');
       if (hasOcr) {
         final fy = finalRect[1].toDouble(), fh2 = finalRect[3].toDouble();
         final nameErr = (nameCY! - (fy + nameYPct * fh2)).abs().round();
@@ -1090,6 +1327,9 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
       _cumText.clear();
       _cumNameBox = null;
       _cumCnBox = null;
+      _cumNameBoxSolo = null;
+      _cumPromoDetected = false;
+      _gridAnchors.clear();
 
       // Reset cumulative pHash frames for new scan cycle.
       // Native rects are NOT cleared — rects from SETTLING are valid

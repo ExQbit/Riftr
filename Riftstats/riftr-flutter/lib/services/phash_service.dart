@@ -477,7 +477,7 @@ class PhashService {
     }
 
     // Promo threshold: if best SAD < 35, promo badge was found
-    const promoThreshold = 42.0;
+    const promoThreshold = 60.0;
     final isPromo = bestPromoSad < promoThreshold;
     final defaultBaseId = baseVars.isNotEmpty ? baseVars.first : withTemplates.first;
     final resultId = isPromo ? bestPromoId! : defaultBaseId;
