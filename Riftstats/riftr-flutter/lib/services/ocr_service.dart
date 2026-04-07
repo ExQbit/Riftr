@@ -41,6 +41,39 @@ class OcrService {
   bool _isProcessing = false;
   bool debugMode = false;
 
+  /// Last extraction from processImage — exposed so scanner can grab boxes from WAITING state
+  OcrExtraction? lastExtraction;
+  /// Best mana box seen across all processImage calls — sticky because ML Kit
+  /// only reads the mana digit in early frames before the full card is visible
+  List<double>? _bestManaBox;
+  int? _bestManaCost;
+
+  /// Reset sticky mana when scanning a new card
+  void resetStickyMana() {
+    _bestManaBox = null;
+    _bestManaCost = null;
+    lastExtraction = null;
+  }
+
+  /// Run OCR on a raw BGRA image crop. Returns recognized text blocks.
+  Future<RecognizedText?> recognizeCrop(Uint8List bgra, int width, int height) async {
+    try {
+      final inputImage = InputImage.fromBytes(
+        bytes: bgra,
+        metadata: InputImageMetadata(
+          size: Size(width.toDouble(), height.toDouble()),
+          rotation: InputImageRotation.rotation0deg,
+          format: InputImageFormat.bgra8888,
+          bytesPerRow: width * 4,
+        ),
+      );
+      return await _textRecognizer.processImage(inputImage);
+    } catch (e) {
+      debugPrint('OCR recognizeCrop error: $e');
+      return null;
+    }
+  }
+
   // ── Regex patterns ──
 
   /// CN with optional /max: "SFD 097/221", "S0-143", "0GN 022298", "SO-84m"
@@ -268,6 +301,37 @@ class OcrService {
 
     // ── Extract all data points ──
     final extraction = _extract(allLines, allTextLower, text);
+    // Remember best manaBox across all calls — ML Kit only reads the mana digit
+    // in early frames before the full card is visible, then drops it
+    if (extraction.manaBox != null) {
+      _bestManaBox = extraction.manaBox;
+      _bestManaCost = extraction.manaCost;
+    }
+    // Expose for scanner with sticky manaBox from earlier frames
+    if (_bestManaBox != null && extraction.manaBox == null) {
+      lastExtraction = OcrExtraction(
+        setCode: extraction.setCode,
+        collectorNumber: extraction.collectorNumber,
+        cnSuffix: extraction.cnSuffix,
+        cnRaw: extraction.cnRaw,
+        cnHasSetPrefix: extraction.cnHasSetPrefix,
+        namesFound: extraction.namesFound,
+        keywordsFound: extraction.keywordsFound,
+        typesFound: extraction.typesFound,
+        regionsFound: extraction.regionsFound,
+        manaCost: extraction.manaCost ?? _bestManaCost,
+        rawTextLower: extraction.rawTextLower,
+        fuzzyTextLower: extraction.fuzzyTextLower,
+        softSetHint: extraction.softSetHint,
+        manaBox: _bestManaBox,
+        typeBox: extraction.typeBox,
+        nameBox: extraction.nameBox,
+        cnBox: extraction.cnBox,
+        promoDetected: extraction.promoDetected,
+      );
+    } else {
+      lastExtraction = extraction;
+    }
 
     // ── Score all candidates (in isolate) ──
     final lookup = CardLookupService.instance;
@@ -577,7 +641,8 @@ class OcrService {
     }
     if (debugMode && promoDetected) debugPrint('OCR: PROMO badge detected in text!');
 
-    // 6. Mana cost — look for single digit at start of a block (often top-left of card)
+    // 6. Mana cost — look for single digit at start of a block (top-left of card)
+    // Must be in the upper quarter of the frame to avoid "+0" stats being read as mana
     int? manaCost;
     List<double>? manaBox;
     if (recognized.blocks.isNotEmpty) {
@@ -586,12 +651,41 @@ class OcrService {
           final dy = a.boundingBox.top.compareTo(b.boundingBox.top);
           return dy != 0 ? dy : a.boundingBox.left.compareTo(b.boundingBox.left);
         });
-      for (final block in topBlocks.take(3)) {
+      // Mana must be SIGNIFICANTLY above the main text blocks.
+      // The type line (GEAR EQUIPMENT) is at ~52% of the card, mana at ~3%.
+      // That's ~49% of card height above the type line — at least 200px on 1080p.
+      // Find the top of the highest multi-char block and require mana to be
+      // at least 150px above it (not just barely above).
+      double highestTextTop = double.infinity;
+      for (final b in recognized.blocks) {
+        if (b.text.trim().length >= 4) {
+          if (b.boundingBox.top < highestTextTop) {
+            highestTextTop = b.boundingBox.top;
+          }
+        }
+      }
+      final upperLimit = highestTextTop == double.infinity
+          ? recognized.blocks.first.boundingBox.top
+          : highestTextTop - 150; // mana must be well above the type line
+      if (debugMode) {
+        debugPrint('Mana search: ${topBlocks.length} blocks, upperLimit=${upperLimit.round()}');
+        for (int i = 0; i < topBlocks.length && i < 8; i++) {
+          final b = topBlocks[i];
+          debugPrint('  top[$i]: "${b.text.trim()}" y=${b.boundingBox.top.round()} len=${b.text.trim().length} isDigit=${RegExp(r'^\d{1,2}$').hasMatch(b.text.trim())}');
+        }
+      }
+      for (final block in topBlocks.take(5)) {
         final trimmed = block.text.trim();
         if (trimmed.length <= 2 && RegExp(r'^\d{1,2}$').hasMatch(trimmed)) {
+          // Must be ABOVE the main card text — reject stats like "+0" at bottom
+          if (block.boundingBox.top >= upperLimit) {
+            if (debugMode) debugPrint('Mana: rejected "$trimmed" at y=${block.boundingBox.top.round()} (not above upperLimit=${upperLimit.round()})');
+            continue;
+          }
           manaCost = int.tryParse(trimmed);
           final r = block.boundingBox;
           manaBox = [r.left, r.top, r.right, r.bottom];
+          if (debugMode) debugPrint('Mana: accepted "$trimmed" at y=${block.boundingBox.top.round()}');
           break;
         }
       }

@@ -134,7 +134,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     WidgetsBinding.instance.addObserver(this);
     if (!_lookup.isReady) _lookup.build();
     _phash.load();
-    OcrService.instance.debugMode = false; // OCR raw lines off (too noisy)
+    OcrService.instance.debugMode = true; // ON for mana debug
     _initCamera();
   }
 
@@ -330,6 +330,14 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
           // more OCR frames (for CN suffix) and native rects (for pHash).
           _waitingMatch = match;
           _setState(ScanState.scanning);
+          // Seed grid anchors from WAITING extraction (has mana box etc. that SCANNING may not see)
+          final waitingExtraction = _ocr.lastExtraction;
+          if (waitingExtraction != null) {
+            _accumulateGridAnchors(waitingExtraction);
+            if (_debugMode && _gridAnchors.isNotEmpty) {
+              debugPrint('Scanner: seeded grid from WAITING: [${_gridAnchors.keys.join(",")}]');
+            }
+          }
           if (_debugMode) {
             debugPrint('Scanner: WAITING match "${match.card.name}" has $variantCount variants → entering SCANNING for refinement');
           }
@@ -456,6 +464,16 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
         // ── OCR Grid: accumulate anchors from this frame ──
         _accumulateGridAnchors(extraction);
 
+        // ── Mana crop OCR: if we have type+cn but no mana after 5 frames,
+        // calculate where mana should be and OCR just that region ──
+        if (!_gridAnchors.containsKey('mana') &&
+            _gridAnchors.containsKey('type') &&
+            _gridAnchors.containsKey('cn') &&
+            _scanFrameCount == 5 &&
+            _lastYPlane != null) {
+          _tryManaCropOcr();
+        }
+
         _cumNames.addAll(extraction.namesFound);
         for (final kw in extraction.keywordsFound) {
           if (_cumKeywords.length >= 10) break;
@@ -485,7 +503,8 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
 
       if (_debugMode) {
         debugPrint('Scanner F$_scanFrameCount cum: set=$_cumSetCode cn=$_cumCN raw=$_cumCNRaw '
-            'names=$_cumNames kw=$_cumKeywords types=$_cumTypes${_cumPromoDetected ? ' PROMO✓' : ''}');
+            'names=$_cumNames kw=$_cumKeywords types=$_cumTypes${_cumPromoDetected ? ' PROMO✓' : ''} '
+            'grid=[${_gridAnchors.keys.join(",")}]');
       }
 
       final lookup = CardLookupService.instance;
@@ -792,6 +811,86 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
         .toList();
 
     _addCard(resolvedCard, resolvedAlts);
+  }
+
+  // ══════════════════════════════════════════════
+  // ── Mana crop OCR: targeted read of the mana region ──
+  // ══════════════════════════════════════════════
+
+  /// Crop the mana region from the Y-plane and run OCR on just that area.
+  /// Uses the Grid (type+cn) to calculate where mana should be.
+  void _tryManaCropOcr() async {
+    final typeAnchor = _gridAnchors['type'];
+    final cnAnchor = _gridAnchors['cn'];
+    if (typeAnchor == null || cnAnchor == null) return;
+
+    // Calculate card geometry from type+cn
+    final observedDist = cnAnchor.observedCY - typeAnchor.observedCY;
+    if (observedDist <= 0) return;
+    final cardH = observedDist / (_gridCnYPct - _gridTypeYPct);
+    final cardW = cardH * _idealRatio;
+    final cardTop = typeAnchor.observedCY - _gridTypeYPct * cardH;
+    final cardLeft = cnAnchor.observedLeft - _gridCnXPct * cardW;
+
+    // Mana sits at ~3% of card height, ~8% from left, in a diamond ~12% wide, ~8% tall
+    final manaX = (cardLeft + cardW * 0.02).round().clamp(0, _lastYWidth - 1);
+    final manaY = (cardTop + cardH * 0.0).round().clamp(0, _lastYHeight - 1);
+    final manaW = (cardW * 0.18).round().clamp(1, _lastYWidth - manaX);
+    final manaH = (cardH * 0.12).round().clamp(1, _lastYHeight - manaY);
+
+    if (manaW < 20 || manaH < 20) return;
+
+    // Crop Y-plane and convert to BGRA
+    final bgra = Uint8List(manaW * manaH * 4);
+    for (int y = 0; y < manaH; y++) {
+      for (int x = 0; x < manaW; x++) {
+        final srcIdx = (manaY + y) * _lastYStride + (manaX + x);
+        final v = srcIdx < _lastYPlane!.length ? _lastYPlane![srcIdx] : 0;
+        final idx = (y * manaW + x) * 4;
+        bgra[idx] = v; bgra[idx + 1] = v; bgra[idx + 2] = v; bgra[idx + 3] = 255;
+      }
+    }
+
+    try {
+      final recognized = await _ocr.recognizeCrop(bgra, manaW, manaH);
+      if (recognized == null || recognized.blocks.isEmpty) return;
+
+      for (final block in recognized.blocks) {
+        final trimmed = block.text.trim();
+        if (trimmed.length <= 2 && RegExp(r'^\d{1,2}$').hasMatch(trimmed)) {
+          final manaCost = int.tryParse(trimmed);
+          if (manaCost != null) {
+            _cumMana ??= manaCost;
+            // Create mana anchor in ORIGINAL frame coordinates
+            final box = [
+              manaX.toDouble(), manaY.toDouble(),
+              (manaX + manaW).toDouble(), (manaY + manaH).toDouble(),
+            ];
+            final cx = (box[0] + box[2]) / 2;
+            final cy = (box[1] + box[3]) / 2;
+            _gridAnchors['mana'] = GridAnchor(
+              label: 'mana',
+              yPct: _gridManaYPct,
+              xPct: _gridManaXPct,
+              observedCX: cx,
+              observedCY: cy,
+              observedLeft: box[0],
+            );
+            if (_debugMode) {
+              debugPrint('Mana crop OCR: found "$trimmed" at crop (${manaX},${manaY}) ${manaW}x${manaH}');
+            }
+            return;
+          }
+        }
+      }
+
+      if (_debugMode) {
+        final text = recognized.blocks.map((b) => b.text).join(' | ');
+        debugPrint('Mana crop OCR: no digit found in "$text" at (${manaX},${manaY}) ${manaW}x${manaH}');
+      }
+    } catch (e) {
+      if (_debugMode) debugPrint('Mana crop OCR error: $e');
+    }
   }
 
   // ══════════════════════════════════════════════
@@ -1309,6 +1408,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     if (newState == ScanState.motion) {
       _nativeRects.clear();
       _waitingMatch = null;
+      _ocr.resetStickyMana(); // new card → reset sticky mana from previous scan
     }
     // Reset cumulative extraction when entering SCANNING
     if (newState == ScanState.scanning) {
