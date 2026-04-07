@@ -15,6 +15,7 @@ import '../services/card_lookup_service.dart';
 import '../services/phash_service.dart';
 import '../services/native_rect_service.dart';
 import '../services/promo_classifier_service.dart';
+import '../services/set_classifier_service.dart';
 import '../services/training_frame_service.dart';
 import '../theme/app_theme.dart';
 import '../widgets/card_image.dart';
@@ -80,6 +81,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
   // ── pHash variant detection ──
   final _phash = PhashService.instance;
   final _promoClassifier = PromoClassifierService.instance;
+  final _setClassifier = SetClassifierService.instance;
   final _trainingFrames = TrainingFrameService.instance;
   Uint8List? _lastYPlane;  // updated every frame (for motion detection)
   int _lastYWidth = 0;
@@ -139,6 +141,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     if (!_lookup.isReady) _lookup.build();
     _phash.load();
     _promoClassifier.load();
+    _setClassifier.load();
     OcrService.instance.debugMode = true; // ON for mana debug
     _initCamera();
   }
@@ -810,6 +813,26 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
             _saveDebugCrops(computeResult, match.card.name);
           }
           _saveFullFrameDebug(match.card.name, cardRect);
+        }
+
+        // ── TFLite Set Code Classifier ──
+        // Overrides OCR-detected set code with CNN classification
+        if (computeResult.debugFullPixels != null && _setClassifier.isReady) {
+          final setResult = _setClassifier.classify(
+            computeResult.debugFullPixels!,
+            computeResult.debugFullW,
+            computeResult.debugFullH,
+          );
+          if (setResult != null) {
+            if (_debugMode) {
+              debugPrint('TFLite set: ${setResult.setCode} '
+                  '(conf=${setResult.confidence.toStringAsFixed(3)}, '
+                  'OCR was: ${match.card.setId})');
+            }
+            // Override cumulative set code with CNN result for downstream matching.
+            // This fixes OCR misreads like "SFO"→"SFD", "O6S"→"OGS".
+            _cumSetCode = setResult.setCode;
+          }
         }
 
         // ── TFLite Promo Badge Classifier ──
