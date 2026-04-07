@@ -108,6 +108,7 @@ class PhashService {
     } catch (e) {
       debugPrint('PhashService: Failed to load gem templates: $e');
     }
+
   }
 
   /// Parse a 16-char hex string as 64-bit hash.
@@ -352,11 +353,24 @@ class PhashService {
       final sorted = List<PhashComparison>.from(comparisons)
         ..sort((a, b) => a.gemDist.compareTo(b.gemDist));
       final bestGem = sorted.first;
+      final secondGem = sorted.length > 1 ? sorted[1].gemDist : 64;
+      final gemGap = secondGem - bestGem.gemDist;
+
+      // Confidence gate: gem crop Hamming distances of 20+ are near-random (64-bit hash).
+      // Only trust the pick if there's a meaningful gap between best and second-best.
+      if (gemGap < confidenceMinGap) {
+        return PhashResult(
+          bestId: null,
+          stage: 2,
+          reason: 'low-confidence gem (best=${bestGem.gemDist}, gap=$gemGap < $confidenceMinGap, spread=$fullSpread)',
+          comparisons: comparisons,
+        );
+      }
 
       return PhashResult(
         bestId: bestGem.cardId,
         stage: 2,
-        reason: '${bestGem.gemDist > gemHashThreshold ? "promo" : "base"} (spread=$fullSpread)',
+        reason: '${bestGem.gemDist > gemHashThreshold ? "promo" : "base"} (spread=$fullSpread, gap=$gemGap)',
         comparisons: comparisons,
       );
     }
@@ -394,145 +408,29 @@ class PhashService {
     final sameArt = comparisons.where((c) => c.fullDist <= fullHashThreshold).toList();
     sameArt.sort((a, b) => a.gemDist.compareTo(b.gemDist));
     final bestGem = sameArt.first;
+    final secondGem = sameArt.length > 1 ? sameArt[1].gemDist : 64;
+    final gemGap = secondGem - bestGem.gemDist;
+
+    // Confidence gate: only trust gem-based pick if gap is meaningful
+    if (gemGap < confidenceMinGap) {
+      return PhashResult(
+        bestId: null,
+        stage: 2,
+        reason: 'low-confidence gem (best=${bestGem.gemDist}, gap=$gemGap < $confidenceMinGap)',
+        comparisons: comparisons,
+      );
+    }
 
     return PhashResult(
       bestId: bestGem.cardId,
       stage: 2,
-      reason: bestGem.gemDist > gemHashThreshold ? 'promo' : 'base',
+      reason: '${bestGem.gemDist > gemHashThreshold ? "promo" : "base"} (gap=$gemGap)',
       comparisons: comparisons,
     );
   }
 
-  // ══════════════════════════════════════════════
-  // ── SAD Template Matching for Promo detection ──
-  // ══════════════════════════════════════════════
-
-  /// Compare camera gem crop against reference gem templates using SAD
-  /// (Sum of Absolute Differences) with multi-position sliding window.
-  /// Returns the variant ID with the lowest SAD, or null if no templates.
-  PhashResult? findBestVariantSAD(
-    Uint8List cameraCardPixels, int cardW, int cardH,
-    List<String> variantIds, {Set<String>? promoIds}
-  ) {
-    if (_gemTemplates.isEmpty) return null;
-
-    // Check which variants have templates
-    final withTemplates = variantIds.where((id) => _gemTemplates.containsKey(id)).toList();
-    if (withTemplates.length < 2) return null;
-
-    // Extract camera gem crops at multiple positions (sliding window)
-    final baseGx = (_gemCropX * cardW).round();
-    final baseGy = (_gemCropY * cardH).round();
-    final gw = (_gemCropW * cardW).round().clamp(1, cardW);
-    final gh = (_gemCropH * cardH).round().clamp(1, cardH);
-
-    // Sliding window: ±15px in 3px steps = 11×11 = 121 probes
-    // Balance: enough for rect boundary error, not so much that false matches occur
-    const step = 3;
-    const range = 15;
-
-    // Strategy: Base is default. Only search for PROMO indicators.
-    // If any probe position matches a promo template well → Promo.
-    // If not → Base.
-    final promoVars = promoIds != null
-        ? withTemplates.where((id) => promoIds.contains(id)).toList()
-        : <String>[];
-    final baseVars = withTemplates.where((id) => !promoVars.contains(id)).toList();
-
-    if (promoVars.isEmpty) return null;
-
-    // Search: does any probe position match a promo template?
-    String? bestPromoId;
-    double bestPromoSad = double.infinity;
-
-    for (final promoId in promoVars) {
-      final template = _gemTemplates[promoId]!;
-      if (template.length != _gemTemplateW * _gemTemplateH) continue;
-
-      for (int dy = -range; dy <= range; dy += step) {
-        for (int dx = -range; dx <= range; dx += step) {
-          final gx = (baseGx + dx).clamp(0, cardW - gw);
-          final gy = (baseGy + dy).clamp(0, cardH - gh);
-
-          final cropPixels = _extractAndResize(
-            cameraCardPixels, cardW, cardH, gx, gy, gw, gh,
-            _gemTemplateW, _gemTemplateH,
-          );
-          if (cropPixels == null) continue;
-
-          final normalized = _normalize(cropPixels);
-
-          double sum = 0;
-          for (int i = 0; i < normalized.length; i++) {
-            sum += (normalized[i] - template[i]).abs();
-          }
-          final meanSad = sum / normalized.length;
-
-          if (meanSad < bestPromoSad) {
-            bestPromoSad = meanSad;
-            bestPromoId = promoId;
-          }
-        }
-      }
-    }
-
-    // Promo threshold: if best SAD < 35, promo badge was found
-    const promoThreshold = 60.0;
-    final isPromo = bestPromoSad < promoThreshold;
-    final defaultBaseId = baseVars.isNotEmpty ? baseVars.first : withTemplates.first;
-    final resultId = isPromo ? bestPromoId! : defaultBaseId;
-
-    final comparisons = withTemplates.map((id) => PhashComparison(
-      cardId: id,
-      fullDist: 0,
-      gemDist: id == bestPromoId ? bestPromoSad.round() : 99,
-    )).toList();
-
-    return PhashResult(
-      bestId: resultId,
-      stage: 3,
-      reason: 'SAD promo-detect (best=${bestPromoSad.toStringAsFixed(1)}, thresh=$promoThreshold → ${isPromo ? "PROMO" : "base"})',
-      comparisons: comparisons,
-    );
-  }
-
-  /// Extract a sub-region from pixels and resize to target dimensions
-  /// using simple bilinear-ish nearest-neighbor sampling.
-  static Uint8List? _extractAndResize(
-    Uint8List src, int srcW, int srcH,
-    int cropX, int cropY, int cropW, int cropH,
-    int targetW, int targetH,
-  ) {
-    final result = Uint8List(targetW * targetH);
-    for (int ty = 0; ty < targetH; ty++) {
-      final sy = cropY + (ty * cropH ~/ targetH);
-      if (sy >= srcH) return null;
-      for (int tx = 0; tx < targetW; tx++) {
-        final sx = cropX + (tx * cropW ~/ targetW);
-        if (sx >= srcW) return null;
-        final srcIdx = sy * srcW + sx;
-        if (srcIdx >= src.length) return null;
-        result[ty * targetW + tx] = src[srcIdx];
-      }
-    }
-    return result;
-  }
-
-  /// Normalize pixel array to 0-255 range.
-  static Uint8List _normalize(Uint8List pixels) {
-    int mn = 255, mx = 0;
-    for (final p in pixels) {
-      if (p < mn) mn = p;
-      if (p > mx) mx = p;
-    }
-    if (mx == mn) return pixels;
-    final result = Uint8List(pixels.length);
-    final range = mx - mn;
-    for (int i = 0; i < pixels.length; i++) {
-      result[i] = ((pixels[i] - mn) * 255 ~/ range);
-    }
-    return result;
-  }
+  // NOTE: SAD template matching and gradient badge detection were removed.
+  // Promo detection is now handled by PromoClassifierService (TFLite CNN).
 }
 
 /// Per-variant comparison result.

@@ -14,6 +14,7 @@ import '../services/ocr_service.dart';
 import '../services/card_lookup_service.dart';
 import '../services/phash_service.dart';
 import '../services/native_rect_service.dart';
+import '../services/promo_classifier_service.dart';
 import '../theme/app_theme.dart';
 import '../widgets/card_image.dart';
 import 'scan_results_screen.dart';
@@ -77,6 +78,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
 
   // ── pHash variant detection ──
   final _phash = PhashService.instance;
+  final _promoClassifier = PromoClassifierService.instance;
   Uint8List? _lastYPlane;  // updated every frame (for motion detection)
   int _lastYWidth = 0;
   int _lastYHeight = 0;
@@ -134,6 +136,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     WidgetsBinding.instance.addObserver(this);
     if (!_lookup.isReady) _lookup.build();
     _phash.load();
+    _promoClassifier.load();
     OcrService.instance.debugMode = true; // ON for mana debug
     _initCamera();
   }
@@ -776,7 +779,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
         }
 
         // Single pHash compute with OCR-anchored card rect
-        // debug=true to always get card pixels (needed for SAD template matching)
+        // debug=true to always get card pixels (needed for badge detection)
         final computeResult = await compute(computePhashIsolate, PhashPayload(
           yPlane: yPlane,
           width: _lastYWidth,
@@ -793,19 +796,37 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
           _saveFullFrameDebug(match.card.name, cardRect);
         }
 
-        var result = _phash.findBestVariant(computeResult.hash, variantIds, promoIds: promoIds);
-
-        // Stage 2 (gem pHash): try SAD template matching for better accuracy
-        if (result != null && result.stage == 2 && computeResult.debugFullPixels != null) {
-          final sadResult = _phash.findBestVariantSAD(
+        // ── TFLite Promo Badge Classifier ──
+        // CNN-based detection: 48×48 grayscale crop → promo probability
+        if (promoIds.isNotEmpty && computeResult.debugFullPixels != null && _promoClassifier.isReady) {
+          final prob = _promoClassifier.classify(
             computeResult.debugFullPixels!,
-            computeResult.debugFullW, computeResult.debugFullH,
-            variantIds, promoIds: promoIds,
+            computeResult.debugFullW,
+            computeResult.debugFullH,
           );
-          if (sadResult != null) {
-            result = sadResult; // SAD overrides pHash gem result
+          if (prob != null) {
+            final isPromoBadge = prob >= PromoClassifierService.promoThreshold;
+            if (_debugMode) {
+              debugPrint('TFLite badge: prob=${prob.toStringAsFixed(3)} '
+                  '(thresh=${PromoClassifierService.promoThreshold} → ${isPromoBadge ? "PROMO" : "base"})');
+            }
+            if (isPromoBadge) {
+              final promoVariant = allVariants.where((c) => c.isPromo).toList();
+              if (promoVariant.isNotEmpty) {
+                resolvedCard = promoVariant.first;
+                if (_debugMode) {
+                  debugPrint('TFLite badge: resolved to ${resolvedCard.setId}#${resolvedCard.collectorNumber}');
+                }
+                final resolvedAlts = allVariants.where((c) => c.id != resolvedCard.id).toList();
+                _addCard(resolvedCard, resolvedAlts);
+                return;
+              }
+            }
           }
         }
+
+        // ── pHash variant detection (fallback) ──
+        final result = _phash.findBestVariant(computeResult.hash, variantIds, promoIds: promoIds);
 
         if (result != null) {
           if (_debugMode) {
@@ -856,12 +877,14 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     final cw = gridRect.rect[2].toDouble();
     final ch = gridRect.rect[3].toDouble();
 
-    // Badge region: centered on the PROMO badge between card text and CN line
-    // PROMO text arc sits at ~90-93% Y. Use 90% start, 5% height.
-    final badgeX = (cx + cw * 0.30).round().clamp(0, _lastYWidth - 1);
-    final badgeY = (cy + ch * 0.90).round().clamp(0, _lastYHeight - 1);
-    final badgeW = (cw * 0.40).round().clamp(1, _lastYWidth - badgeX);
-    final badgeH = (ch * 0.05).round().clamp(1, _lastYHeight - badgeY);
+    // Badge region: generous crop of the bottom portion of the card.
+    // PROMO text sits curved on/above the gem at the very bottom.
+    // Crop the full bottom 15% of the card with full width to ensure
+    // we capture the text regardless of exact position or curve.
+    final badgeX = cx.round().clamp(0, _lastYWidth - 1);
+    final badgeY = (cy + ch * 0.83).round().clamp(0, _lastYHeight - 1);
+    final badgeW = cw.round().clamp(1, _lastYWidth - badgeX);
+    final badgeH = (ch * 0.14).round().clamp(1, _lastYHeight - badgeY);
 
     if (_debugMode) debugPrint('Badge crop: ($badgeX,$badgeY) ${badgeW}x$badgeH');
     if (badgeW < 30 || badgeH < 15) {
@@ -869,9 +892,9 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
       return;
     }
 
-    // Crop Y-plane and convert to 3x upscaled BGRA grayscale
-    // ML Kit needs sufficient pixel density to read small text like "PROMO"
-    const scale = 3;
+    // Crop Y-plane and convert to 4x upscaled BGRA grayscale
+    // Higher upscale gives ML Kit more pixels to work with for small curved text
+    const scale = 4;
     final scaledW = badgeW * scale;
     final scaledH = badgeH * scale;
     final bgra = Uint8List(scaledW * scaledH * 4);
@@ -892,8 +915,13 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
 
       final text = recognized.blocks.map((b) => b.text.toLowerCase()).join(' ');
 
-      // Check for PROMO and common OCR misreads
-      final promoPatterns = ['promo', 'prom0', 'pr0mo', 'promd', 'promq', 'prgmo'];
+      // Check for PROMO and common OCR misreads (full + partial matches)
+      final promoPatterns = [
+        'promo', 'prom0', 'pr0mo', 'promd', 'promq', 'prgmo',
+        'promo', 'prómo', 'prömo', // accented variants
+        'rom0', 'romo', // partial: missing P
+        'prom', 'pro mo', 'pr omo', // partial: split by space
+      ];
       for (final p in promoPatterns) {
         if (text.contains(p)) {
           _cumPromoDetected = true;

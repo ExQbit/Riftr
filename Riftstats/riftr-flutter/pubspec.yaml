@@ -49,6 +49,7 @@ dependencies:
   http: ^1.6.0
   camera: ^0.11.0+2
   google_mlkit_text_recognition: ^0.15.0
+  tflite_flutter: ^0.11.0
 
 dev_dependencies:
   flutter_test:
@@ -89,6 +90,7 @@ flutter:
     - assets/cards.json
     - assets/phash_lookup.json
     - assets/gem_templates.json
+    - assets/promo_badge_classifier.tflite
     - assets/meta_decks.json
     - assets/runes/
     - assets/badges/
