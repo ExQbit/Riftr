@@ -15,6 +15,7 @@ import '../services/card_lookup_service.dart';
 import '../services/phash_service.dart';
 import '../services/native_rect_service.dart';
 import '../services/promo_classifier_service.dart';
+import '../services/training_frame_service.dart';
 import '../theme/app_theme.dart';
 import '../widgets/card_image.dart';
 import 'scan_results_screen.dart';
@@ -79,6 +80,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
   // ── pHash variant detection ──
   final _phash = PhashService.instance;
   final _promoClassifier = PromoClassifierService.instance;
+  final _trainingFrames = TrainingFrameService.instance;
   Uint8List? _lastYPlane;  // updated every frame (for motion detection)
   int _lastYWidth = 0;
   int _lastYHeight = 0;
@@ -598,6 +600,12 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
         } else {
           debugPrint('Scanner: No match after $_scanFrameCount frames (cumBest=$bestScore)');
           _debugOcr = 'no match (cum=$bestScore)';
+          // Collect negative training frame (scan timeout)
+          if (_lastYPlane != null) {
+            _trainingFrames.saveNegativeFrame(
+              _lastYPlane!, _lastYWidth, _lastYHeight, _lastYStride,
+            );
+          }
           _setState(ScanState.stable);
         }
         return;
@@ -618,6 +626,14 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     _setState(ScanState.stable);
     _lastMatchedCardId = match.card.id;
     HapticFeedback.mediumImpact();
+
+    // Collect positive training frame (successful scan)
+    if (_lastYPlane != null) {
+      _trainingFrames.savePositiveFrame(
+        _lastYPlane!, _lastYWidth, _lastYHeight, _lastYStride,
+        match.card.name,
+      );
+    }
 
     var resolvedCard = match.card;
 
@@ -1712,6 +1728,44 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
               child: Center(
                 child: Text('Tap to scan again',
                   style: AppTextStyles.small.copyWith(color: AppColors.textSecondary)),
+              ),
+            ),
+
+          // Training frame export button (debug only)
+          if (_debugMode)
+            Positioned(
+              bottom: MediaQuery.of(context).padding.bottom + 100,
+              left: 16,
+              child: GestureDetector(
+                onTap: () async {
+                  final count = await _trainingFrames.frameCount();
+                  if (!mounted) return;
+                  if (count.total == 0) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('No training frames collected yet')),
+                    );
+                    return;
+                  }
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('Exporting ${count.total} frames (${count.positive} pos, ${count.negative} neg)...')),
+                  );
+                  await _trainingFrames.exportFrames();
+                },
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: Colors.black54,
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: const Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.file_upload_outlined, color: Colors.white70, size: 16),
+                      SizedBox(width: 4),
+                      Text('Frames', style: TextStyle(color: Colors.white70, fontSize: 11)),
+                    ],
+                  ),
+                ),
               ),
             ),
 
