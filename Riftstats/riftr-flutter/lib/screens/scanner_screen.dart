@@ -16,6 +16,7 @@ import '../services/phash_service.dart';
 import '../services/native_rect_service.dart';
 import '../services/promo_classifier_service.dart';
 import '../services/set_classifier_service.dart';
+import '../services/suffix_classifier_service.dart';
 import '../services/training_frame_service.dart';
 import '../theme/app_theme.dart';
 import '../widgets/card_image.dart';
@@ -82,6 +83,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
   final _phash = PhashService.instance;
   final _promoClassifier = PromoClassifierService.instance;
   final _setClassifier = SetClassifierService.instance;
+  final _suffixClassifier = SuffixClassifierService.instance;
   final _trainingFrames = TrainingFrameService.instance;
   Uint8List? _lastYPlane;  // updated every frame (for motion detection)
   int _lastYWidth = 0;
@@ -142,6 +144,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     _phash.load();
     _promoClassifier.load();
     _setClassifier.load();
+    _suffixClassifier.load();
     OcrService.instance.debugMode = true; // ON for mana debug
     _initCamera();
   }
@@ -835,6 +838,26 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
             // Override cumulative set code with CNN result for downstream matching.
             // This fixes OCR misreads like "SFO"→"SFD", "O6S"→"OGS".
             _cumSetCode = setResult.setCode;
+          }
+        }
+
+        // ── TFLite Suffix Classifier ──
+        // Overrides OCR-detected suffix with CNN classification
+        if (computeResult.debugFullPixels != null && _suffixClassifier.isReady) {
+          final suffixResult = _suffixClassifier.classify(
+            computeResult.debugFullPixels!,
+            computeResult.debugFullW,
+            computeResult.debugFullH,
+          );
+          if (suffixResult != null) {
+            final detectedSuffix = suffixResult.suffix == 'none' ? null : suffixResult.suffix;
+            if (_debugMode) {
+              debugPrint('TFLite suffix: ${suffixResult.suffix} '
+                  '(conf=${suffixResult.confidence.toStringAsFixed(3)}, '
+                  'OCR was: ${_cumCNSuffix ?? "none"})');
+            }
+            // Override OCR suffix if CNN is confident
+            _cumCNSuffix = detectedSuffix;
           }
         }
 

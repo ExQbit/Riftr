@@ -92,6 +92,7 @@ flutter:
     - assets/gem_templates.json
     - assets/promo_badge_classifier.tflite
     - assets/set_code_classifier.tflite
+    - assets/suffix_classifier.tflite
     - assets/meta_decks.json
     - assets/runes/
     - assets/badges/
