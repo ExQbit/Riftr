@@ -630,14 +630,6 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     _lastMatchedCardId = match.card.id;
     HapticFeedback.mediumImpact();
 
-    // Collect positive training frame (successful scan)
-    if (_lastYPlane != null) {
-      _trainingFrames.savePositiveFrame(
-        _lastYPlane!, _lastYWidth, _lastYHeight, _lastYStride,
-        match.card.name,
-      );
-    }
-
     var resolvedCard = match.card;
 
     final nameLower = match.card.name.toLowerCase();
@@ -813,6 +805,17 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
             _saveDebugCrops(computeResult, match.card.name);
           }
           _saveFullFrameDebug(match.card.name, cardRect);
+        }
+
+        // Save full-res card crop for training (set/suffix/promo models)
+        if (computeResult.debugFullPixels != null) {
+          _trainingFrames.savePositiveFrame(
+            _lastYPlane!, _lastYWidth, _lastYHeight, _lastYStride,
+            match.card.name,
+            cardCrop: computeResult.debugFullPixels!,
+            cardCropW: computeResult.debugFullW,
+            cardCropH: computeResult.debugFullH,
+          );
         }
 
         // ── TFLite Set Code Classifier ──

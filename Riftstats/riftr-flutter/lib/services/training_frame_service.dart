@@ -46,8 +46,11 @@ class TrainingFrameService {
   }
 
   /// Save a positive frame (card successfully scanned).
+  /// Save a positive frame (card successfully scanned).
+  /// [cardCrop] is the full-resolution card crop (grayscale) for set/suffix training.
   Future<void> savePositiveFrame(
     Uint8List yPlane, int width, int height, int stride, String cardName,
+    {Uint8List? cardCrop, int cardCropW = 0, int cardCropH = 0}
   ) async {
     if (_saving) return;
     _saving = true;
@@ -57,12 +60,21 @@ class TrainingFrameService {
           .replaceAll(RegExp(r'[^a-zA-Z0-9]'), '_')
           .toLowerCase();
       final ts = DateTime.now().millisecondsSinceEpoch;
-      final path = '${dir.path}/${ts}_pos_$safeName.png';
 
-      await _saveDownscaledFrame(yPlane, width, height, stride, path);
+      // Low-res full frame (96×128) for card-present classifier
+      await _saveDownscaledFrame(yPlane, width, height, stride,
+          '${dir.path}/${ts}_pos_$safeName.png');
+
+      // Full-resolution card crop for set/suffix/promo training
+      if (cardCrop != null && cardCropW > 0 && cardCropH > 0) {
+        await _saveGrayscalePng(cardCrop, cardCropW, cardCropH,
+            '${dir.path}/${ts}_crop_$safeName.png');
+      }
+
       await _enforceLimit(dir);
 
-      if (kDebugMode) debugPrint('TrainingFrame: saved positive → $safeName');
+      final count = await frameCount();
+      if (kDebugMode) debugPrint('TrainingFrame: saved positive → $safeName (${count.total}/2000: ${count.positive}pos ${count.negative}neg)');
     } catch (e) {
       if (kDebugMode) debugPrint('TrainingFrame: save positive failed: $e');
     } finally {
@@ -84,7 +96,8 @@ class TrainingFrameService {
       await _saveDownscaledFrame(yPlane, width, height, stride, path);
       await _enforceLimit(dir);
 
-      if (kDebugMode) debugPrint('TrainingFrame: saved negative');
+      final count = await frameCount();
+      if (kDebugMode) debugPrint('TrainingFrame: saved negative (${count.total}/2000: ${count.positive}pos ${count.negative}neg)');
     } catch (e) {
       if (kDebugMode) debugPrint('TrainingFrame: save negative failed: $e');
     } finally {
@@ -126,6 +139,26 @@ class TrainingFrameService {
     final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
     image.dispose();
 
+    if (byteData != null) {
+      await File(path).writeAsBytes(byteData.buffer.asUint8List());
+    }
+  }
+
+  /// Save grayscale pixels as PNG (no downscaling).
+  Future<void> _saveGrayscalePng(Uint8List pixels, int w, int h, String path) async {
+    final rgba = Uint8List(w * h * 4);
+    for (int i = 0; i < w * h; i++) {
+      final v = i < pixels.length ? pixels[i] : 0;
+      rgba[i * 4] = v;
+      rgba[i * 4 + 1] = v;
+      rgba[i * 4 + 2] = v;
+      rgba[i * 4 + 3] = 255;
+    }
+    final completer = Completer<ui.Image>();
+    ui.decodeImageFromPixels(rgba, w, h, ui.PixelFormat.rgba8888, completer.complete);
+    final image = await completer.future;
+    final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+    image.dispose();
     if (byteData != null) {
       await File(path).writeAsBytes(byteData.buffer.asUint8List());
     }
