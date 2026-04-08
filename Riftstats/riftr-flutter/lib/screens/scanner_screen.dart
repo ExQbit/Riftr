@@ -484,7 +484,11 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
 
         // ── Mana crop OCR: if we have type+cn but no mana after 5 frames,
         // calculate where mana should be and OCR just that region ──
-        if (!_gridAnchors.containsKey('mana') &&
+        // Skip for card types that don't have a mana diamond (rune, legend, battlefield).
+        final _noManaDiamond = _cumTypes.contains('rune') ||
+            _cumTypes.contains('legend') || _cumTypes.contains('battlefield');
+        if (!_noManaDiamond &&
+            !_gridAnchors.containsKey('mana') &&
             _gridAnchors.containsKey('type') &&
             _gridAnchors.containsKey('cn') &&
             _scanFrameCount == 5 &&
@@ -901,7 +905,10 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
 
         // ── TFLite Mana Classifier ──
         // CNN-based mana detection: 48×48 grayscale crop → mana class
-        if (computeResult.debugFullPixels != null && _manaClassifier.isReady) {
+        // Skip for card types without a mana diamond (rune, legend, battlefield).
+        final noMana = _cumTypes.contains('rune') ||
+            _cumTypes.contains('legend') || _cumTypes.contains('battlefield');
+        if (!noMana && computeResult.debugFullPixels != null && _manaClassifier.isReady) {
           final manaResult = _manaClassifier.classify(
             computeResult.debugFullPixels!,
             computeResult.debugFullW,
@@ -962,14 +969,46 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
         }
 
         // ── pHash variant detection (fallback) ──
-        final result = _phash.findBestVariant(computeResult.hash, variantIds, promoIds: promoIds);
+        // Constrain pHash to variants matching the confirmed set+CN.
+        // Without this, pHash can jump to a different set's variant
+        // (e.g., SFDX#R06b instead of OGN#214) if the artwork hash is closer.
+        final confirmedSet = _cumSetCode;
+        final confirmedCN = _cumCN?.toString();
+        List<RiftCard> phashCandidates = allVariants;
+        if (confirmedSet != null && confirmedCN != null) {
+          // Filter to variants matching set (base or promo) + CN number
+          final setFamily = <String>{confirmedSet};
+          // Also include promo set if base was detected, and vice versa
+          const promoMap = {'OGN': 'OGNX', 'SFD': 'SFDX', 'OGS': 'OGSX'};
+          const baseMap = {'OGNX': 'OGN', 'SFDX': 'SFD', 'OGSX': 'OGS'};
+          if (promoMap.containsKey(confirmedSet)) setFamily.add(promoMap[confirmedSet]!);
+          if (baseMap.containsKey(confirmedSet)) setFamily.add(baseMap[confirmedSet]!);
+
+          // Compare CN numerically: "214" matches "214", "214a", "214b" etc.
+          final filtered = allVariants.where((c) {
+            if (!setFamily.contains(c.setId)) return false;
+            final cardCNNum = c.collectorNumber?.replaceAll(RegExp(r'[^0-9]'), '');
+            return cardCNNum == confirmedCN;
+          }).toList();
+          if (filtered.isNotEmpty) {
+            phashCandidates = filtered;
+            if (_debugMode && filtered.length < allVariants.length) {
+              debugPrint('pHash: constrained to ${filtered.length}/${allVariants.length} variants '
+                  '(set=$confirmedSet cn=$confirmedCN)');
+            }
+          }
+        }
+
+        final phashVariantIds = phashCandidates.map((c) => c.id).toList();
+        final phashPromoIds = phashCandidates.where((c) => c.isPromo).map((c) => c.id).toSet();
+        final result = _phash.findBestVariant(computeResult.hash, phashVariantIds, promoIds: phashPromoIds);
 
         if (result != null) {
           if (_debugMode) {
-            debugPrint('pHash: ${allVariants.length} variants of "${match.card.name}", '
+            debugPrint('pHash: ${phashCandidates.length} variants of "${match.card.name}", '
                 'Stage ${result.stage} → ${result.reason}');
             for (final c in result.comparisons) {
-              final card = allVariants.firstWhere((v) => v.id == c.cardId, orElse: () => match.card);
+              final card = phashCandidates.firstWhere((v) => v.id == c.cardId, orElse: () => match.card);
               final selected = c.cardId == result.bestId ? ' ✓' : '';
               final gemInfo = result.stage >= 2 || c.fullDist <= PhashService.fullHashThreshold
                   ? ' gem=${c.gemDist}' : '';
