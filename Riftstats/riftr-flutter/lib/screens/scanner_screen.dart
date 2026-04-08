@@ -859,6 +859,11 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     // ══════════════════════════════════════════════
     // ── Training frame collection (ALWAYS run) ──
     // ══════════════════════════════════════════════
+    if (_debugMode) {
+      debugPrint('TrainingFrame: computeResult=${computeResult != null}, '
+          'pixels=${computeResult?.debugFullPixels != null}, '
+          'yPlane=${_lastYPlane != null}');
+    }
     if (computeResult?.debugFullPixels != null) {
       _trainingFrames.savePositiveFrame(
         _lastYPlane!, _lastYWidth, _lastYHeight, _lastYStride,
