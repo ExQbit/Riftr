@@ -118,21 +118,23 @@ class TrainingFrameService {
         final ch = rh.clamp(1, height - cy);
         if (cw < 50 || ch < 50) continue;
 
-        // Crop rect from Y-plane into a new buffer (stride = cw)
-        final cropped = Uint8List(cw * ch);
-        for (int y = 0; y < ch; y++) {
-          for (int x = 0; x < cw; x++) {
-            final srcIdx = (cy + y) * stride + (cx + x);
-            cropped[y * cw + x] =
+        // Downscale rect directly to 96×128 grayscale pixels
+        final pixels = Uint8List(_targetW * _targetH);
+        for (int dy = 0; dy < _targetH; dy++) {
+          final srcY = cy + (dy * ch ~/ _targetH);
+          for (int dx = 0; dx < _targetW; dx++) {
+            final srcX = cx + (dx * cw ~/ _targetW);
+            final srcIdx = srcY * stride + srcX;
+            pixels[dy * _targetW + dx] =
                 srcIdx >= 0 && srcIdx < yPlane.length ? yPlane[srcIdx] : 0;
           }
         }
 
-        // Save as downscaled 96×128 PNG (reuses working method)
+        // Save as raw grayscale binary (96×128 = 12288 bytes)
+        // Training script reads these directly — no PNG overhead
         final dir = isCard ? posDir : negDir;
         final label = isCard ? 'rect_pos' : 'rect_neg';
-        await _saveDownscaledFrame(cropped, cw, ch, cw,
-            '${dir.path}/${ts}_${label}_$i.png');
+        await File('${dir.path}/${ts}_${label}_$i.raw').writeAsBytes(pixels);
 
         if (isCard) posSaved++; else negSaved++;
       }
@@ -314,11 +316,11 @@ class TrainingFrameService {
     int pos = 0, neg = 0;
     try {
       final posDir = await _positiveDir();
-      pos = posDir.listSync().whereType<File>().where((f) => f.path.endsWith('.png')).length;
+      pos = posDir.listSync().whereType<File>().where((f) => f.path.endsWith('.png') || f.path.endsWith('.raw')).length;
     } catch (_) {}
     try {
       final negDir = await _negativeDir();
-      neg = negDir.listSync().whereType<File>().where((f) => f.path.endsWith('.png')).length;
+      neg = negDir.listSync().whereType<File>().where((f) => f.path.endsWith('.png') || f.path.endsWith('.raw')).length;
     } catch (_) {}
     return (positive: pos, negative: neg, total: pos + neg);
   }
@@ -337,7 +339,7 @@ class TrainingFrameService {
       final dir = Directory('${base.path}/$subDir');
       if (!dir.existsSync()) continue;
       for (final file in dir.listSync().whereType<File>()) {
-        if (file.path.endsWith('.png')) {
+        if (file.path.endsWith('.png') || file.path.endsWith('.raw')) {
           files.add(XFile(file.path));
         }
       }
