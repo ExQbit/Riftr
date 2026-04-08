@@ -875,10 +875,13 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     }
 
     // Save native rect crops for Card-Present classifier (rect validator)
+    // Copy lists — they're cleared by scanner state changes before async save completes
     if (_nativeRects.isNotEmpty && _lastYPlane != null) {
+      final rectsCopy = _nativeRects.map((r) => List<int>.from(r)).toList();
+      final cardRectCopy = cardRect != null ? List<int>.from(cardRect) : null;
       _trainingFrames.saveRectCrops(
-        _lastYPlane!, _lastYWidth, _lastYHeight, _lastYStride,
-        _nativeRects, cardRect,
+        Uint8List.fromList(_lastYPlane!), _lastYWidth, _lastYHeight, _lastYStride,
+        rectsCopy, cardRectCopy,
       );
     }
 
