@@ -126,6 +126,7 @@ class RiftCard {
   bool get isLandscape => orientation == 'landscape';
   bool get isStandard => !alternateArt && !overnumbered && !signature;
   bool get isPromo => setId == 'OGNX' || setId == 'SFDX' || setId == 'OGSX';
+  bool get isChampionEdition => riftboundId?.contains('champion') ?? false;
   bool get isMetal => metal;
   bool get isToken => type == 'Token';
   bool get isSpecialVariant => isPromo || isMetal;

@@ -122,6 +122,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
   List<double>? _cumCnBox;    // OCR-anchor: best CN bounding box (paired with name)
   List<double>? _cumNameBoxSolo; // name box without requiring CN in same frame
   bool _cumPromoDetected = false; // OCR saw "PROMO" text on badge
+  bool _cumChampionDetected = false; // OCR saw "CHAMPION" text on card
   final StringBuffer _cumText = StringBuffer();
 
   // ── OCR Grid: cross-frame anchor accumulation ──
@@ -500,6 +501,17 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
           _tryBadgeCropOcr();
         }
 
+        // ── Champion crop OCR: detect "CHAMPION" text in artwork area ──
+        // Run every 4th frame, offset from badge OCR
+        if (!_cumChampionDetected &&
+            _scanFrameCount >= 4 &&
+            _scanFrameCount % 4 == 0 &&
+            (_gridAnchors.containsKey('type') || _gridAnchors.containsKey('name')) &&
+            _gridAnchors.containsKey('cn') &&
+            _lastYPlane != null) {
+          _tryChampionCropOcr();
+        }
+
         _cumNames.addAll(extraction.namesFound);
         for (final kw in extraction.keywordsFound) {
           if (_cumKeywords.length >= 10) break;
@@ -690,11 +702,27 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
       }
     }
 
-    // Badge OCR promo detection — if "PROMO" was read on the badge, pick promo variant
+    // Badge OCR promo detection — if "PROMO" or "CHAMPION" was read, pick promo variant
     if (allVariants.length > 1 && _cumPromoDetected) {
       final promoVariant = allVariants.where((c) => c.isPromo).toList();
       if (promoVariant.isNotEmpty) {
-        resolvedCard = promoVariant.first;
+        // If CHAMPION was detected and there's a champion edition, pick that one
+        if (_cumChampionDetected) {
+          final championVariant = promoVariant.where((c) => c.isChampionEdition).toList();
+          if (championVariant.isNotEmpty) {
+            resolvedCard = championVariant.first;
+            if (_debugMode) {
+              debugPrint('Variant resolved by champion OCR: '
+                  '${resolvedCard.setId}#${resolvedCard.collectorNumber} (CHAMPION edition)');
+            }
+            final resolvedAlts = allVariants.where((c) => c.id != resolvedCard.id).toList();
+            _addCard(resolvedCard, resolvedAlts);
+            return;
+          }
+        }
+        // Regular promo — pick non-champion promo if available, else first promo
+        final regularPromo = promoVariant.where((c) => !c.isChampionEdition).toList();
+        resolvedCard = regularPromo.isNotEmpty ? regularPromo.first : promoVariant.first;
         if (_debugMode) {
           debugPrint('Variant resolved by badge OCR: '
               '${resolvedCard.setId}#${resolvedCard.collectorNumber} (PROMO detected)');
@@ -885,7 +913,22 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
             if (isPromoBadge) {
               final promoVariant = allVariants.where((c) => c.isPromo).toList();
               if (promoVariant.isNotEmpty) {
-                resolvedCard = promoVariant.first;
+                // Champion edition detection via OCR
+                if (_cumChampionDetected) {
+                  final championVariant = promoVariant.where((c) => c.isChampionEdition).toList();
+                  if (championVariant.isNotEmpty) {
+                    resolvedCard = championVariant.first;
+                    if (_debugMode) {
+                      debugPrint('TFLite badge: resolved to ${resolvedCard.setId}#${resolvedCard.collectorNumber} (CHAMPION)');
+                    }
+                    final resolvedAlts = allVariants.where((c) => c.id != resolvedCard.id).toList();
+                    _addCard(resolvedCard, resolvedAlts);
+                    return;
+                  }
+                }
+                // Regular promo — prefer non-champion
+                final regularPromo = promoVariant.where((c) => !c.isChampionEdition).toList();
+                resolvedCard = regularPromo.isNotEmpty ? regularPromo.first : promoVariant.first;
                 if (_debugMode) {
                   debugPrint('TFLite badge: resolved to ${resolvedCard.setId}#${resolvedCard.collectorNumber}');
                 }
@@ -1004,11 +1047,95 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
         }
       }
 
+      // Check for CHAMPION text (Champion edition promos)
+      final championPatterns = [
+        'champion', 'champi0n', 'champ1on', 'champlon',
+        'champio', 'hampion', 'champi', // partial reads
+      ];
+      for (final p in championPatterns) {
+        if (text.contains(p)) {
+          _cumChampionDetected = true;
+          _cumPromoDetected = true; // Champion implies promo
+          if (_debugMode) {
+            debugPrint('Badge crop OCR: CHAMPION detected! text="$text" at ($badgeX,$badgeY) ${badgeW}x$badgeH');
+          }
+          return;
+        }
+      }
+
       if (_debugMode) {
         debugPrint('Badge crop OCR: no promo in "$text" at ($badgeX,$badgeY) ${badgeW}x$badgeH');
       }
     } catch (e) {
       if (_debugMode) debugPrint('Badge crop OCR error: $e');
+    }
+  }
+
+  // ══════════════════════════════════════════════
+  // ── Champion crop OCR: detect "CHAMPION" text in artwork area ──
+  // ══════════════════════════════════════════════
+
+  /// Crop the right side of the artwork area to detect "CHAMPION" text.
+  /// Champion edition promos have large gold "CHAMPION" text at ~40-50% Y, 55-90% X.
+  void _tryChampionCropOcr() async {
+    final gridRect = _calculateCardRectFromGrid();
+    if (gridRect == null) return;
+
+    final cx = gridRect.rect[0].toDouble();
+    final cy = gridRect.rect[1].toDouble();
+    final cw = gridRect.rect[2].toDouble();
+    final ch = gridRect.rect[3].toDouble();
+
+    // Champion text region: right half of artwork area (~35-55% Y, 50-95% X)
+    final cropX = (cx + cw * 0.50).round().clamp(0, _lastYWidth - 1);
+    final cropY = (cy + ch * 0.35).round().clamp(0, _lastYHeight - 1);
+    final cropW = (cw * 0.45).round().clamp(1, _lastYWidth - cropX);
+    final cropH = (ch * 0.20).round().clamp(1, _lastYHeight - cropY);
+
+    if (cropW < 30 || cropH < 15) return;
+
+    // Crop Y-plane and convert to 3x upscaled BGRA grayscale
+    const scale = 3;
+    final scaledW = cropW * scale;
+    final scaledH = cropH * scale;
+    final bgra = Uint8List(scaledW * scaledH * 4);
+    for (int sy = 0; sy < scaledH; sy++) {
+      for (int sx = 0; sx < scaledW; sx++) {
+        final origX = cropX + (sx ~/ scale);
+        final origY = cropY + (sy ~/ scale);
+        final srcIdx = origY * _lastYStride + origX;
+        final v = srcIdx >= 0 && srcIdx < _lastYPlane!.length ? _lastYPlane![srcIdx] : 0;
+        final idx = (sy * scaledW + sx) * 4;
+        bgra[idx] = v; bgra[idx + 1] = v; bgra[idx + 2] = v; bgra[idx + 3] = 255;
+      }
+    }
+
+    try {
+      final recognized = await _ocr.recognizeCrop(bgra, scaledW, scaledH);
+      if (recognized == null || recognized.blocks.isEmpty) return;
+
+      final text = recognized.blocks.map((b) => b.text.toLowerCase()).join(' ');
+
+      final championPatterns = [
+        'champion', 'champi0n', 'champ1on', 'champlon',
+        'champio', 'hampion', 'champi', // partial reads
+      ];
+      for (final p in championPatterns) {
+        if (text.contains(p)) {
+          _cumChampionDetected = true;
+          _cumPromoDetected = true; // Champion implies promo
+          if (_debugMode) {
+            debugPrint('Champion crop OCR: CHAMPION detected! text="$text"');
+          }
+          return;
+        }
+      }
+
+      if (_debugMode) {
+        debugPrint('Champion crop OCR: no champion in "$text"');
+      }
+    } catch (e) {
+      if (_debugMode) debugPrint('Champion crop OCR error: $e');
     }
   }
 
@@ -1628,6 +1755,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
       _cumCnBox = null;
       _cumNameBoxSolo = null;
       _cumPromoDetected = false;
+      _cumChampionDetected = false;
       _gridAnchors.clear();
 
       // Reset cumulative pHash frames for new scan cycle.
