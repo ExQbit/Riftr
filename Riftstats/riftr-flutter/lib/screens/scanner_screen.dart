@@ -740,16 +740,17 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
       }
     }
 
-    // pHash variant detection (fallback when no suffix and no badge OCR)
-    if (allVariants.length > 1 && _phash.isReady && _lastYPlane != null) {
-      try {
-        final variantIds = allVariants.map((c) => c.id).toList();
-        final promoIds = allVariants.where((c) => c.isPromo).map((c) => c.id).toSet();
+    // ══════════════════════════════════════════════
+    // ── Card rect + pHash compute + CNNs (ALWAYS run) ──
+    // ══════════════════════════════════════════════
+    PhashComputeResult? computeResult;
+    List<int>? cardRect;
 
-        // Card rect: 4-step fallback chain
-        List<int>? cardRect;
+    if (_phash.isReady && _lastYPlane != null) {
+      try {
         String rectMethod = '';
 
+        // Card rect: 4-step fallback chain
         // 1. OCR Grid (primary) — uses any 2+ text anchors with 20%+ vertical distance
         final gridResult = _calculateCardRectFromGrid();
         if (gridResult != null) {
@@ -801,11 +802,11 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
           if (_debugMode) debugPrint('pHash center-crop fallback rect: ($cardX,$cardY) ${cardW}x$cardH');
         }
 
-        if (_debugMode) debugPrint('pHash: rect via $rectMethod → (${cardRect[0]},${cardRect[1]}) ${cardRect[2]}x${cardRect[3]}');
+        if (_debugMode) debugPrint('Card rect via $rectMethod → (${cardRect[0]},${cardRect[1]}) ${cardRect[2]}x${cardRect[3]}');
 
         // Log ALL native rects for debugging
         if (_debugMode && _nativeRects.isNotEmpty) {
-          debugPrint('pHash: ${_nativeRects.length} native rects collected:');
+          debugPrint('Native rects: ${_nativeRects.length} collected:');
           for (int i = 0; i < _nativeRects.length && i < 10; i++) {
             final r = _nativeRects[i];
             final ratio = r[2] > 0 && r[3] > 0 ? (r[2] / r[3]).toStringAsFixed(3) : '?';
@@ -819,7 +820,6 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
           _saveRejectedRectsDebug(match.card.name, _nativeRects);
         }
 
-        {
         // Strip stride padding from last Y-plane
         Uint8List yPlane;
         if (_lastYStride == _lastYWidth) {
@@ -834,9 +834,9 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
           }
         }
 
-        // Single pHash compute with OCR-anchored card rect
-        // debug=true to always get card pixels (needed for badge detection)
-        final computeResult = await compute(computePhashIsolate, PhashPayload(
+        // pHash compute with OCR-anchored card rect
+        // debug=true to always get card pixels (needed for CNNs + training)
+        computeResult = await compute(computePhashIsolate, PhashPayload(
           yPlane: yPlane,
           width: _lastYWidth,
           height: _lastYHeight,
@@ -851,180 +851,178 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
           }
           _saveFullFrameDebug(match.card.name, cardRect);
         }
+      } catch (e) {
+        debugPrint('Card rect/pHash compute error: $e');
+      }
+    }
 
-        // Save full-res card crop for training (set/suffix/promo models)
-        if (computeResult.debugFullPixels != null) {
-          _trainingFrames.savePositiveFrame(
-            _lastYPlane!, _lastYWidth, _lastYHeight, _lastYStride,
-            match.card.name,
-            cardCrop: computeResult.debugFullPixels!,
-            cardCropW: computeResult.debugFullW,
-            cardCropH: computeResult.debugFullH,
-          );
+    // ══════════════════════════════════════════════
+    // ── Training frame collection (ALWAYS run) ──
+    // ══════════════════════════════════════════════
+    if (computeResult?.debugFullPixels != null) {
+      _trainingFrames.savePositiveFrame(
+        _lastYPlane!, _lastYWidth, _lastYHeight, _lastYStride,
+        match.card.name,
+        cardCrop: computeResult!.debugFullPixels!,
+        cardCropW: computeResult.debugFullW,
+        cardCropH: computeResult.debugFullH,
+      );
+    }
+
+    // ══════════════════════════════════════════════
+    // ── TFLite CNN classifiers (ALWAYS run) ──
+    // ══════════════════════════════════════════════
+
+    // ── TFLite Set Code Classifier ──
+    if (computeResult?.debugFullPixels != null && _setClassifier.isReady) {
+      final setResult = _setClassifier.classify(
+        computeResult!.debugFullPixels!,
+        computeResult.debugFullW,
+        computeResult.debugFullH,
+      );
+      if (setResult != null) {
+        if (_debugMode) {
+          debugPrint('TFLite set: ${setResult.setCode} '
+              '(conf=${setResult.confidence.toStringAsFixed(3)}, '
+              'OCR was: ${match.card.setId})');
         }
+        _cumSetCode = setResult.setCode;
+      }
+    }
 
-        // ── TFLite Set Code Classifier ──
-        // Overrides OCR-detected set code with CNN classification
-        if (computeResult.debugFullPixels != null && _setClassifier.isReady) {
-          final setResult = _setClassifier.classify(
-            computeResult.debugFullPixels!,
-            computeResult.debugFullW,
-            computeResult.debugFullH,
-          );
-          if (setResult != null) {
-            if (_debugMode) {
-              debugPrint('TFLite set: ${setResult.setCode} '
-                  '(conf=${setResult.confidence.toStringAsFixed(3)}, '
-                  'OCR was: ${match.card.setId})');
-            }
-            // Override cumulative set code with CNN result for downstream matching.
-            // This fixes OCR misreads like "SFO"→"SFD", "O6S"→"OGS".
-            _cumSetCode = setResult.setCode;
-          }
+    // ── TFLite Suffix Classifier ──
+    if (computeResult?.debugFullPixels != null && _suffixClassifier.isReady) {
+      final suffixResult = _suffixClassifier.classify(
+        computeResult!.debugFullPixels!,
+        computeResult.debugFullW,
+        computeResult.debugFullH,
+      );
+      if (suffixResult != null) {
+        final detectedSuffix = suffixResult.suffix == 'none' ? null : suffixResult.suffix;
+        if (_debugMode) {
+          debugPrint('TFLite suffix: ${suffixResult.suffix} '
+              '(conf=${suffixResult.confidence.toStringAsFixed(3)}, '
+              'OCR was: ${_cumCNSuffix ?? "none"})');
         }
+        _cumCNSuffix = detectedSuffix;
+      }
+    }
 
-        // ── TFLite Suffix Classifier ──
-        // Overrides OCR-detected suffix with CNN classification
-        if (computeResult.debugFullPixels != null && _suffixClassifier.isReady) {
-          final suffixResult = _suffixClassifier.classify(
-            computeResult.debugFullPixels!,
-            computeResult.debugFullW,
-            computeResult.debugFullH,
-          );
-          if (suffixResult != null) {
-            final detectedSuffix = suffixResult.suffix == 'none' ? null : suffixResult.suffix;
-            if (_debugMode) {
-              debugPrint('TFLite suffix: ${suffixResult.suffix} '
-                  '(conf=${suffixResult.confidence.toStringAsFixed(3)}, '
-                  'OCR was: ${_cumCNSuffix ?? "none"})');
-            }
-            // Override OCR suffix if CNN is confident
-            _cumCNSuffix = detectedSuffix;
-          }
+    // ── TFLite Mana Classifier ──
+    // Skip for card types without a mana diamond (rune, legend, battlefield).
+    final noMana = _cumTypes.contains('rune') ||
+        _cumTypes.contains('legend') || _cumTypes.contains('battlefield');
+    if (!noMana && computeResult?.debugFullPixels != null && _manaClassifier.isReady) {
+      final manaResult = _manaClassifier.classify(
+        computeResult!.debugFullPixels!,
+        computeResult.debugFullW,
+        computeResult.debugFullH,
+      );
+      if (manaResult != null) {
+        if (_debugMode) {
+          debugPrint('TFLite mana: ${manaResult.mana} '
+              '(conf=${manaResult.confidence.toStringAsFixed(3)}, '
+              'OCR was: ${_cumMana ?? "none"})');
         }
+        _cumMana = manaResult.mana;
+      }
+    }
 
-        // ── TFLite Mana Classifier ──
-        // CNN-based mana detection: 48×48 grayscale crop → mana class
-        // Skip for card types without a mana diamond (rune, legend, battlefield).
-        final noMana = _cumTypes.contains('rune') ||
-            _cumTypes.contains('legend') || _cumTypes.contains('battlefield');
-        if (!noMana && computeResult.debugFullPixels != null && _manaClassifier.isReady) {
-          final manaResult = _manaClassifier.classify(
-            computeResult.debugFullPixels!,
-            computeResult.debugFullW,
-            computeResult.debugFullH,
-          );
-          if (manaResult != null) {
-            if (_debugMode) {
-              debugPrint('TFLite mana: ${manaResult.mana} '
-                  '(conf=${manaResult.confidence.toStringAsFixed(3)}, '
-                  'OCR was: ${_cumMana ?? "none"})');
-            }
-            _cumMana = manaResult.mana;
-          }
+    // ── TFLite Promo Badge Classifier ──
+    final promoIds = allVariants.where((c) => c.isPromo).map((c) => c.id).toSet();
+    if (promoIds.isNotEmpty && computeResult?.debugFullPixels != null && _promoClassifier.isReady) {
+      final prob = _promoClassifier.classify(
+        computeResult!.debugFullPixels!,
+        computeResult.debugFullW,
+        computeResult.debugFullH,
+      );
+      if (prob != null) {
+        final isPromoBadge = prob >= PromoClassifierService.promoThreshold;
+        if (_debugMode) {
+          debugPrint('TFLite badge: prob=${prob.toStringAsFixed(3)} '
+              '(thresh=${PromoClassifierService.promoThreshold} → ${isPromoBadge ? "PROMO" : "base"})');
         }
-
-        // ── TFLite Promo Badge Classifier ──
-        // CNN-based detection: 48×48 grayscale crop → promo probability
-        if (promoIds.isNotEmpty && computeResult.debugFullPixels != null && _promoClassifier.isReady) {
-          final prob = _promoClassifier.classify(
-            computeResult.debugFullPixels!,
-            computeResult.debugFullW,
-            computeResult.debugFullH,
-          );
-          if (prob != null) {
-            final isPromoBadge = prob >= PromoClassifierService.promoThreshold;
-            if (_debugMode) {
-              debugPrint('TFLite badge: prob=${prob.toStringAsFixed(3)} '
-                  '(thresh=${PromoClassifierService.promoThreshold} → ${isPromoBadge ? "PROMO" : "base"})');
-            }
-            if (isPromoBadge) {
-              final promoVariant = allVariants.where((c) => c.isPromo).toList();
-              if (promoVariant.isNotEmpty) {
-                // Champion edition detection via OCR
-                if (_cumChampionDetected) {
-                  final championVariant = promoVariant.where((c) => c.isChampionEdition).toList();
-                  if (championVariant.isNotEmpty) {
-                    resolvedCard = championVariant.first;
-                    if (_debugMode) {
-                      debugPrint('TFLite badge: resolved to ${resolvedCard.setId}#${resolvedCard.collectorNumber} (CHAMPION)');
-                    }
-                    final resolvedAlts = allVariants.where((c) => c.id != resolvedCard.id).toList();
-                    _addCard(resolvedCard, resolvedAlts);
-                    return;
-                  }
-                }
-                // Regular promo — prefer non-champion
-                final regularPromo = promoVariant.where((c) => !c.isChampionEdition).toList();
-                resolvedCard = regularPromo.isNotEmpty ? regularPromo.first : promoVariant.first;
+        if (isPromoBadge && allVariants.length > 1) {
+          final promoVariant = allVariants.where((c) => c.isPromo).toList();
+          if (promoVariant.isNotEmpty) {
+            // Champion edition detection via OCR
+            if (_cumChampionDetected) {
+              final championVariant = promoVariant.where((c) => c.isChampionEdition).toList();
+              if (championVariant.isNotEmpty) {
+                resolvedCard = championVariant.first;
                 if (_debugMode) {
-                  debugPrint('TFLite badge: resolved to ${resolvedCard.setId}#${resolvedCard.collectorNumber}');
+                  debugPrint('TFLite badge: resolved to ${resolvedCard.setId}#${resolvedCard.collectorNumber} (CHAMPION)');
                 }
                 final resolvedAlts = allVariants.where((c) => c.id != resolvedCard.id).toList();
                 _addCard(resolvedCard, resolvedAlts);
                 return;
               }
             }
-          }
-        }
-
-        // ── pHash variant detection (fallback) ──
-        // Constrain pHash to variants matching the confirmed set+CN.
-        // Without this, pHash can jump to a different set's variant
-        // (e.g., SFDX#R06b instead of OGN#214) if the artwork hash is closer.
-        final confirmedSet = _cumSetCode;
-        final confirmedCN = _cumCN?.toString();
-        List<RiftCard> phashCandidates = allVariants;
-        if (confirmedSet != null && confirmedCN != null) {
-          // Filter to variants matching set (base or promo) + CN number
-          final setFamily = <String>{confirmedSet};
-          // Also include promo set if base was detected, and vice versa
-          const promoMap = {'OGN': 'OGNX', 'SFD': 'SFDX', 'OGS': 'OGSX'};
-          const baseMap = {'OGNX': 'OGN', 'SFDX': 'SFD', 'OGSX': 'OGS'};
-          if (promoMap.containsKey(confirmedSet)) setFamily.add(promoMap[confirmedSet]!);
-          if (baseMap.containsKey(confirmedSet)) setFamily.add(baseMap[confirmedSet]!);
-
-          // Compare CN numerically: "214" matches "214", "214a", "214b" etc.
-          final filtered = allVariants.where((c) {
-            if (!setFamily.contains(c.setId)) return false;
-            final cardCNNum = c.collectorNumber?.replaceAll(RegExp(r'[^0-9]'), '');
-            return cardCNNum == confirmedCN;
-          }).toList();
-          if (filtered.isNotEmpty) {
-            phashCandidates = filtered;
-            if (_debugMode && filtered.length < allVariants.length) {
-              debugPrint('pHash: constrained to ${filtered.length}/${allVariants.length} variants '
-                  '(set=$confirmedSet cn=$confirmedCN)');
+            // Regular promo — prefer non-champion
+            final regularPromo = promoVariant.where((c) => !c.isChampionEdition).toList();
+            resolvedCard = regularPromo.isNotEmpty ? regularPromo.first : promoVariant.first;
+            if (_debugMode) {
+              debugPrint('TFLite badge: resolved to ${resolvedCard.setId}#${resolvedCard.collectorNumber}');
             }
+            final resolvedAlts = allVariants.where((c) => c.id != resolvedCard.id).toList();
+            _addCard(resolvedCard, resolvedAlts);
+            return;
+          }
+        }
+      }
+    }
+
+    // ══════════════════════════════════════════════
+    // ── pHash variant resolution (only for multi-variant cards) ──
+    // ══════════════════════════════════════════════
+    if (allVariants.length > 1 && computeResult != null) {
+      // Constrain pHash to variants matching the confirmed set+CN.
+      final confirmedSet = _cumSetCode;
+      final confirmedCN = _cumCN?.toString();
+      List<RiftCard> phashCandidates = allVariants;
+      if (confirmedSet != null && confirmedCN != null) {
+        final setFamily = <String>{confirmedSet};
+        const promoMap = {'OGN': 'OGNX', 'SFD': 'SFDX', 'OGS': 'OGSX'};
+        const baseMap = {'OGNX': 'OGN', 'SFDX': 'SFD', 'OGSX': 'OGS'};
+        if (promoMap.containsKey(confirmedSet)) setFamily.add(promoMap[confirmedSet]!);
+        if (baseMap.containsKey(confirmedSet)) setFamily.add(baseMap[confirmedSet]!);
+
+        final filtered = allVariants.where((c) {
+          if (!setFamily.contains(c.setId)) return false;
+          final cardCNNum = c.collectorNumber?.replaceAll(RegExp(r'[^0-9]'), '');
+          return cardCNNum == confirmedCN;
+        }).toList();
+        if (filtered.isNotEmpty) {
+          phashCandidates = filtered;
+          if (_debugMode && filtered.length < allVariants.length) {
+            debugPrint('pHash: constrained to ${filtered.length}/${allVariants.length} variants '
+                '(set=$confirmedSet cn=$confirmedCN)');
+          }
+        }
+      }
+
+      final phashVariantIds = phashCandidates.map((c) => c.id).toList();
+      final phashPromoIds = phashCandidates.where((c) => c.isPromo).map((c) => c.id).toSet();
+      final result = _phash.findBestVariant(computeResult.hash, phashVariantIds, promoIds: phashPromoIds);
+
+      if (result != null) {
+        if (_debugMode) {
+          debugPrint('pHash: ${phashCandidates.length} variants of "${match.card.name}", '
+              'Stage ${result.stage} → ${result.reason}');
+          for (final c in result.comparisons) {
+            final card = phashCandidates.firstWhere((v) => v.id == c.cardId, orElse: () => match.card);
+            final selected = c.cardId == result.bestId ? ' ✓' : '';
+            final gemInfo = result.stage >= 2 || c.fullDist <= PhashService.fullHashThreshold
+                ? ' gem=${c.gemDist}' : '';
+            debugPrint('  ${card.setId}#${card.collectorNumber}: full=${c.fullDist}$gemInfo$selected');
           }
         }
 
-        final phashVariantIds = phashCandidates.map((c) => c.id).toList();
-        final phashPromoIds = phashCandidates.where((c) => c.isPromo).map((c) => c.id).toSet();
-        final result = _phash.findBestVariant(computeResult.hash, phashVariantIds, promoIds: phashPromoIds);
-
-        if (result != null) {
-          if (_debugMode) {
-            debugPrint('pHash: ${phashCandidates.length} variants of "${match.card.name}", '
-                'Stage ${result.stage} → ${result.reason}');
-            for (final c in result.comparisons) {
-              final card = phashCandidates.firstWhere((v) => v.id == c.cardId, orElse: () => match.card);
-              final selected = c.cardId == result.bestId ? ' ✓' : '';
-              final gemInfo = result.stage >= 2 || c.fullDist <= PhashService.fullHashThreshold
-                  ? ' gem=${c.gemDist}' : '';
-              debugPrint('  ${card.setId}#${card.collectorNumber}: full=${c.fullDist}$gemInfo$selected');
-            }
-          }
-
-          final r = result!;
-          if (r.bestId != null && r.bestId != match.card.id) {
-            final bestCard = allVariants.firstWhere((c) => c.id == r.bestId, orElse: () => match.card);
-            resolvedCard = bestCard;
-          }
+        final r = result;
+        if (r.bestId != null && r.bestId != match.card.id) {
+          final bestCard = allVariants.firstWhere((c) => c.id == r.bestId, orElse: () => match.card);
+          resolvedCard = bestCard;
         }
-        } // end rect block
-      } catch (e) {
-        debugPrint('pHash: Error: $e');
       }
     }
 
