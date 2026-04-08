@@ -934,8 +934,12 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     }
 
     // ── TFLite Promo Badge Classifier ──
+    // Skip for runes — they have a completely different layout, the badge region
+    // at 38%X/88%Y captures unrelated content and causes false positives.
+    // Rune promos are still detected via badge OCR ("PROMO" text).
+    final skipPromoCnn = _cumTypes.contains('rune');
     final promoIds = allVariants.where((c) => c.isPromo).map((c) => c.id).toSet();
-    if (promoIds.isNotEmpty && computeResult?.debugFullPixels != null && _promoClassifier.isReady) {
+    if (!skipPromoCnn && promoIds.isNotEmpty && computeResult?.debugFullPixels != null && _promoClassifier.isReady) {
       final prob = _promoClassifier.classify(
         computeResult!.debugFullPixels!,
         computeResult.debugFullW,
