@@ -2010,41 +2010,78 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
               ),
             ),
 
-          // Training frame export button (debug only)
+          // Training frame buttons (debug only)
           if (_debugMode)
             Positioned(
               bottom: MediaQuery.of(context).padding.bottom + 100,
               left: 16,
-              child: GestureDetector(
-                onTap: () async {
-                  final count = await _trainingFrames.frameCount();
-                  if (!mounted) return;
-                  if (count.total == 0) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('No training frames collected yet')),
-                    );
-                    return;
-                  }
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(content: Text('Exporting ${count.total} frames (${count.positive} pos, ${count.negative} neg)...')),
-                  );
-                  await _trainingFrames.exportFrames();
-                },
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                  decoration: BoxDecoration(
-                    color: Colors.black54,
-                    borderRadius: BorderRadius.circular(8),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // Export button
+                  GestureDetector(
+                    onTap: () async {
+                      final count = await _trainingFrames.frameCount();
+                      if (!mounted) return;
+                      if (count.total == 0) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(content: Text('No training frames collected yet')),
+                        );
+                        return;
+                      }
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(content: Text('Exporting ${count.total} frames (${count.positive} pos, ${count.negative} neg)...')),
+                      );
+                      await _trainingFrames.exportFrames();
+                    },
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                      decoration: BoxDecoration(
+                        color: Colors.black54,
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: const Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(Icons.file_upload_outlined, color: Colors.white70, size: 16),
+                          SizedBox(width: 4),
+                          Text('Frames', style: TextStyle(color: Colors.white70, fontSize: 11)),
+                        ],
+                      ),
+                    ),
                   ),
-                  child: const Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(Icons.file_upload_outlined, color: Colors.white70, size: 16),
-                      SizedBox(width: 4),
-                      Text('Frames', style: TextStyle(color: Colors.white70, fontSize: 11)),
-                    ],
+                  const SizedBox(width: 8),
+                  // Manual negative frame button
+                  GestureDetector(
+                    onTap: () {
+                      if (_lastYPlane == null) return;
+                      _trainingFrames.saveNegativeFrame(
+                        _lastYPlane!, _lastYWidth, _lastYHeight, _lastYStride,
+                      );
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(
+                          content: Text('NEG frame saved'),
+                          duration: Duration(milliseconds: 500),
+                        ),
+                      );
+                    },
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                      decoration: BoxDecoration(
+                        color: Colors.red.withValues(alpha: 0.6),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: const Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(Icons.cancel_outlined, color: Colors.white70, size: 16),
+                          SizedBox(width: 4),
+                          Text('NEG', style: TextStyle(color: Colors.white70, fontSize: 11)),
+                        ],
+                      ),
+                    ),
                   ),
-                ),
+                ],
               ),
             ),
 
