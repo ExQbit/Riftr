@@ -327,9 +327,12 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
         if (match == null || !mounted) return;
         _updateDebug(match);
 
-        // Name required: reject matches without card name recognized
+        // Name or title required: reject matches without card text recognized
+        // Title counts too (e.g., "Vi" is 2 chars → scored as title, not name)
         final hasName = match.breakdown.containsKey('name') ||
-            match.breakdown.containsKey('name_fuzzy');
+            match.breakdown.containsKey('name_fuzzy') ||
+            match.breakdown.containsKey('title') ||
+            match.breakdown.containsKey('title_fuzzy');
         if (!hasName) return; // ignore garbage CN-only matches
 
         // Check if this card has multiple variants
@@ -564,10 +567,12 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
 
       // ── Normal SCANNING: early-exit or max frames ──
 
-      // Name required for early-exit too
+      // Name or title required for early-exit too
       final earlyHasName = matches.isNotEmpty &&
           (matches.first.breakdown.containsKey('name') ||
-           matches.first.breakdown.containsKey('name_fuzzy'));
+           matches.first.breakdown.containsKey('name_fuzzy') ||
+           matches.first.breakdown.containsKey('title') ||
+           matches.first.breakdown.containsKey('title_fuzzy'));
       if (bestScore >= _earlyExitScore && earlyHasName) {
         final best = matches.first;
         final card = best.fingerprint.card;
@@ -592,10 +597,12 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
       }
 
       if (_scanFrameCount >= _maxScanFrames) {
-        // Name required: no match without the card name being recognized
+        // Name or title required: no match without card text recognized
         final hasName = matches.isNotEmpty &&
             (matches.first.breakdown.containsKey('name') ||
-             matches.first.breakdown.containsKey('name_fuzzy'));
+             matches.first.breakdown.containsKey('name_fuzzy') ||
+             matches.first.breakdown.containsKey('title') ||
+             matches.first.breakdown.containsKey('title_fuzzy'));
         if (bestScore >= _minAcceptScore && hasName) {
           final best = matches.first;
           final card = best.fingerprint.card;
