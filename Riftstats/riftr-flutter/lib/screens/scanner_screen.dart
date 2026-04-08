@@ -149,9 +149,6 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     _setClassifier.load();
     _suffixClassifier.load();
     _manaClassifier.load();
-    // One-time cleanup: delete old full-frame training data,
-    // now replaced by native rect crops. Remove this after one build.
-    _trainingFrames.clearAll();
     OcrService.instance.debugMode = true; // ON for mana debug
     _initCamera();
   }
@@ -926,8 +923,10 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
 
     // ── TFLite Mana Classifier ──
     // Skip for card types without a mana diamond (rune, legend, battlefield).
+    final cardTypeLower = match.card.type?.toLowerCase() ?? '';
     final noMana = _cumTypes.contains('rune') ||
-        _cumTypes.contains('legend') || _cumTypes.contains('battlefield');
+        _cumTypes.contains('legend') || _cumTypes.contains('battlefield') ||
+        cardTypeLower == 'rune' || cardTypeLower == 'legend' || cardTypeLower == 'battlefield';
     if (!noMana && computeResult?.debugFullPixels != null && _manaClassifier.isReady) {
       final manaResult = _manaClassifier.classify(
         computeResult!.debugFullPixels!,
@@ -948,7 +947,10 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     // Skip for runes — they have a completely different layout, the badge region
     // at 38%X/88%Y captures unrelated content and causes false positives.
     // Rune promos are still detected via badge OCR ("PROMO" text).
-    final skipPromoCnn = _cumTypes.contains('rune');
+    // Skip for runes — check both OCR-detected type AND the matched card's type
+    // (OCR might not have read "RUNE" in every scan session)
+    final skipPromoCnn = _cumTypes.contains('rune') ||
+        match.card.type?.toLowerCase() == 'rune';
     final promoIds = allVariants.where((c) => c.isPromo).map((c) => c.id).toSet();
     if (!skipPromoCnn && promoIds.isNotEmpty && computeResult?.debugFullPixels != null && _promoClassifier.isReady) {
       final prob = _promoClassifier.classify(

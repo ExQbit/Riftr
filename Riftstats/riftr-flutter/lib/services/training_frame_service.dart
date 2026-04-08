@@ -111,22 +111,27 @@ class TrainingFrameService {
         // Check if this rect overlaps with the card rect (IoU > 0.3)
         final isCard = cardRect != null && _rectsOverlap(r, cardRect);
 
-        // Crop rect from Y-plane and resize to 96×128
-        final pixels = Uint8List(_targetW * _targetH);
-        for (int y = 0; y < _targetH; y++) {
-          final srcY = ry + (y * rh ~/ _targetH);
-          for (int x = 0; x < _targetW; x++) {
-            final srcX = rx + (x * rw ~/ _targetW);
-            final srcIdx = srcY * stride + srcX;
-            pixels[y * _targetW + x] =
+        // Clamp rect to frame bounds
+        final cx = rx.clamp(0, width - 1);
+        final cy = ry.clamp(0, height - 1);
+        final cw = rw.clamp(1, width - cx);
+        final ch = rh.clamp(1, height - cy);
+        if (cw < 50 || ch < 50) continue;
+
+        // Crop rect from Y-plane into a new buffer (stride = cw)
+        final cropped = Uint8List(cw * ch);
+        for (int y = 0; y < ch; y++) {
+          for (int x = 0; x < cw; x++) {
+            final srcIdx = (cy + y) * stride + (cx + x);
+            cropped[y * cw + x] =
                 srcIdx >= 0 && srcIdx < yPlane.length ? yPlane[srcIdx] : 0;
           }
         }
 
-        // Save as PNG
+        // Save as downscaled 96×128 PNG (reuses working method)
         final dir = isCard ? posDir : negDir;
         final label = isCard ? 'rect_pos' : 'rect_neg';
-        await _saveGrayscalePixels(pixels, _targetW, _targetH,
+        await _saveDownscaledFrame(cropped, cw, ch, cw,
             '${dir.path}/${ts}_${label}_$i.png');
 
         if (isCard) posSaved++; else negSaved++;
