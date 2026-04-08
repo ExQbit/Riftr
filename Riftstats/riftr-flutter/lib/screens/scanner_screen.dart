@@ -17,6 +17,7 @@ import '../services/native_rect_service.dart';
 import '../services/promo_classifier_service.dart';
 import '../services/set_classifier_service.dart';
 import '../services/suffix_classifier_service.dart';
+import '../services/mana_classifier_service.dart';
 import '../services/training_frame_service.dart';
 import '../theme/app_theme.dart';
 import '../widgets/card_image.dart';
@@ -84,6 +85,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
   final _promoClassifier = PromoClassifierService.instance;
   final _setClassifier = SetClassifierService.instance;
   final _suffixClassifier = SuffixClassifierService.instance;
+  final _manaClassifier = ManaClassifierService.instance;
   final _trainingFrames = TrainingFrameService.instance;
   Uint8List? _lastYPlane;  // updated every frame (for motion detection)
   int _lastYWidth = 0;
@@ -146,6 +148,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     _promoClassifier.load();
     _setClassifier.load();
     _suffixClassifier.load();
+    _manaClassifier.load();
     OcrService.instance.debugMode = true; // ON for mana debug
     _initCamera();
   }
@@ -896,6 +899,24 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
           }
         }
 
+        // ── TFLite Mana Classifier ──
+        // CNN-based mana detection: 48×48 grayscale crop → mana class
+        if (computeResult.debugFullPixels != null && _manaClassifier.isReady) {
+          final manaResult = _manaClassifier.classify(
+            computeResult.debugFullPixels!,
+            computeResult.debugFullW,
+            computeResult.debugFullH,
+          );
+          if (manaResult != null) {
+            if (_debugMode) {
+              debugPrint('TFLite mana: ${manaResult.mana} '
+                  '(conf=${manaResult.confidence.toStringAsFixed(3)}, '
+                  'OCR was: ${_cumMana ?? "none"})');
+            }
+            _cumMana = manaResult.mana;
+          }
+        }
+
         // ── TFLite Promo Badge Classifier ──
         // CNN-based detection: 48×48 grayscale crop → promo probability
         if (promoIds.isNotEmpty && computeResult.debugFullPixels != null && _promoClassifier.isReady) {
@@ -1143,8 +1164,9 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
   // ── Mana crop OCR: targeted read of the mana region ──
   // ══════════════════════════════════════════════
 
-  /// Crop the mana region from the Y-plane and run OCR on just that area.
+  /// Crop the mana region from the Y-plane and detect mana cost.
   /// Uses the Grid (type+cn) to calculate where mana should be.
+  /// Strategy: OCR first, CNN fallback if OCR fails.
   void _tryManaCropOcr() async {
     final typeAnchor = _gridAnchors['type'];
     final cnAnchor = _gridAnchors['cn'];
@@ -1166,7 +1188,8 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
 
     if (manaW < 20 || manaH < 20) return;
 
-    // Crop Y-plane and convert to BGRA
+    // ── Step 1: Try OCR on the mana crop ──
+    // Crop Y-plane and convert to BGRA for ML Kit
     final bgra = Uint8List(manaW * manaH * 4);
     for (int y = 0; y < manaH; y++) {
       for (int x = 0; x < manaW; x++) {
@@ -1177,45 +1200,75 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
       }
     }
 
+    bool ocrFound = false;
     try {
       final recognized = await _ocr.recognizeCrop(bgra, manaW, manaH);
-      if (recognized == null || recognized.blocks.isEmpty) return;
-
-      for (final block in recognized.blocks) {
-        final trimmed = block.text.trim();
-        if (trimmed.length <= 2 && RegExp(r'^\d{1,2}$').hasMatch(trimmed)) {
-          final manaCost = int.tryParse(trimmed);
-          if (manaCost != null) {
-            _cumMana ??= manaCost;
-            // Create mana anchor in ORIGINAL frame coordinates
-            final box = [
-              manaX.toDouble(), manaY.toDouble(),
-              (manaX + manaW).toDouble(), (manaY + manaH).toDouble(),
-            ];
-            final cx = (box[0] + box[2]) / 2;
-            final cy = (box[1] + box[3]) / 2;
-            _gridAnchors['mana'] = GridAnchor(
-              label: 'mana',
-              yPct: _gridManaYPct,
-              xPct: _gridManaXPct,
-              observedCX: cx,
-              observedCY: cy,
-              observedLeft: box[0],
-            );
-            if (_debugMode) {
-              debugPrint('Mana crop OCR: found "$trimmed" at crop (${manaX},${manaY}) ${manaW}x${manaH}');
+      if (recognized != null && recognized.blocks.isNotEmpty) {
+        for (final block in recognized.blocks) {
+          final trimmed = block.text.trim();
+          if (trimmed.length <= 2 && RegExp(r'^\d{1,2}$').hasMatch(trimmed)) {
+            final manaCost = int.tryParse(trimmed);
+            if (manaCost != null) {
+              _setManaAnchor(manaCost, manaX, manaY, manaW, manaH, 'OCR');
+              ocrFound = true;
+              break;
             }
-            return;
           }
         }
-      }
-
-      if (_debugMode) {
-        final text = recognized.blocks.map((b) => b.text).join(' | ');
-        debugPrint('Mana crop OCR: no digit found in "$text" at (${manaX},${manaY}) ${manaW}x${manaH}');
+        if (!ocrFound && _debugMode) {
+          final text = recognized.blocks.map((b) => b.text).join(' | ');
+          debugPrint('Mana crop OCR: no digit in "$text"');
+        }
       }
     } catch (e) {
       if (_debugMode) debugPrint('Mana crop OCR error: $e');
+    }
+
+    if (ocrFound) return;
+
+    // ── Step 2: CNN fallback — extract card pixels and classify ──
+    if (!_manaClassifier.isReady) return;
+
+    // Extract estimated card region from Y-plane
+    final cardX = cardLeft.round().clamp(0, _lastYWidth - 1);
+    final cardY2 = cardTop.round().clamp(0, _lastYHeight - 1);
+    final cw = cardW.round().clamp(1, _lastYWidth - cardX);
+    final ch = cardH.round().clamp(1, _lastYHeight - cardY2);
+
+    if (cw < 50 || ch < 50) return;
+
+    final cardPixels = Uint8List(cw * ch);
+    for (int y = 0; y < ch; y++) {
+      for (int x = 0; x < cw; x++) {
+        final srcIdx = (cardY2 + y) * _lastYStride + (cardX + x);
+        cardPixels[y * cw + x] =
+            srcIdx >= 0 && srcIdx < _lastYPlane!.length ? _lastYPlane![srcIdx] : 0;
+      }
+    }
+
+    final result = _manaClassifier.classify(cardPixels, cw, ch);
+    if (result != null) {
+      _setManaAnchor(result.mana, manaX, manaY, manaW, manaH, 'CNN(${result.confidence.toStringAsFixed(2)})');
+    } else if (_debugMode) {
+      debugPrint('Mana CNN: low confidence, skipping');
+    }
+  }
+
+  /// Helper: set mana value + create grid anchor from crop coordinates.
+  void _setManaAnchor(int manaCost, int manaX, int manaY, int manaW, int manaH, String source) {
+    _cumMana ??= manaCost;
+    final cx = manaX + manaW / 2.0;
+    final cy = manaY + manaH / 2.0;
+    _gridAnchors['mana'] = GridAnchor(
+      label: 'mana',
+      yPct: _gridManaYPct,
+      xPct: _gridManaXPct,
+      observedCX: cx,
+      observedCY: cy,
+      observedLeft: manaX.toDouble(),
+    );
+    if (_debugMode) {
+      debugPrint('Mana $source: found $manaCost at ($manaX,$manaY) ${manaW}x$manaH');
     }
   }
 
