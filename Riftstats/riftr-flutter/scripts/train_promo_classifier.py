@@ -153,7 +153,17 @@ def build_dataset(base_dir):
             continue
 
         is_promo = sid in ("SFDX", "OGNX", "OGSX")
-        entry = {"path": path, "name": c.get("name", ""), "set": sid}
+        cn = str(c.get("collector_number", ""))
+
+        # Golden frame promos (Top-8/Championship) — need extra oversampling
+        # because there are only ~8 of them vs ~134 text badge promos
+        golden_frame_keys = {
+            ("OGNX", "34"), ("OGNX", "67"), ("OGNX", "193"),
+            ("SFDX", "178"), ("SFDX", "22"), ("SFDX", "86"), ("SFDX", "139"),
+        }
+        is_golden = (sid, cn) in golden_frame_keys
+
+        entry = {"path": path, "name": c.get("name", ""), "set": sid, "golden": is_golden}
 
         if is_promo:
             promo_cards.append(entry)
@@ -171,17 +181,20 @@ def build_dataset(base_dir):
             except Exception:
                 continue
 
+            # Golden frame promos get 15x oversampling (8 cards vs 134 text badge)
+            extra = 15 if card.get("golden", False) else 1
+
             # Center crop
             center = crop_badge(img)
             center_arr = np.array(center)
             samples.append((center_arr, label))
 
             # Augmented center crops
-            for _ in range(AUGMENT_PER_CROP):
+            for _ in range(AUGMENT_PER_CROP * extra):
                 samples.append((augment(center_arr), label))
 
             # Jittered crops + augmentations
-            for _ in range(JITTER_CROPS):
+            for _ in range(JITTER_CROPS * extra):
                 jx = random.uniform(-JITTER_RANGE, JITTER_RANGE)
                 jy = random.uniform(-JITTER_RANGE, JITTER_RANGE)
                 jittered = crop_badge(img, jx, jy)
