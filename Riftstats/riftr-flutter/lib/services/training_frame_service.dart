@@ -23,7 +23,8 @@ class TrainingFrameService {
   static const _maxPerCategory = 1000;
 
   Directory? _baseDir;
-  bool _saving = false; // prevent concurrent saves
+  bool _saving = false; // prevent concurrent saves (pos/neg frames)
+  bool _savingRects = false; // separate lock for rect crops
 
   /// Initialize base directory lazily.
   Future<Directory> _getBaseDir() async {
@@ -93,8 +94,8 @@ class TrainingFrameService {
     Uint8List yPlane, int width, int height, int stride,
     List<List<int>> nativeRects, List<int>? cardRect,
   ) async {
-    if (_saving || nativeRects.isEmpty) return;
-    _saving = true;
+    if (_savingRects || nativeRects.isEmpty) return;
+    _savingRects = true;
     try {
       final posDir = await _positiveDir();
       final negDir = await _negativeDir();
@@ -138,7 +139,7 @@ class TrainingFrameService {
     } catch (e) {
       if (kDebugMode) debugPrint('TrainingFrame: rect crops failed: $e');
     } finally {
-      _saving = false;
+      _savingRects = false;
     }
   }
 
