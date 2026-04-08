@@ -948,7 +948,31 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
               '(thresh=${PromoClassifierService.promoThreshold} → ${isPromoBadge ? "PROMO" : "base"})');
         }
         if (isPromoBadge && allVariants.length > 1) {
-          final promoVariant = allVariants.where((c) => c.isPromo).toList();
+          // Constrain promo selection to variants matching confirmed set+CN
+          // (same logic as pHash constraint — prevents cross-set false matches)
+          var promoVariant = allVariants.where((c) => c.isPromo).toList();
+          final badgeSet = _cumSetCode;
+          final badgeCN = _cumCN?.toString();
+          if (badgeSet != null && badgeCN != null && promoVariant.length > 1) {
+            final setFamily = <String>{badgeSet};
+            const promoMap = {'OGN': 'OGNX', 'SFD': 'SFDX', 'OGS': 'OGSX'};
+            const baseMap = {'OGNX': 'OGN', 'SFDX': 'SFD', 'OGSX': 'OGS'};
+            if (promoMap.containsKey(badgeSet)) setFamily.add(promoMap[badgeSet]!);
+            if (baseMap.containsKey(badgeSet)) setFamily.add(baseMap[badgeSet]!);
+
+            final filtered = promoVariant.where((c) {
+              if (!setFamily.contains(c.setId)) return false;
+              final cardCNNum = c.collectorNumber?.replaceAll(RegExp(r'[^0-9]'), '');
+              return cardCNNum == badgeCN;
+            }).toList();
+            if (filtered.isNotEmpty) {
+              if (_debugMode && filtered.length < promoVariant.length) {
+                debugPrint('TFLite badge: constrained to ${filtered.length}/${promoVariant.length} promo variants '
+                    '(set=$badgeSet cn=$badgeCN)');
+              }
+              promoVariant = filtered;
+            }
+          }
           if (promoVariant.isNotEmpty) {
             // Champion edition detection via OCR
             if (_cumChampionDetected) {
