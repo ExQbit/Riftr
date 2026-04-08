@@ -33,10 +33,11 @@ class PromoClassifierService {
   /// High threshold to minimize false positives (better to miss a promo
   /// than to falsely label a base card as promo).
   /// Camera Y-plane images have lower confidence than clean references.
-  /// Reference validation: promo mean=0.979, base mean=0.002.
-  /// Camera reality: promo ~0.25-0.47, base ~0.00.
-  /// Threshold 0.15 separates cleanly while leaving margin.
-  static const promoThreshold = 0.15;
+  /// Reference validation: promo mean=0.979, base mean=0.006.
+  /// Worst base false positive: OGN#262 Zenith Blade = 0.236.
+  /// Camera reality: promo ~0.25-1.0, base ~0.00.
+  /// Threshold 0.25 avoids false positives while catching promos.
+  static const promoThreshold = 0.25;
 
   /// Load the TFLite model from assets.
   Future<void> load() async {
