@@ -52,7 +52,10 @@ class TrainingFrameService {
     Uint8List yPlane, int width, int height, int stride, String cardName,
     {Uint8List? cardCrop, int cardCropW = 0, int cardCropH = 0}
   ) async {
-    if (_saving) return;
+    if (_saving) {
+      if (kDebugMode) debugPrint('TrainingFrame: skip positive (save in progress)');
+      return;
+    }
     _saving = true;
     try {
       final dir = await _positiveDir();
