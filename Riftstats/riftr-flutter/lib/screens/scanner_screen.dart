@@ -845,7 +845,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
         ));
 
         // Save debug images: card crop + full frame with rect overlay
-        if (_debugMode) {
+        if (_debugMode && computeResult != null) {
           if (computeResult.debugFullPixels != null) {
             _saveDebugCrops(computeResult, match.card.name);
           }
