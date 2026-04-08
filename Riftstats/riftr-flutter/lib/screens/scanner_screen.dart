@@ -874,6 +874,14 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
       );
     }
 
+    // Save native rect crops for Card-Present classifier (rect validator)
+    if (_nativeRects.isNotEmpty && _lastYPlane != null) {
+      _trainingFrames.saveRectCrops(
+        _lastYPlane!, _lastYWidth, _lastYHeight, _lastYStride,
+        _nativeRects, cardRect,
+      );
+    }
+
     // ══════════════════════════════════════════════
     // ── TFLite CNN classifiers (ALWAYS run) ──
     // ══════════════════════════════════════════════

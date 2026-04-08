@@ -85,6 +85,106 @@ class TrainingFrameService {
     }
   }
 
+  /// Save native rect crops for Card-Present classifier training.
+  ///
+  /// Crops each native rect from the Y-plane, resizes to 96×128, and saves.
+  /// Rects overlapping with [cardRect] → positive, others → negative.
+  Future<void> saveRectCrops(
+    Uint8List yPlane, int width, int height, int stride,
+    List<List<int>> nativeRects, List<int>? cardRect,
+  ) async {
+    if (_saving || nativeRects.isEmpty) return;
+    _saving = true;
+    try {
+      final posDir = await _positiveDir();
+      final negDir = await _negativeDir();
+      final ts = DateTime.now().millisecondsSinceEpoch;
+      int posSaved = 0, negSaved = 0;
+
+      for (int i = 0; i < nativeRects.length; i++) {
+        final r = nativeRects[i];
+        if (r.length < 4) continue;
+        final rx = r[0], ry = r[1], rw = r[2], rh = r[3];
+        if (rw < 50 || rh < 50) continue; // skip tiny rects
+
+        // Check if this rect overlaps with the card rect (IoU > 0.3)
+        final isCard = cardRect != null && _rectsOverlap(r, cardRect);
+
+        // Crop rect from Y-plane and resize to 96×128
+        final pixels = Uint8List(_targetW * _targetH);
+        for (int y = 0; y < _targetH; y++) {
+          final srcY = ry + (y * rh ~/ _targetH);
+          for (int x = 0; x < _targetW; x++) {
+            final srcX = rx + (x * rw ~/ _targetW);
+            final srcIdx = srcY * stride + srcX;
+            pixels[y * _targetW + x] =
+                srcIdx >= 0 && srcIdx < yPlane.length ? yPlane[srcIdx] : 0;
+          }
+        }
+
+        // Save as PNG
+        final dir = isCard ? posDir : negDir;
+        final label = isCard ? 'rect_pos' : 'rect_neg';
+        await _saveGrayscalePixels(pixels, _targetW, _targetH,
+            '${dir.path}/${ts}_${label}_$i.png');
+
+        if (isCard) posSaved++; else negSaved++;
+      }
+
+      if (kDebugMode && (posSaved > 0 || negSaved > 0)) {
+        debugPrint('TrainingFrame: rect crops saved ${posSaved}pos ${negSaved}neg '
+            '(from ${nativeRects.length} rects)');
+      }
+    } catch (e) {
+      if (kDebugMode) debugPrint('TrainingFrame: rect crops failed: $e');
+    } finally {
+      _saving = false;
+    }
+  }
+
+  /// Check if two rects overlap significantly (IoU > 0.3).
+  bool _rectsOverlap(List<int> a, List<int> b) {
+    final ax1 = a[0], ay1 = a[1], ax2 = a[0] + a[2], ay2 = a[1] + a[3];
+    final bx1 = b[0], by1 = b[1], bx2 = b[0] + b[2], by2 = b[1] + b[3];
+
+    final ix1 = ax1 > bx1 ? ax1 : bx1;
+    final iy1 = ay1 > by1 ? ay1 : by1;
+    final ix2 = ax2 < bx2 ? ax2 : bx2;
+    final iy2 = ay2 < by2 ? ay2 : by2;
+
+    if (ix1 >= ix2 || iy1 >= iy2) return false;
+
+    final intersection = (ix2 - ix1) * (iy2 - iy1);
+    final aArea = a[2] * a[3];
+    final bArea = b[2] * b[3];
+    final union = aArea + bArea - intersection;
+
+    return union > 0 && intersection / union > 0.3;
+  }
+
+  /// Save grayscale pixels as PNG (no downscaling, already correct size).
+  Future<void> _saveGrayscalePixels(Uint8List pixels, int w, int h, String path) async {
+    final rgba = Uint8List(w * h * 4);
+    for (int i = 0; i < w * h; i++) {
+      final v = pixels[i];
+      rgba[i * 4] = v;
+      rgba[i * 4 + 1] = v;
+      rgba[i * 4 + 2] = v;
+      rgba[i * 4 + 3] = 255;
+    }
+
+    final completer = Completer<ui.Image>();
+    ui.decodeImageFromPixels(
+      rgba, w, h, ui.PixelFormat.rgba8888,
+      (img) => completer.complete(img),
+    );
+    final image = await completer.future;
+    final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+    image.dispose();
+    if (byteData == null) return;
+    await File(path).writeAsBytes(byteData.buffer.asUint8List());
+  }
+
   /// Save a negative frame (scan timeout, no card matched).
   Future<void> saveNegativeFrame(
     Uint8List yPlane, int width, int height, int stride,
