@@ -289,6 +289,20 @@ class TrainingFrameService {
     }
   }
 
+  /// Delete all old training frames (both positive and negative).
+  Future<void> clearAll() async {
+    try {
+      final base = await _getBaseDir();
+      if (base.existsSync()) {
+        await base.delete(recursive: true);
+        _baseDir = null;
+        if (kDebugMode) debugPrint('TrainingFrame: cleared all frames');
+      }
+    } catch (e) {
+      if (kDebugMode) debugPrint('TrainingFrame: clear failed: $e');
+    }
+  }
+
   /// Count total collected frames.
   Future<({int positive, int negative, int total})> frameCount() async {
     int pos = 0, neg = 0;

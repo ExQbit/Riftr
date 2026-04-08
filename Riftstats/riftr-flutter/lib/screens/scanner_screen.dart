@@ -149,6 +149,9 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     _setClassifier.load();
     _suffixClassifier.load();
     _manaClassifier.load();
+    // One-time cleanup: delete old full-frame training data,
+    // now replaced by native rect crops. Remove this after one build.
+    _trainingFrames.clearAll();
     OcrService.instance.debugMode = true; // ON for mana debug
     _initCamera();
   }
