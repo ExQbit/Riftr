@@ -250,6 +250,9 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
           final prob = _cardPresentClassifier.classify(
             _lastYPlane!, _lastYWidth, _lastYHeight, _lastYStride,
           );
+          if (_debugMode && _processedFrames % 10 == 0) {
+            debugPrint('CardPresent: prob=${prob?.toStringAsFixed(3) ?? "null"}');
+          }
           if (prob != null && prob < CardPresentClassifierService.cardPresentThreshold) {
             // No card detected — skip expensive OCR this frame
             return;
