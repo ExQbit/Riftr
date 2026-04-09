@@ -18,8 +18,8 @@ class TrainingFrameService {
   TrainingFrameService._();
   static final TrainingFrameService instance = TrainingFrameService._();
 
-  static const _targetW = 96;
-  static const _targetH = 128;
+  static const _targetW = 192;
+  static const _targetH = 256;
   static const _maxPerCategory = 1000;
 
   Directory? _baseDir;

@@ -2071,35 +2071,6 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
                     ),
                   ),
                   const SizedBox(width: 8),
-                  // Manual POS frame button
-                  GestureDetector(
-                    onTap: () {
-                      if (_lastYPlane == null) return;
-                      _trainingFrames.saveManualFrame(
-                        _lastYPlane!, _lastYWidth, _lastYHeight, _lastYStride,
-                        isPositive: true,
-                      );
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(content: Text('POS saved'), duration: Duration(milliseconds: 400)),
-                      );
-                    },
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                      decoration: BoxDecoration(
-                        color: Colors.green.withValues(alpha: 0.6),
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: const Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(Icons.check_circle_outline, color: Colors.white70, size: 16),
-                          SizedBox(width: 4),
-                          Text('POS', style: TextStyle(color: Colors.white70, fontSize: 11)),
-                        ],
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
                   // Clear all training frames button
                   GestureDetector(
                     onTap: () async {
@@ -2125,36 +2096,75 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
                       ),
                     ),
                   ),
-                  const SizedBox(width: 8),
-                  // Manual NEG frame button
-                  GestureDetector(
-                    onTap: () {
-                      if (_lastYPlane == null) return;
-                      _trainingFrames.saveManualFrame(
-                        _lastYPlane!, _lastYWidth, _lastYHeight, _lastYStride,
-                        isPositive: false,
-                      );
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(content: Text('NEG saved'), duration: Duration(milliseconds: 400)),
-                      );
-                    },
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                      decoration: BoxDecoration(
-                        color: Colors.red.withValues(alpha: 0.6),
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: const Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(Icons.cancel_outlined, color: Colors.white70, size: 16),
-                          SizedBox(width: 4),
-                          Text('NEG', style: TextStyle(color: Colors.white70, fontSize: 11)),
-                        ],
-                      ),
-                    ),
-                  ),
                 ],
+              ),
+            ),
+
+          // Manual POS button (left side, centered vertically)
+          if (_debugMode)
+            Positioned(
+              left: 8,
+              top: MediaQuery.of(context).size.height * 0.45,
+              child: GestureDetector(
+                onTap: () {
+                  if (_lastYPlane == null) return;
+                  _trainingFrames.saveManualFrame(
+                    _lastYPlane!, _lastYWidth, _lastYHeight, _lastYStride,
+                    isPositive: true,
+                  );
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('POS saved'), duration: Duration(milliseconds: 400)),
+                  );
+                },
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 20),
+                  decoration: BoxDecoration(
+                    color: Colors.green.withValues(alpha: 0.7),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: const Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.check_circle, color: Colors.white, size: 28),
+                      SizedBox(height: 4),
+                      Text('POS', style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold)),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+
+          // Manual NEG button (right side, centered vertically)
+          if (_debugMode)
+            Positioned(
+              right: 8,
+              top: MediaQuery.of(context).size.height * 0.45,
+              child: GestureDetector(
+                onTap: () {
+                  if (_lastYPlane == null) return;
+                  _trainingFrames.saveManualFrame(
+                    _lastYPlane!, _lastYWidth, _lastYHeight, _lastYStride,
+                    isPositive: false,
+                  );
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('NEG saved'), duration: Duration(milliseconds: 400)),
+                  );
+                },
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 20),
+                  decoration: BoxDecoration(
+                    color: Colors.red.withValues(alpha: 0.7),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: const Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.cancel, color: Colors.white, size: 28),
+                      SizedBox(height: 4),
+                      Text('NEG', style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold)),
+                    ],
+                  ),
+                ),
               ),
             ),
 
