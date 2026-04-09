@@ -94,8 +94,7 @@ class TrainingFrameService {
     Uint8List yPlane, int width, int height, int stride,
     List<List<int>> nativeRects, List<int>? cardRect,
   ) async {
-    if (_savingRects || nativeRects.isEmpty) return;
-    _savingRects = true;
+    if (nativeRects.isEmpty) return;
     try {
       final posDir = await _positiveDir();
       final negDir = await _negativeDir();
@@ -146,8 +145,6 @@ class TrainingFrameService {
       }
     } catch (e) {
       if (kDebugMode) debugPrint('TrainingFrame: rect crops failed: $e');
-    } finally {
-      _savingRects = false;
     }
   }
 
