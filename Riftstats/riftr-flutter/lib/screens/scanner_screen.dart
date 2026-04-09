@@ -100,7 +100,9 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
   Uint8List? _prevLuminance;
   double _motionPercent = 0;
   static const _motionThreshold = 18.0;
+  static const _motionThresholdAfterScan = 30.0; // higher threshold after scan to prevent double-scan
   static const _stableThreshold = 8.0; // hand-held: 3-8% trembling is normal, not movement
+  bool _justScanned = false; // true after successful scan, reset when entering WAITING
   static const _rectMotionLimit = 10.0; // collect native rects during hand trembles (card still visible)
   Timer? _settlingTimer;
 
@@ -263,7 +265,9 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
 
       case ScanState.stable:
         // Card already scanned, waiting for motion
-        if (_motionPercent > _motionThreshold) {
+        // After a successful scan, require more movement to prevent double-scan
+        final threshold = _justScanned ? _motionThresholdAfterScan : _motionThreshold;
+        if (_motionPercent > threshold) {
           _setState(ScanState.motion);
         }
 
@@ -274,6 +278,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
           _settlingTimer?.cancel();
           _settlingTimer = Timer(const Duration(milliseconds: 300), () {
             if (_state == ScanState.settling && mounted) {
+              _justScanned = false; // reset — user moved enough for a new scan
               _setState(ScanState.scanning);
             }
           });
@@ -1848,6 +1853,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
 
   /// Add card to scanned list or increment quantity.
   void _addCard(RiftCard card, List<RiftCard> alternatives) {
+    _justScanned = true; // require higher motion threshold before next scan
     final existingIndex = _scannedCards.indexWhere((e) => e.card.id == card.id);
     if (existingIndex >= 0) {
       setState(() => _scannedCards[existingIndex].quantity++);
