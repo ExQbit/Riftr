@@ -100,7 +100,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
   Uint8List? _prevLuminance;
   double _motionPercent = 0;
   static const _motionThreshold = 18.0;
-  static const _motionThresholdAfterScan = 30.0; // higher threshold after scan to prevent double-scan
+  static const _motionThresholdAfterScan = 22.0; // higher threshold after scan to prevent double-scan
   static const _stableThreshold = 8.0; // hand-held: 3-8% trembling is normal, not movement
   bool _justScanned = false; // true after successful scan, reset when entering WAITING
   double _lastCardPresentProb = 0.0; // cached from last card-present check
