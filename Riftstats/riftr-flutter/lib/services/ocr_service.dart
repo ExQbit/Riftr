@@ -651,22 +651,20 @@ class OcrService {
           final dy = a.boundingBox.top.compareTo(b.boundingBox.top);
           return dy != 0 ? dy : a.boundingBox.left.compareTo(b.boundingBox.left);
         });
-      // Mana must be SIGNIFICANTLY above the main text blocks.
-      // The type line (GEAR EQUIPMENT) is at ~52% of the card, mana at ~3%.
-      // That's ~49% of card height above the type line — at least 200px on 1080p.
-      // Find the top of the highest multi-char block and require mana to be
-      // at least 150px above it (not just barely above).
-      double highestTextTop = double.infinity;
+      // Mana must be in the upper portion of the visible text area.
+      // Old approach (highestTextTop - 250px) broke when neighbor card text
+      // appeared at the top of the frame, making upperLimit negative.
+      // New approach: find the vertical span of all text blocks and require
+      // mana to be in the upper 35% of that span.
+      double minY = double.infinity, maxY = 0;
       for (final b in recognized.blocks) {
-        if (b.text.trim().length >= 4) {
-          if (b.boundingBox.top < highestTextTop) {
-            highestTextTop = b.boundingBox.top;
-          }
-        }
+        if (b.boundingBox.top < minY) minY = b.boundingBox.top;
+        if (b.boundingBox.bottom > maxY) maxY = b.boundingBox.bottom;
       }
-      final upperLimit = highestTextTop == double.infinity
-          ? recognized.blocks.first.boundingBox.top
-          : highestTextTop - 250; // mana must be FAR above the type line (~50% of card height)
+      final textSpan = maxY - minY;
+      final upperLimit = textSpan > 100
+          ? minY + textSpan * 0.35  // mana must be in upper 35% of text span
+          : recognized.blocks.first.boundingBox.top; // fallback if text span too small
       if (debugMode) {
         debugPrint('Mana search: ${topBlocks.length} blocks, upperLimit=${upperLimit.round()}');
         for (int i = 0; i < topBlocks.length && i < 8; i++) {
