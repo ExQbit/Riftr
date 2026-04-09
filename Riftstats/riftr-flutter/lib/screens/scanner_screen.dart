@@ -103,6 +103,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
   static const _motionThresholdAfterScan = 30.0; // higher threshold after scan to prevent double-scan
   static const _stableThreshold = 8.0; // hand-held: 3-8% trembling is normal, not movement
   bool _justScanned = false; // true after successful scan, reset when entering WAITING
+  double _lastCardPresentProb = 0.0; // cached from last card-present check
   static const _rectMotionLimit = 10.0; // collect native rects during hand trembles (card still visible)
   Timer? _settlingTimer;
 
@@ -248,17 +249,19 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     switch (_state) {
       case ScanState.waiting:
         // Quick card-present check — skip OCR if no card visible
-        if (_cardPresentClassifier.isReady && _lastYPlane != null) {
+        // Only check every 3rd frame to reduce CPU load
+        if (_processedFrames % 3 == 0 && _cardPresentClassifier.isReady && _lastYPlane != null) {
           final prob = _cardPresentClassifier.classify(
             _lastYPlane!, _lastYWidth, _lastYHeight, _lastYStride,
           );
-          if (_debugMode && _processedFrames % 10 == 0) {
+          _lastCardPresentProb = prob ?? 0.0;
+          if (_debugMode && _processedFrames % 30 == 0) {
             debugPrint('CardPresent: prob=${prob?.toStringAsFixed(3) ?? "null"}');
           }
-          if (prob != null && prob < CardPresentClassifierService.cardPresentThreshold) {
-            // No card detected — skip expensive OCR this frame
-            return;
-          }
+        }
+        // Skip OCR if last card-present check was negative
+        if (_lastCardPresentProb < CardPresentClassifierService.cardPresentThreshold) {
+          return;
         }
         // First scan attempt — try flip for upside-down cards
         _runOcr(image, tryFlip: true);
