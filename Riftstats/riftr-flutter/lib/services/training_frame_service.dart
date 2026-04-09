@@ -101,11 +101,18 @@ class TrainingFrameService {
       final ts = DateTime.now().millisecondsSinceEpoch;
       final label = isPositive ? 'manual_pos' : 'manual_neg';
 
+      // Crop center 50% of the frame — card is held in the middle,
+      // this ensures the card fills most of the saved image
+      final cropX = width ~/ 4;
+      final cropY = height ~/ 4;
+      final cropW = width ~/ 2;
+      final cropH = height ~/ 2;
+
       final pixels = Uint8List(_targetW * _targetH);
       for (int y = 0; y < _targetH; y++) {
-        final srcY = y * height ~/ _targetH;
+        final srcY = cropY + (y * cropH ~/ _targetH);
         for (int x = 0; x < _targetW; x++) {
-          final srcX = x * width ~/ _targetW;
+          final srcX = cropX + (x * cropW ~/ _targetW);
           final srcIdx = srcY * stride + srcX;
           pixels[y * _targetW + x] =
               srcIdx >= 0 && srcIdx < yPlane.length ? yPlane[srcIdx] : 0;
