@@ -24,7 +24,7 @@ class CardPresentClassifierService {
   static const _inputH = 256;
 
   /// Minimum confidence to consider a card present.
-  static const cardPresentThreshold = 0.50;
+  static const cardPresentThreshold = 0.55;
 
   /// Load the TFLite model from assets.
   Future<void> load() async {
