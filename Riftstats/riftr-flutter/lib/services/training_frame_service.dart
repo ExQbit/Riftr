@@ -90,6 +90,35 @@ class TrainingFrameService {
   ///
   /// Crops each native rect from the Y-plane, resizes to 96×128, and saves.
   /// Rects overlapping with [cardRect] → positive, others → negative.
+  /// Save current camera frame as a manual positive or negative sample.
+  /// Downscales to 96×128 grayscale raw binary.
+  Future<void> saveManualFrame(
+    Uint8List yPlane, int width, int height, int stride,
+    {required bool isPositive}
+  ) async {
+    try {
+      final dir = isPositive ? await _positiveDir() : await _negativeDir();
+      final ts = DateTime.now().millisecondsSinceEpoch;
+      final label = isPositive ? 'manual_pos' : 'manual_neg';
+
+      final pixels = Uint8List(_targetW * _targetH);
+      for (int y = 0; y < _targetH; y++) {
+        final srcY = y * height ~/ _targetH;
+        for (int x = 0; x < _targetW; x++) {
+          final srcX = x * width ~/ _targetW;
+          final srcIdx = srcY * stride + srcX;
+          pixels[y * _targetW + x] =
+              srcIdx >= 0 && srcIdx < yPlane.length ? yPlane[srcIdx] : 0;
+        }
+      }
+
+      await File('${dir.path}/${ts}_$label.raw').writeAsBytes(pixels);
+      if (kDebugMode) debugPrint('TrainingFrame: saved $label');
+    } catch (e) {
+      if (kDebugMode) debugPrint('TrainingFrame: manual save failed: $e');
+    }
+  }
+
   Future<void> saveRectCrops(
     Uint8List yPlane, int width, int height, int stride,
     List<List<int>> nativeRects, List<int>? cardRect,

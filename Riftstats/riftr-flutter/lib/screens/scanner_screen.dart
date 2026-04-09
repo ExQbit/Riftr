@@ -859,16 +859,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
           'pixels=${computeResult?.debugFullPixels != null}, '
           'yPlane=${_lastYPlane != null}');
     }
-    // Save native rect crops for Card-Present classifier (rect validator)
-    // Copy lists — they're cleared by scanner state changes before async save completes
-    if (_nativeRects.isNotEmpty && _lastYPlane != null) {
-      final rectsCopy = _nativeRects.map((r) => List<int>.from(r)).toList();
-      final cardRectCopy = cardRect != null ? List<int>.from(cardRect) : null;
-      _trainingFrames.saveRectCrops(
-        Uint8List.fromList(_lastYPlane!), _lastYWidth, _lastYHeight, _lastYStride,
-        rectsCopy, cardRectCopy,
-      );
-    }
+    // Training data now collected via manual POS/NEG buttons
 
     // ══════════════════════════════════════════════
     // ── TFLite CNN classifiers (ALWAYS run) ──
@@ -2080,16 +2071,71 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
                     ),
                   ),
                   const SizedBox(width: 8),
+                  // Manual POS frame button
+                  GestureDetector(
+                    onTap: () {
+                      if (_lastYPlane == null) return;
+                      _trainingFrames.saveManualFrame(
+                        _lastYPlane!, _lastYWidth, _lastYHeight, _lastYStride,
+                        isPositive: true,
+                      );
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('POS saved'), duration: Duration(milliseconds: 400)),
+                      );
+                    },
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                      decoration: BoxDecoration(
+                        color: Colors.green.withValues(alpha: 0.6),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: const Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(Icons.check_circle_outline, color: Colors.white70, size: 16),
+                          SizedBox(width: 4),
+                          Text('POS', style: TextStyle(color: Colors.white70, fontSize: 11)),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
                   // Clear all training frames button
                   GestureDetector(
                     onTap: () async {
                       await _trainingFrames.clearAll();
                       if (!mounted) return;
                       ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(
-                          content: Text('Training frames cleared'),
-                          duration: Duration(milliseconds: 800),
-                        ),
+                        const SnackBar(content: Text('Cleared'), duration: Duration(milliseconds: 400)),
+                      );
+                    },
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                      decoration: BoxDecoration(
+                        color: Colors.orange.withValues(alpha: 0.6),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: const Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(Icons.delete_outline, color: Colors.white70, size: 16),
+                          SizedBox(width: 4),
+                          Text('CLR', style: TextStyle(color: Colors.white70, fontSize: 11)),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  // Manual NEG frame button
+                  GestureDetector(
+                    onTap: () {
+                      if (_lastYPlane == null) return;
+                      _trainingFrames.saveManualFrame(
+                        _lastYPlane!, _lastYWidth, _lastYHeight, _lastYStride,
+                        isPositive: false,
+                      );
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('NEG saved'), duration: Duration(milliseconds: 400)),
                       );
                     },
                     child: Container(
@@ -2101,9 +2147,9 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
                       child: const Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          Icon(Icons.delete_outline, color: Colors.white70, size: 16),
+                          Icon(Icons.cancel_outlined, color: Colors.white70, size: 16),
                           SizedBox(width: 4),
-                          Text('CLR', style: TextStyle(color: Colors.white70, fontSize: 11)),
+                          Text('NEG', style: TextStyle(color: Colors.white70, fontSize: 11)),
                         ],
                       ),
                     ),
