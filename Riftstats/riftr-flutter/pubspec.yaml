@@ -94,6 +94,7 @@ flutter:
     - assets/set_code_classifier.tflite
     - assets/suffix_classifier.tflite
     - assets/mana_classifier.tflite
+    - assets/card_present_classifier.tflite
     - assets/meta_decks.json
     - assets/runes/
     - assets/badges/

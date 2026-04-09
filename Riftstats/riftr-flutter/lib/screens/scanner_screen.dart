@@ -18,6 +18,7 @@ import '../services/promo_classifier_service.dart';
 import '../services/set_classifier_service.dart';
 import '../services/suffix_classifier_service.dart';
 import '../services/mana_classifier_service.dart';
+import '../services/card_present_classifier_service.dart';
 import '../services/training_frame_service.dart';
 import '../theme/app_theme.dart';
 import '../widgets/card_image.dart';
@@ -86,6 +87,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
   final _setClassifier = SetClassifierService.instance;
   final _suffixClassifier = SuffixClassifierService.instance;
   final _manaClassifier = ManaClassifierService.instance;
+  final _cardPresentClassifier = CardPresentClassifierService.instance;
   final _trainingFrames = TrainingFrameService.instance;
   Uint8List? _lastYPlane;  // updated every frame (for motion detection)
   int _lastYWidth = 0;
@@ -149,6 +151,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     _setClassifier.load();
     _suffixClassifier.load();
     _manaClassifier.load();
+    _cardPresentClassifier.load();
     OcrService.instance.debugMode = true; // ON for mana debug
     _initCamera();
   }
@@ -242,6 +245,16 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     // ── State transitions ──
     switch (_state) {
       case ScanState.waiting:
+        // Quick card-present check — skip OCR if no card visible
+        if (_cardPresentClassifier.isReady && _lastYPlane != null) {
+          final prob = _cardPresentClassifier.classify(
+            _lastYPlane!, _lastYWidth, _lastYHeight, _lastYStride,
+          );
+          if (prob != null && prob < CardPresentClassifierService.cardPresentThreshold) {
+            // No card detected — skip expensive OCR this frame
+            return;
+          }
+        }
         // First scan attempt — try flip for upside-down cards
         _runOcr(image, tryFlip: true);
 
