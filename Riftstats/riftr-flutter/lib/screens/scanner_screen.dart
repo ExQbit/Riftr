@@ -632,12 +632,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
         } else {
           debugPrint('Scanner: No match after $_scanFrameCount frames (cumBest=$bestScore)');
           _debugOcr = 'no match (cum=$bestScore)';
-          // Collect negative training frame (scan timeout)
-          if (_lastYPlane != null) {
-            _trainingFrames.saveNegativeFrame(
-              _lastYPlane!, _lastYWidth, _lastYHeight, _lastYStride,
-            );
-          }
+          // Negative training data now comes from rect crops (automatic)
           _setState(ScanState.stable);
         }
         return;
@@ -864,16 +859,6 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
           'pixels=${computeResult?.debugFullPixels != null}, '
           'yPlane=${_lastYPlane != null}');
     }
-    if (computeResult?.debugFullPixels != null) {
-      _trainingFrames.savePositiveFrame(
-        _lastYPlane!, _lastYWidth, _lastYHeight, _lastYStride,
-        match.card.name,
-        cardCrop: computeResult!.debugFullPixels!,
-        cardCropW: computeResult.debugFullW,
-        cardCropH: computeResult.debugFullH,
-      );
-    }
-
     // Save native rect crops for Card-Present classifier (rect validator)
     // Copy lists — they're cleared by scanner state changes before async save completes
     if (_nativeRects.isNotEmpty && _lastYPlane != null) {
@@ -2095,17 +2080,15 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
                     ),
                   ),
                   const SizedBox(width: 8),
-                  // Manual negative frame button
+                  // Clear all training frames button
                   GestureDetector(
-                    onTap: () {
-                      if (_lastYPlane == null) return;
-                      _trainingFrames.saveNegativeFrame(
-                        _lastYPlane!, _lastYWidth, _lastYHeight, _lastYStride,
-                      );
+                    onTap: () async {
+                      await _trainingFrames.clearAll();
+                      if (!mounted) return;
                       ScaffoldMessenger.of(context).showSnackBar(
                         const SnackBar(
-                          content: Text('NEG frame saved'),
-                          duration: Duration(milliseconds: 500),
+                          content: Text('Training frames cleared'),
+                          duration: Duration(milliseconds: 800),
                         ),
                       );
                     },
@@ -2118,9 +2101,9 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
                       child: const Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          Icon(Icons.cancel_outlined, color: Colors.white70, size: 16),
+                          Icon(Icons.delete_outline, color: Colors.white70, size: 16),
                           SizedBox(width: 4),
-                          Text('NEG', style: TextStyle(color: Colors.white70, fontSize: 11)),
+                          Text('CLR', style: TextStyle(color: Colors.white70, fontSize: 11)),
                         ],
                       ),
                     ),
