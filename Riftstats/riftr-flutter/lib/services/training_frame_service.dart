@@ -108,8 +108,9 @@ class TrainingFrameService {
         final rx = r[0], ry = r[1], rw = r[2], rh = r[3];
         if (rw < 50 || rh < 50) continue; // skip tiny rects
 
-        // Check if this rect overlaps with the card rect (IoU > 0.3)
-        final isCard = cardRect != null && _rectsOverlap(r, cardRect);
+        // Check if this native rect contains the card's center point
+        // (IoU was too strict — slightly shifted rects showing the card were labeled negative)
+        final isCard = cardRect != null && _rectContainsCenter(r, cardRect);
 
         // Clamp rect to frame bounds
         final cx = rx.clamp(0, width - 1);
@@ -150,24 +151,12 @@ class TrainingFrameService {
     }
   }
 
-  /// Check if two rects overlap significantly (IoU > 0.3).
-  bool _rectsOverlap(List<int> a, List<int> b) {
-    final ax1 = a[0], ay1 = a[1], ax2 = a[0] + a[2], ay2 = a[1] + a[3];
-    final bx1 = b[0], by1 = b[1], bx2 = b[0] + b[2], by2 = b[1] + b[3];
-
-    final ix1 = ax1 > bx1 ? ax1 : bx1;
-    final iy1 = ay1 > by1 ? ay1 : by1;
-    final ix2 = ax2 < bx2 ? ax2 : bx2;
-    final iy2 = ay2 < by2 ? ay2 : by2;
-
-    if (ix1 >= ix2 || iy1 >= iy2) return false;
-
-    final intersection = (ix2 - ix1) * (iy2 - iy1);
-    final aArea = a[2] * a[3];
-    final bArea = b[2] * b[3];
-    final union = aArea + bArea - intersection;
-
-    return union > 0 && intersection / union > 0.3;
+  /// Check if native rect [a] contains the center point of card rect [b].
+  bool _rectContainsCenter(List<int> a, List<int> b) {
+    final centerX = b[0] + b[2] ~/ 2;
+    final centerY = b[1] + b[3] ~/ 2;
+    return centerX >= a[0] && centerX <= a[0] + a[2] &&
+           centerY >= a[1] && centerY <= a[1] + a[3];
   }
 
   /// Save grayscale pixels as PNG (no downscaling, already correct size).
