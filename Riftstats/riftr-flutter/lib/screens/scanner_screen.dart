@@ -149,6 +149,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     _setClassifier.load();
     _suffixClassifier.load();
     _manaClassifier.load();
+    _trainingFrames.clearAll(); // TODO: remove after one build — clears old mislabeled data
     OcrService.instance.debugMode = true; // ON for mana debug
     _initCamera();
   }
