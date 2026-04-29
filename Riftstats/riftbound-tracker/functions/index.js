@@ -1799,20 +1799,79 @@ exports.stripeWebhook = onRequest(
         account.payouts_enabled &&
         account.details_submitted;
 
-      await db
+      // ── Bank-Detail-Change ATO Detection (Round 8 Pen-Test, 2026-04-29) ──
+      // Stripe-Connect Account-Takeover-Pattern (Stripe-Empfehlung):
+      //   1. Attacker phishes Seller-Email-Credentials
+      //   2. Attacker logged in Stripe-Express-Dashboard via Magic-Link
+      //   3. Attacker aendert external_account (Bank-Konto) auf eigenes
+      //   4. Naechste Auszahlung geht an Attacker → Seller-Geld weg
+      // Defense: bei jeder account.updated detectieren wir external_account-
+      // Aenderungen via Vergleich mit gecachtem Fingerprint, pausen Payouts
+      // und alarmieren Admin + Seller. Stripe rate-limit zwingt eh delay,
+      // Riftr-side audit gibt Forensik + Recovery-Pfad.
+      const sellerProfRef = db
         .collection("artifacts").doc(APP_ID)
         .collection("users").doc(uid)
-        .collection("data").doc("sellerProfile")
-        .set(
-          {
-            stripeOnboarded: isOnboarded,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          },
-          { merge: true }
+        .collection("data").doc("sellerProfile");
+      const sellerProfDoc = await sellerProfRef.get();
+      const existingExtAccountId = sellerProfDoc.exists
+        ? (sellerProfDoc.data().stripeExternalAccountId || null)
+        : null;
+      const newExtAccount = (account.external_accounts?.data || [])[0];
+      const newExtAccountId = newExtAccount?.id || null;
+
+      const updatePayload = {
+        stripeOnboarded: isOnboarded,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      };
+
+      // Bank-Wechsel detected: nur wenn vorher schon einer existierte
+      // (sonst ist es das initiale Onboarding, kein Takeover).
+      const isBankChange = existingExtAccountId
+        && newExtAccountId
+        && existingExtAccountId !== newExtAccountId;
+
+      if (isBankChange) {
+        console.warn(
+          `🚨 ATO-WARN: Stripe account ${account.id} (uid=${uid}) external_account ` +
+          `changed: ${existingExtAccountId} → ${newExtAccountId}. ` +
+          `Pausing payouts via Riftr-flag.`,
         );
+        updatePayload.payoutsPausedReason = "external_account_changed";
+        updatePayload.payoutsPausedAt = admin.firestore.FieldValue.serverTimestamp();
+        updatePayload.previousExternalAccountId = existingExtAccountId;
+        updatePayload.stripeExternalAccountId = newExtAccountId;
+        // Push an Seller damit er WEISS dass etwas geaendert wurde
+        // (legitim oder nicht — er kann reagieren).
+        try {
+          sendNotification(
+            uid,
+            "⚠️ Bankverbindung geaendert",
+            "Deine Stripe-Bankverbindung wurde geaendert. " +
+            "Falls du das nicht warst, kontaktiere uns SOFORT — " +
+            "Auszahlungen sind aus Sicherheitsgruenden pausiert.",
+            { type: "security", severity: "high" },
+          );
+          sendAdminAlert(
+            "STRIPE_BANK_CHANGE",
+            `Seller ${uid} (account ${account.id}) external_account ` +
+            `changed: ${existingExtAccountId} → ${newExtAccountId}. ` +
+            `Payouts paused. Manual review required.`,
+          );
+        } catch (alertErr) {
+          console.error(`Bank-Change Alert dispatch failed: ${alertErr.message}`);
+        }
+      } else if (newExtAccountId && !existingExtAccountId) {
+        // Initiales Onboarding: external_account zum ersten Mal gesetzt.
+        // Cache fuer spaetere Vergleiche.
+        updatePayload.stripeExternalAccountId = newExtAccountId;
+      }
+
+      await sellerProfRef.set(updatePayload, { merge: true });
 
       console.log(
-        `Stripe account ${account.id} for uid ${uid}: onboarded=${isOnboarded}`
+        `Stripe account ${account.id} for uid ${uid}: onboarded=${isOnboarded}` +
+        (isBankChange ? " ⚠️ BANK CHANGE DETECTED" : ""),
       );
     }
 
@@ -2299,6 +2358,15 @@ exports.createPaymentIntent = onCall(
     const sellerDoc = await sellerRef.get();
     if (!sellerDoc.exists || !sellerDoc.data().stripeAccountId) {
       throw new HttpsError("failed-precondition", "Seller has no Stripe account");
+    }
+    // ATO-Defense (Round 8 Pen-Test, 2026-04-29): block buys auf
+    // Sellers deren Stripe-Account due-to-bank-change auf Pause ist.
+    // Sonst landet das Geld via transfer_data am potenziell-Attacker-Konto.
+    if (sellerDoc.data().payoutsPausedReason) {
+      throw new HttpsError(
+        "failed-precondition",
+        "This seller is temporarily unavailable. Please try again later or contact support.",
+      );
     }
     const sellerStripeAccountId = sellerDoc.data().stripeAccountId;
 
@@ -2839,6 +2907,17 @@ exports.processMultiSellerCart = onCall(
           `Seller ${sellerId} has no Stripe account`,
         );
       }
+      // ATO-Defense (Round 8 Pen-Test, 2026-04-29): block multi-seller-cart
+      // wenn EINER der Seller pausiert ist. Cart kann nicht teil-erfolgreich
+      // gehen — wenn Seller X paused, Buyer kriegt clean error + cart bleibt
+      // intakt fuer spaeteren retry.
+      if (sellerProfDoc.data().payoutsPausedReason) {
+        throw new HttpsError(
+          "failed-precondition",
+          `Seller ${sellerProfDoc.data().displayName || sellerId} is temporarily unavailable. ` +
+          "Remove this seller from your cart or try again later.",
+        );
+      }
       const stripeAccountId = sellerProfDoc.data().stripeAccountId;
       // Verify capabilities (skip if known-active to save API calls; for safety check first time)
       const sellerAccount = await stripe.accounts.retrieve(stripeAccountId);
@@ -3269,6 +3348,24 @@ exports.markShipped = onCall(
     }
     if (order.status !== "paid") {
       throw new HttpsError("failed-precondition", `Order status is ${order.status}, expected paid`);
+    }
+
+    // ATO-Defense (Round 8 Pen-Test, 2026-04-29): block markShipped wenn
+    // Seller-Account paused (z.B. nach Bank-Detail-Change). Capture haette
+    // sonst Geld zur potenziell-Attacker-Bank geleitet (transfer_data routet
+    // ueber Connect-Account das auf die geaenderte Bank zeigt). Order
+    // bleibt im "paid" Status — Stripe Auth haelt 7 Tage, danach automatisch
+    // released wenn nicht captured. Admin reviewt + entscheidet manuell.
+    const shippingSellerRef = db.collection("artifacts").doc(APP_ID)
+      .collection("users").doc(uid)
+      .collection("data").doc("sellerProfile");
+    const shippingSellerDoc = await shippingSellerRef.get();
+    if (shippingSellerDoc.exists && shippingSellerDoc.data().payoutsPausedReason) {
+      throw new HttpsError(
+        "failed-precondition",
+        "Your seller account is temporarily paused for security review. " +
+        "Please contact support before shipping orders.",
+      );
     }
 
     // Pre-release: block shipping before release date
