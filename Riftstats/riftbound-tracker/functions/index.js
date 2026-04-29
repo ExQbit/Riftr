@@ -2590,6 +2590,24 @@ exports.createPaymentIntent = onCall(
     const buyerCountry = (shippingAddress.country || "").toUpperCase();
     const anyInsuredOnly = listingData.some(l => l.insuredOnly);
     const effectiveMethod = anyInsuredOnly ? "insured" : shippingMethod;
+
+    // Tracked-Shipping-Required Server-Side Enforcement (Round 11.1, 2026-04-29):
+    // Cardmarket/TCGplayer-Standard: Orders > €25 müssen tracked versendet
+    // werden (Cardmarket: >€25, TCGplayer: >$20). Schützt vor Bait-and-Switch
+    // (Round 10 Strategie 4), Lost-Mail-Scam (Letter ohne Tracking = keine
+    // Versand-Beweis), und Friendly-Fraud-Chargebacks. Flutter-UI Picker
+    // (lib/data/shipping_rates.dart::requiresTracking) macht das schon
+    // soft-enforce, aber ein Hacker mit Frida/Burp könnte direkten API-Call
+    // mit `shippingMethod: "letter"` machen → ohne Server-Side-Check würde
+    // das durchgehen. Hier hartes Enforcement.
+    if (effectiveMethod === "letter" && subtotal > 25) {
+      throw new HttpsError(
+        "failed-precondition",
+        "Orders over €25 must use tracked or insured shipping. " +
+        "Please select a different shipping method.",
+      );
+    }
+
     const shippingCost = round2(getShippingRate(sellerCountry, buyerCountry, effectiveMethod));
 
     // ── Fee-Logik (Phase-1) ──
@@ -3174,6 +3192,20 @@ exports.processMultiSellerCart = onCall(
         });
       }
       cardSubtotal = round2(cardSubtotal);
+
+      // Tracked-Shipping-Required Server-Side Enforcement (Round 11.1, 2026-04-29):
+      // Cardmarket-Pattern: Orders > €25 müssen tracked versendet werden.
+      // Per-Seller-Group check (jeder Seller-Subtotal individuell, nicht
+      // total cart). Schützt vor Bait-and-Switch + Lost-Mail + Friendly-Fraud.
+      // Flutter-UI macht das schon soft-enforce, hier hartes Server-Side-Check
+      // gegen Frida/Burp-Bypass.
+      if (effectiveMethod === "letter" && cardSubtotal > 25) {
+        throw new HttpsError(
+          "failed-precondition",
+          `Seller ${sellerId}: orders over €25 must use tracked or insured ` +
+          `shipping. Please select a different shipping method.`,
+        );
+      }
 
       const cartSubtotalCents = Math.round(cardSubtotal * 100);
       const shippingCents = Math.round(shippingCost * 100);
