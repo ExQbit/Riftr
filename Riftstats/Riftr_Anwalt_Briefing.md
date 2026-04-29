@@ -56,7 +56,26 @@ Sämtliche Zahlungen laufen über **Stripe Connect Destination Charges** mit:
 - Stripe-Fees trägt Riftr (= klare Buchhaltung, keine User-Verwirrung)
 
 **Anmerkung zur Stripe-Charge-Type-Terminologie:**
-Riftr nutzt **Destination Charges** (Plattform = merchant of record, Funds via `transfer_data` automatisch zum Connected Account), NICHT Direct Charges (wo Verkäufer = merchant of record via `stripeAccount` Header). Beide Patterns können BaFin-konform sein, der juristische Argumentations-Pfad ist aber unterschiedlich. Wir bitten um anwaltliche Bewertung ob ein formales **ZAG-Memo zur Dokumentation der Befreiung** erforderlich ist (Stripe's eigene Compliance-Team akzeptiert unsere Setup als nicht-zahlungsdienste-pflichtig, aber wir möchten das anwaltlich gegengezeichnet sehen).
+
+Riftr nutzt **Destination Charges** mit `transfer_data + application_fee_amount` (NICHT Direct Charges via `stripeAccount`-Header).
+
+**Drei Ebenen die wir sauber trennen wollen** (auf Hinweis eines Aufsichtsrechtlers):
+
+| Ebene | Rolle Riftr | Bedeutung |
+|---|---|---|
+| **Stripe-technisch** | Charge-Empfänger | Plattform-Stripe-Account empfängt formal die Zahlung, leitet sie automatisch via `transfer_data` weiter |
+| **Zivilrechtlich** | Vermittler (NICHT Verkäufer) | Kaufvertrag besteht ausschließlich zwischen Käufer und Verkäufer |
+| **Aufsichtsrechtlich (ZAG)** | nicht zahlungsdienste-pflichtig | Riftr hat keine tatsächliche oder rechtliche Verfügungsmacht über die Gelder; Stripe leitet sie automatisch und unwiderruflich weiter |
+
+**ZAG-Memo:** Wir möchten zur formalen Dokumentation der ZAG-Befreiung ein **Standard-Memo** beauftragen (8–12 Seiten, mit Risikoanalyse). Begründung: später sowohl bei Investoren-Due-Diligence als auch bei Stripe-Risk-Review vorlegbar.
+
+**Bewusst KEINE BaFin-Anfrage:**
+- BaFin-Anfragen sind gebührenpflichtig (€1.000–5.000)
+- Verfahrensdauer 2–6 Monate, kein Anspruch auf bestimmte Antwort
+- Marktstandard: eBay, Etsy, Cardmarket, Vinted, Kleinanzeigen operieren alle ohne formale BaFin-Bestätigung
+- Stripe Payments Europe Ltd. ist EU-passportet als regulierter Akteur, das Memo dokumentiert unsere Architektur-Konformität
+
+**Wichtige Klarstellung:** Wir berufen uns NICHT auf eine "Stripe Compliance Bestätigung" — solche mündlichen/Chat-Aussagen wären rechtlich wertlos. Wir verlassen uns ausschließlich auf das anwaltliche Memo.
 
 **Konsequenz rechtlich:**
 - Keine BaFin-Erlaubnis nach §§ 10, 32 KWG erforderlich
@@ -93,6 +112,12 @@ Riftr nutzt **Destination Charges** (Plattform = merchant of record, Funds via `
 - Stattdessen „Mediations-Service bei Streitigkeiten" — beschreibt Tätigkeit, kein Versprechen
 - Service-Gebühr-Beschreibung: „deckt Plattform-Kosten" — kein Gewährleistungs-Versprechen
 - Klare Trennung: Kaufvertrag besteht zwischen Käufer und Verkäufer, NICHT mit Riftr
+
+**Vorgeschlagene Vermittler-Klausel** (zur juristischen Untermauerung der ZAG-Befreiung):
+
+> „Die Zahlungsabwicklung erfolgt technisch über Stripe Connect. Riftr nimmt zwar im Stripe-System formal die Käuferzahlung in Empfang, hat aber keinerlei tatsächliche oder rechtliche Verfügungsmacht über die Gelder; Stripe leitet die Beträge automatisch und unwiderruflich an den Verkäufer-Account weiter. Der Kaufvertrag kommt ausschließlich zwischen Käufer und Verkäufer zustande; Riftr ist Vermittler."
+
+Bitte diese Klausel review + ggf. verfeinern. Anwalt wurde bereits angeboten weitere AGB-Klauseln zu formulieren, die die fehlende-Verfügungsgewalt-Argumentation wasserdicht in die Vermittler-Position einbetten.
 
 **Konkrete Fragen für AGB-Review:**
 
@@ -269,7 +294,14 @@ Riftr nutzt **Destination Charges** (Plattform = merchant of record, Funds via `
 1. AGB final-Drafts (auf Basis CLAUDE.md-Wording)
 2. Datenschutzerklärung
 3. Impressum-Vorlage
-4. **ZAG-Memo zur Dokumentation der Zahlungsdienstegesetz-Befreiung** (kein BaFin-Antrag)
+4. **ZAG-Memo zur Dokumentation der Zahlungsdienstegesetz-Befreiung** (kein BaFin-Antrag). Scope:
+   - Subsumtion der konkreten Riftr-Architektur (Destination Charges + `transfer_data` + `application_fee_amount` + Standard Connected Accounts) unter § 1 Abs. 1 ZAG (Finanztransfergeschäft) und § 1 Abs. 1 Nr. 5 ZAG (Acquiring)
+   - Bezugnahme auf BaFin-Merkblatt zum ZAG (Stand 2017 + Aktualisierungen)
+   - Argumentation der fehlenden Verfügungsgewalt (Kernargument)
+   - Abgrenzung zu klassischem Finanztransfergeschäft (z. B. PayPal-Architektur Pre-PSD2)
+   - Stripe Payments Europe Ltd. als regulierter Akteur (irische E-Geld-Lizenz, EU-Passport)
+   - Risikobewertung: Was ändert sich, wenn BaFin-Position kippt? Welche Architektur-Anpassungen wären nötig?
+   - Empfehlung zu AGB-Klauseln, die die Befreiung stützen (Vermittler-Wording)
 5. Widerrufsrecht-Klarstellung (P2P vs. kommerzielle Verkäufer)
 
 ### Medium (vor Live-Launch)
