@@ -6508,8 +6508,6 @@ exports.cleanupBetaMarketplace = onRequest(
       reviews_deleted: 0,
       walletTransactions_deleted: 0,
       walletDocs_deleted: 0,
-      costBasis_deleted: 0,
-      portfolioHistory_deleted: 0,
       buyerSellerPairs_deleted: 0,
       rateLimits_deleted: 0,
       stripe_events_deleted: 0,
@@ -6560,31 +6558,19 @@ exports.cleanupBetaMarketplace = onRequest(
       const walletSnap = await db.collectionGroup("wallet").get();
       summary.walletDocs_deleted = await batchDelete(walletSnap, "wallet docs");
 
-      // ── 7. cost_basis + portfolio_history docs ──
-      // Diese liegen unter users/{uid}/data/cost_basis (single doc per user)
+      // ── 7. SellerProfile-Stats reset (NICHT cost_basis + portfolio_history!) ──
+      // KORREKTUR (2026-04-29): cost_basis + portfolio_history wurden urspruenglich
+      // ebenfalls geloescht — falsch. Das sind echte Sammlungs-Historie-Daten:
+      //   - cost_basis: FIFO-Kauf-Historie (was hat der User pro Karte bezahlt)
+      //                 → wichtig fuer realized-gains-Berechnung
+      //   - portfolio_history: tägliche Snapshots des Sammlungs-Werts
+      //                         → wichtig fuer Portfolio-Performance-Chart
+      // Beide werden NICHT durch Test-Marktplatz-Aktivitaet "verschmutzt"
+      // (sie tracken die ECHTE Sammlung), daher hier nicht mehr loeschen.
       const usersRef = db.collection("artifacts").doc(APP_ID).collection("users");
       const userDocs = await usersRef.listDocuments();
-      let costBasisDeleted = 0;
-      let portfolioDeleted = 0;
       let sellerProfilesReset = 0;
       for (const userDoc of userDocs) {
-        try {
-          const cbRef = userDoc.collection("data").doc("cost_basis");
-          const cbDoc = await cbRef.get();
-          if (cbDoc.exists) {
-            await cbRef.delete();
-            costBasisDeleted++;
-          }
-        } catch (_) {}
-        try {
-          const phRef = userDoc.collection("data").doc("portfolio_history");
-          const phDoc = await phRef.get();
-          if (phDoc.exists) {
-            await phRef.delete();
-            portfolioDeleted++;
-          }
-        } catch (_) {}
-        // ── 8. SellerProfile-Stats reset (NICHT komplett loeschen!) ──
         // Wir behalten displayName, email, country, address, isCommercialSeller,
         // stripeAccountId, etc. Nur die Stats die aus Test-Orders kamen werden
         // genullt damit der Beta-Start-State sauber ist.
@@ -6604,8 +6590,6 @@ exports.cleanupBetaMarketplace = onRequest(
           }
         } catch (_) {}
       }
-      summary.costBasis_deleted = costBasisDeleted;
-      summary.portfolioHistory_deleted = portfolioDeleted;
       summary.sellerProfiles_reset = sellerProfilesReset;
 
       // ── 9. Admin-Tracking-Collections (buyerSellerPairs, rateLimits, stripe_events) ──
