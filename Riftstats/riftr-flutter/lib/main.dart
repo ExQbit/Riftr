@@ -1,7 +1,9 @@
 import 'dart:ui';
+import 'package:flutter/foundation.dart' show kIsWeb, kDebugMode, debugPrint;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_app_check/firebase_app_check.dart';
 import 'firebase_options.dart';
 import 'theme/app_theme.dart';
 import 'services/auth_service.dart';
@@ -30,10 +32,15 @@ import 'services/order_service.dart';
 import 'services/wallet_service.dart';
 import 'package:flutter_stripe/flutter_stripe.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
-import 'services/push_notification_service.dart';
+// Conditional: on web, push notification service is a no-op (FCM web
+// setup requires VAPID + service worker, neither configured for the beta).
+import 'services/push_notification_service.dart'
+    if (dart.library.html) 'services/push_notification_service_stub.dart';
 import 'services/cart_service.dart';
 import 'screens/onboarding_screen.dart';
 import 'screens/setup_screen.dart';
+import 'widgets/market/deck_shopping_sheet.dart';
+import 'widgets/market/market_card_detail_route.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 /// Top-level background message handler (required by FCM).
@@ -50,27 +57,79 @@ void main() async {
     options: DefaultFirebaseOptions.currentPlatform,
   );
 
-  FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
+  // ─── App Check (Security-Audit Round 2, 2026-04-29) ──────────────────
+  // Verifiziert dass CF-Calls + Firestore-Zugriffe wirklich aus der
+  // echten Riftr-App kommen (nicht aus einem Bot/Skript der den Firebase-
+  // API-Key aus dem App-Bundle extrahiert hat). Ohne App Check kann ein
+  // Angreifer beliebig viele anonyme Firebase-Accounts erzeugen und alle
+  // CFs spammen — App Check blockt diesen Angriff vor dem CF-Compute.
+  //
+  // Provider:
+  //   - iOS Production/TestFlight: AppleProvider.deviceCheck (DeviceCheck
+  //     ist auf jedem iOS 11+ Device verfuegbar, kein zusaetzliches Setup
+  //     fuer den User)
+  //   - iOS Debug (Simulator/USB-Build): AppleProvider.debug — Debug-Token
+  //     muss in Firebase Console registriert werden, sonst werden Calls
+  //     vom Simulator als ungueltig markiert
+  //   - Android Production: AndroidProvider.playIntegrity (Play-Store-
+  //     installierte Builds), Debug: AndroidProvider.debug
+  //
+  // Hinweis: Server-side enforce ist NICHT aktiviert (default false auf
+  // allen onCall/onRequest-CFs). Tokens fliessen ins Firebase-Dashboard
+  // sodass wir Live-Traffic vor dem Hard-Enforce verifizieren koennen.
+  // Hard-Enforce per `enforceAppCheck: true` aktivieren wenn Dashboard
+  // zeigt dass >95% Calls valide Tokens haben — sonst breakt der Switch
+  // alle Bestandsclients.
+  if (!kIsWeb) {
+    try {
+      await FirebaseAppCheck.instance.activate(
+        appleProvider: kDebugMode
+            ? AppleProvider.debug
+            : AppleProvider.deviceCheck,
+        androidProvider: kDebugMode
+            ? AndroidProvider.debug
+            : AndroidProvider.playIntegrity,
+      );
+    } catch (e) {
+      // App Check-Activation darf den App-Start nicht blockieren —
+      // worst case: Tokens fliessen nicht, aber App funktioniert weiter
+      // weil Server-side noch nicht enforced wird.
+      debugPrint('App Check activation failed: $e');
+    }
+  }
 
-  Stripe.publishableKey = 'pk_test_51T8RW7IF9chIKwTY1iXCxHqtIGfPlCRIs4k0INBevmznbBTmEiKmXoUcKBVBJdSrmUPa1ZsVIIRIWfUTW3I16WWu007iPI7MWl';
-  Stripe.merchantIdentifier = 'merchant.app.getriftr';
-  Stripe.urlScheme = 'riftr';
+  // FCM background handler — mobile only (web uses a service worker path,
+  // not configured for the beta deploy).
+  if (!kIsWeb) {
+    FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
+  }
 
-  // Lock to portrait (matching landscape guard behavior)
-  SystemChrome.setPreferredOrientations([
-    DeviceOrientation.portraitUp,
-    DeviceOrientation.portraitDown,
-  ]);
+  // Stripe: mobile-only for now. Web init needs `js.stripe.com/v3` script in
+  // index.html — skipped since we're in test mode anyway.
+  if (!kIsWeb) {
+    Stripe.publishableKey = 'pk_test_51T8RW7IF9chIKwTY1iXCxHqtIGfPlCRIs4k0INBevmznbBTmEiKmXoUcKBVBJdSrmUPa1ZsVIIRIWfUTW3I16WWu007iPI7MWl';
+    Stripe.merchantIdentifier = 'merchant.app.getriftr';
+    Stripe.urlScheme = 'riftr';
+  }
 
-  // Edge-to-edge: app renders behind system bars (status bar + nav bar)
-  SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
-  SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
-    statusBarColor: Colors.transparent,
-    statusBarIconBrightness: Brightness.light,
-    systemNavigationBarColor: Colors.transparent,
-    systemNavigationBarIconBrightness: Brightness.light,
-    systemNavigationBarContrastEnforced: false,
-  ));
+  // Mobile-only system UI calls — web has no status/nav bar to configure.
+  if (!kIsWeb) {
+    // Lock to portrait (matching landscape guard behavior)
+    SystemChrome.setPreferredOrientations([
+      DeviceOrientation.portraitUp,
+      DeviceOrientation.portraitDown,
+    ]);
+
+    // Edge-to-edge: app renders behind system bars (status bar + nav bar)
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
+      statusBarColor: Colors.transparent,
+      statusBarIconBrightness: Brightness.light,
+      systemNavigationBarColor: Colors.transparent,
+      systemNavigationBarIconBrightness: Brightness.light,
+      systemNavigationBarContrastEnforced: false,
+    ));
+  }
 
   runApp(const RiftrApp());
 }
@@ -125,7 +184,7 @@ class _AuthGateState extends State<AuthGate> {
       stream: AuthService.instance.authStateChanges,
       builder: (context, snapshot) {
         if (snapshot.connectionState == ConnectionState.waiting) {
-          return const Scaffold(
+          return Scaffold(
             body: Center(child: CircularProgressIndicator(color: AppColors.amber400)),
           );
         }
@@ -179,7 +238,7 @@ class _OnboardingGateState extends State<_OnboardingGate> {
   Widget build(BuildContext context) {
     // Wait for profile load + prefs
     if (!ProfileService.instance.hasLoaded || _hasSeenOnboarding == null) {
-      return const Scaffold(
+      return Scaffold(
         backgroundColor: AppColors.background,
         body: Center(child: CircularProgressIndicator(color: AppColors.amber400)),
       );
@@ -210,12 +269,21 @@ class AppShell extends StatefulWidget {
   /// Exposed for FABs in child screens to sync their position with NavBar slide.
   static final navSlideNotifier = ValueNotifier<double>(1.0);
 
+  /// Top-backdrop color — shown in the status-bar area above the SafeArea
+  /// boundary. Screens override on enter, reset to background on exit.
+  static final topBgNotifier = ValueNotifier<Color>(AppColors.background);
+
   @override
   State<AppShell> createState() => _AppShellState();
 }
 
 class _AppShellState extends State<AppShell> with TickerProviderStateMixin, WidgetsBindingObserver {
-  int _currentIndex = 0;
+  // Initial tab on cold-start (process freshly created): Market (index 3).
+  // App-resume from background preserves the user's current tab automatically
+  // because Flutter keeps the widget state alive — only a fresh process
+  // re-runs initState and resets _currentIndex to this default.
+  // Tab order: 0=Tracker, 1=Cards, 2=Collect, 3=Market, 4=Decks, 5=Stats, 6=Social.
+  int _currentIndex = 3;
   int? _returnToTabIndex; // Auto-return after cross-tab navigation (e.g. Social → Decks → back)
   bool _hideNav = false;
   bool _navCollapsed = false;
@@ -233,14 +301,22 @@ class _AppShellState extends State<AppShell> with TickerProviderStateMixin, Widg
 
   late final List<Widget> _screens = [
     TrackerScreen(onFullscreenChanged: _setNavHidden, onGoToDecks: () => setState(() { _currentIndex = 4; _badgeTabs.remove(4); })),
-    CardsScreen(key: _cardsKey),
-    CollectionScreen(key: _collectionKey),
+    CardsScreen(
+      key: _cardsKey,
+      onNavigateToMarket: _handleViewOnMarket,
+      onOpenSellSheet: _handleOpenSellSheet,
+    ),
+    CollectionScreen(
+      key: _collectionKey,
+      onNavigateToMarket: _handleViewOnMarket,
+      onOpenSellSheet: _handleOpenSellSheet,
+    ),
     MarketScreen(key: _marketKey, onFullscreenChanged: _setNavHidden, onNavigateToAuthor: _navigateToAuthor),
     DecksScreen(
       key: _decksKey,
       onFullscreenChanged: _setNavHidden,
       onNavigateToAuthor: _navigateToAuthor,
-      onShowMissingInMarket: _showMissingInMarket,
+      onStartDeckShopping: _startDeckShopping,
       onDeckViewerClosed: () {
         if (_returnToTabIndex != null) {
           setState(() {
@@ -358,12 +434,71 @@ class _AppShellState extends State<AppShell> with TickerProviderStateMixin, Widg
     _socialKey.currentState?.navigateToAuthor(authorId, authorName);
   }
 
-  void _showMissingInMarket(Map<String, int> missingCards) {
-    _marketKey.currentState?.showMissingCards(missingCards);
-    _setNavHidden(false); // Close deck fullscreen overlay
-    setState(() { _currentIndex = 3; _badgeTabs.remove(3); }); // Market tab
+  /// Opens the dedicated deck-shopping sheet (drag-to-dismiss) over the
+  /// current screen. Replaces the old flow that navigated to the Market tab
+  /// and surfaced a missing-cards banner there — the new sheet keeps the
+  /// user anchored in their deck view while offering the Smart Cart CTA
+  /// and the full missing-card list as sibling affordances.
+  ///
+  /// `deckName` is accepted by the callback for future use (accessibility,
+  /// analytics) but is not currently surfaced in the sheet UI.
+  /// Opens the deck-shopping overlay as a fullscreen Navigator route. Mirrors
+  /// the `CardPreviewRoute` pattern (drag-from-anywhere dismissal via the
+  /// app's custom `DragToDismiss` widget). `deckName` accepted for future
+  /// use; not currently surfaced in the overlay UI.
+  void _startDeckShopping(String deckName, Map<String, int> missingCards) {
+    Navigator.of(context).push(
+      DeckShoppingRoute(
+        missingCards: missingCards,
+        onStartSmartCart: () {
+          // Pop the overlay, then hand off to the market flow.
+          Navigator.of(context).pop();
+          _marketKey.currentState?.startSmartCartFlow(missingCards);
+        },
+        onOpenCardDetail: (cardId) {
+          // §7.2 Market-tab card detail as nested sheet on top of overlay.
+          final priceData = MarketService.instance.getPrice(cardId) ??
+              MarketService.instance.getFallbackPrice(cardId);
+          if (priceData == null) return;
+          showMarketCardDetailSheet(
+            context: context,
+            card: priceData,
+            onCheckout: (l) =>
+                _marketKey.currentState?.openCheckoutSheet(l),
+            onAddToCart: (l) =>
+                _marketKey.currentState?.addToCart(l),
+            onSell: () =>
+                _marketKey.currentState?.openSellSheetById(cardId),
+          );
+        },
+      ),
+    );
   }
 
+
+  /// CardPreview "View on Market" handler — switches to the Market tab
+  /// and asks MarketScreen to open its in-tab Card-Detail view for the
+  /// given card. Used by both CardsScreen and CollectionScreen so the
+  /// behavior is identical regardless of preview origin.
+  ///
+  /// Wiring history: previously the two screens declared
+  /// `onNavigateToMarket` as nullable Function fields but main.dart
+  /// instantiated them without passing a callback, making the buttons
+  /// silent no-ops (they popped the preview overlay but never fired the
+  /// action). Both screens now share this single handler.
+  void _handleViewOnMarket(String cardId) {
+    setState(() => _currentIndex = 3); // Market tab
+    _marketKey.currentState?.navigateToCardById(cardId);
+  }
+
+  /// CardPreview "Sell" handler — opens MarketScreen's Sell sheet without
+  /// switching tabs (per `MarketScreen.openSellSheetById` doc-comment:
+  /// "can be called from Cards/Collection tab preview without switching to
+  /// the Market tab"). User stays anchored in their origin tab so they can
+  /// list more cards in sequence.
+  void _handleOpenSellSheet(String cardId) {
+    _marketKey.currentState?.openSellSheetById(cardId);
+  }
 
   void _setNavHidden(bool hide) {
     if (_hideNav == hide) return;
@@ -515,11 +650,16 @@ class _AppShellState extends State<AppShell> with TickerProviderStateMixin, Widg
     // Start listening for marketplace listings
     ListingService.instance.listen();
 
-    // Load cart from disk + sync with Firestore reservations
+    // Load cart from disk + sync with Firestore reservations.
+    // Listener MUST be attached BEFORE loadFromDisk — otherwise loadFromDisk's
+    // notifyListeners fires before we're listening, and the NavBar cart badge
+    // shows totalItems=0 on cold-start until something else rebuilds the tree
+    // (e.g. user taps the Market tab). Bug repro: items in cart → kill app →
+    // relaunch → no badge until Market tab tap.
     if (!DemoService.instance.isActive) {
+      CartService.instance.addListener(() { if (mounted) setState(() {}); });
       await CartService.instance.loadFromDisk();
       CartService.instance.syncWithFirestore();
-      CartService.instance.addListener(() { if (mounted) setState(() {}); });
     }
   }
 
@@ -583,7 +723,20 @@ class _AppShellState extends State<AppShell> with TickerProviderStateMixin, Widg
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: Stack(
+      // Global tap-to-unfocus: HitTestBehavior.translucent lets pointer
+      // events propagate to children (TextFields claim taps and focus
+      // themselves; buttons/list-items claim their taps), but if a tap
+      // lands on empty space and isn't claimed by any descendant, this
+      // parent's onTap fires → keyboard dismissed.
+      // Covers TextFields inside all main-tab content (Decks, Market,
+      // Stats, Social, Cards, Collection, Tracker). Sheets/routes pushed
+      // on top of AppShell live in their own widget trees and need their
+      // own outer GestureDetector — see e.g. sell_sheet, checkout_sheet,
+      // bulk_checkout_sheet, seller_onboarding_sheet.
+      body: GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onTap: () => FocusScope.of(context).unfocus(),
+        child: Stack(
         children: [
           SafeArea(
             bottom: false,
@@ -592,9 +745,17 @@ class _AppShellState extends State<AppShell> with TickerProviderStateMixin, Widg
                 if (!_hideNav) _handleScrollNotification(notification);
                 return false;
               },
-              child: IndexedStack(
-                index: _currentIndex,
-                children: _screens,
+              child: Column(
+                children: [
+                  // Web-only pre-launch banner — always visible, non-dismissible.
+                  if (kIsWeb) const _BetaBanner(),
+                  Expanded(
+                    child: IndexedStack(
+                      index: _currentIndex,
+                      children: _screens,
+                    ),
+                  ),
+                ],
               ),
             ),
           ),
@@ -618,6 +779,7 @@ class _AppShellState extends State<AppShell> with TickerProviderStateMixin, Widg
           ),
         ],
       ),
+      ), // close GestureDetector
     );
   }
 
@@ -755,10 +917,21 @@ class _AppShellState extends State<AppShell> with TickerProviderStateMixin, Widg
                                       mainAxisSize: MainAxisSize.min,
                                       children: [
                                         _badgeIcon(_buildMarketIcon(isActive), i),
-                                        Text('Market',
-                                          style: AppTextStyles.small.copyWith(
-                                            color: isActive ? AppColors.amber100 : AppColors.textMuted,
-                                            fontWeight: FontWeight.w900)),
+                                        // FittedBox(scaleDown) verhindert dass das
+                                        // Label auf 2 Zeilen wrappt wenn die Tab-
+                                        // Zelle eng wird (iPhone 13 mini ≈ 47pt
+                                        // pro Cell). Auf großen Screens bleibt
+                                        // der Text in Original-Größe; auf engen
+                                        // schrumpft er um 5-10% statt zu wrappen.
+                                        FittedBox(
+                                          fit: BoxFit.scaleDown,
+                                          child: Text('Market',
+                                            maxLines: 1,
+                                            softWrap: false,
+                                            style: AppTextStyles.small.copyWith(
+                                              color: isActive ? AppColors.amber100 : AppColors.textMuted,
+                                              fontWeight: FontWeight.w900)),
+                                        ),
                                       ],
                                     ),
                                   ),
@@ -771,10 +944,20 @@ class _AppShellState extends State<AppShell> with TickerProviderStateMixin, Widg
                                         color: isActive ? AppColors.amber100 : AppColors.textMuted),
                                       i),
                                     const SizedBox(height: 2),
-                                    Text(_tabs[i].label,
-                                      style: AppTextStyles.tiny.copyWith(
-                                        color: isActive ? AppColors.amber100 : AppColors.textMuted,
-                                        fontWeight: FontWeight.bold)),
+                                    // siehe Market-Label-Kommentar — gleicher
+                                    // Pattern fuer alle Tabs damit „Tracker"
+                                    // (7 Zeichen, längstes Label) auf iPhone
+                                    // 13 mini nicht in 2. Zeile wrappt und
+                                    // damit das Icon nach oben rutscht.
+                                    FittedBox(
+                                      fit: BoxFit.scaleDown,
+                                      child: Text(_tabs[i].label,
+                                        maxLines: 1,
+                                        softWrap: false,
+                                        style: AppTextStyles.tiny.copyWith(
+                                          color: isActive ? AppColors.amber100 : AppColors.textMuted,
+                                          fontWeight: FontWeight.bold)),
+                                    ),
                                   ],
                                 ),
                         ),
@@ -873,7 +1056,7 @@ class _PulsingCartBadge extends StatelessWidget {
           child: Container(
             width: 18,
             height: 18,
-            decoration: const BoxDecoration(
+            decoration: BoxDecoration(
               color: AppColors.amber400,
               shape: BoxShape.circle,
             ),
@@ -883,6 +1066,48 @@ class _PulsingCartBadge extends StatelessWidget {
           ),
         );
       },
+    );
+  }
+}
+
+
+/// Web-only pre-launch banner. Displayed at the top of the AppShell for
+/// external visitors (Riot/press/community). Communicates that Riftr is
+/// beta and Stripe is in test mode. Remove when going live.
+class _BetaBanner extends StatelessWidget {
+  const _BetaBanner();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(
+        horizontal: AppSpacing.md,
+        vertical: AppSpacing.sm,
+      ),
+      decoration: BoxDecoration(
+        color: AppColors.amberMuted,
+        border: Border(
+          bottom: BorderSide(color: AppColors.amberBorderMuted),
+        ),
+      ),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(Icons.info_outline, size: 16, color: AppColors.amber400),
+          const SizedBox(width: AppSpacing.sm),
+          Flexible(
+            child: Text(
+              "Riftr is currently in beta. Payments are in test mode.",
+              style: AppTextStyles.bodySmall.copyWith(
+                color: AppColors.amber400,
+                fontWeight: FontWeight.w600,
+              ),
+              textAlign: TextAlign.center,
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
