@@ -1998,7 +1998,12 @@ exports.stripeWebhook = onRequest(
         const disputePi = dispute.payment_intent
           ? await stripe.paymentIntents.retrieve(dispute.payment_intent)
           : null;
-        const disputeUid = disputePi?.metadata?.uid;
+        // Bug-Fix (Round 6 Audit-Folge, 2026-04-29): vorher `metadata?.uid`
+        // — der Key existiert nicht. Wir setzen `buyerId` in PI-Metadata
+        // (siehe createPaymentIntent + processMultiSellerCart). Konsequenz
+        // des Bugs: bei Chargeback-WON wurde der User-Account nicht
+        // automatisch entsperrt — Manual-Admin-Action war noetig.
+        const disputeUid = disputePi?.metadata?.buyerId || disputePi?.metadata?.uid;
         if (disputeUid) {
           if (dispute.status === "won") {
             // We won — unfreeze account
@@ -2899,6 +2904,11 @@ exports.processMultiSellerCart = onCall(
           condition: p.listing.condition || "NM",
           quantity: p.quantity,
           pricePerCard: p.listing.price,
+          // Audit-Folge (2026-04-29): per-Item-Marker fuer Rollback —
+          // wenn der Buyer eine cart-reservation auf das Listing hatte,
+          // wurde reservedQty NICHT in der Erfolgs-Phase incrementet.
+          // Rollback muss das wissen damit er nicht zu viel dekrementiert.
+          ownCartReservedQty: p.ownCartReservedQty || 0,
           ...(p.listing.setCode ? { setCode: p.listing.setCode } : {}),
           ...(p.listing.collectorNumber ? { collectorNumber: p.listing.collectorNumber } : {}),
           ...(p.listing.language ? { language: p.listing.language } : {}),
@@ -3095,14 +3105,29 @@ exports.processMultiSellerCart = onCall(
               cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
               cancelReason: "multi_seller_rollback",
             });
-            // Release listings for the cancelled order
+            // Release listings for the cancelled order.
+            // Audit-Folge (2026-04-29): nur den Anteil dekrementieren der in
+            // der Erfolgs-Phase tatsaechlich incrementet wurde. Bei einem
+            // cart-reserved-transfer (ownCartReservedQty > 0) hat der
+            // Erfolgs-Path die reservedQty NICHT erhoeht — also dekrementieren
+            // wir auch nur die nicht-cart-reserved Differenz. Sonst flackert
+            // reservedQty unter den eigentlichen cart-Wert und der User-Cart
+            // wird inkonsistent (cart-doc deleted, listing-state mismatched).
             for (const item of (s.group.items || [])) {
               const lref = db.collection("artifacts").doc(APP_ID)
                 .collection("listings").doc(item.listingId);
               const ldoc = await lref.get();
               if (!ldoc.exists) continue;
               const ldata = ldoc.data();
-              const newR = Math.max(0, (ldata.reservedQty || 0) - item.quantity);
+              const cartTransferQty = Math.min(
+                item.ownCartReservedQty || 0,
+                item.quantity || 0,
+              );
+              const incrementedQty = Math.max(
+                0,
+                (item.quantity || 0) - cartTransferQty,
+              );
+              const newR = Math.max(0, (ldata.reservedQty || 0) - incrementedQty);
               const ud = { reservedQty: newR };
               if (ldata.status === "reserved" && newR < ldata.quantity) {
                 ud.status = "active";
