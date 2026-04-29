@@ -1,11 +1,138 @@
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const { onRequest, onCall, HttpsError } = require("firebase-functions/v2/https");
+const { onDocumentCreated } = require("firebase-functions/v2/firestore");
 const admin = require("firebase-admin");
+const crypto = require("crypto");
 
 admin.initializeApp();
 
 const db = admin.firestore();
 const APP_ID = "riftr-v1";
+
+// ─── Admin-Trigger-Secret fuer onRequest Maintenance-Endpoints ──────────
+//
+// Alle manuellen HTTP-Endpoints (fetchPricesManual, migrateXxx,
+// checkNewXxxManual, discoverXxx, backfillXxx) sind by-default
+// public-callable (onRequest hat keine Auto-Auth) und triggern teure
+// Operationen (CF-Compute-Quota, Riot-API-Calls, volle Migration-Loops).
+// Ohne Auth = DoS-Vektor + Quota-Burn. Stripe-Webhook bleibt ungeschuetzt
+// weil dort die Stripe-Signature die Auth ist.
+//
+// Aufruf: `Authorization: Bearer <ADMIN_TRIGGER_SECRET>`
+// Constant-time-Compare gegen Timing-Attacks.
+const ADMIN_TRIGGER_SECRET = (process.env.ADMIN_TRIGGER_SECRET || "").trim();
+
+// ─── Items-Array Sanitizer (Security-Audit Round 6, 2026-04-29) ──
+// Dedupe + Size-Cap fuer items-arrays die in createPaymentIntent /
+// processMultiSellerCart kommen. Vorher konnte der Client duplikate
+// listingIds senden:
+//   items: [{listingId: "X", qty: 1}, {listingId: "X", qty: 1}]
+// Jede Iteration las dasselbe Listing, available-check bestand beide-mal
+// (gleiche Daten) → Order ueber-allokiert. Listing.qty=1 → Order fuer 2.
+// Fix: dedupe by listingId mit Quantity-Sum, plus 100-Item-Cap (DoS).
+function dedupeAndValidateItems(items) {
+  if (!Array.isArray(items)) {
+    throw new HttpsError("invalid-argument", "items must be an array");
+  }
+  if (items.length === 0) {
+    throw new HttpsError("invalid-argument", "items array is empty");
+  }
+  if (items.length > 100) {
+    throw new HttpsError(
+      "invalid-argument",
+      `items array too large (${items.length}, max 100)`,
+    );
+  }
+  const map = new Map();
+  for (const entry of items) {
+    if (!entry || typeof entry !== "object") {
+      throw new HttpsError("invalid-argument", "invalid item entry");
+    }
+    const lid = entry.listingId;
+    if (!lid || typeof lid !== "string") {
+      throw new HttpsError("invalid-argument", "item missing listingId");
+    }
+    const qty = Math.floor(Number(entry.quantity) || 1);
+    if (qty < 1 || qty > 9999) {
+      throw new HttpsError(
+        "invalid-argument",
+        `invalid quantity for listing ${lid} (must be 1-9999)`,
+      );
+    }
+    map.set(lid, (map.get(lid) || 0) + qty);
+  }
+  // Re-cap auf max-quantity-per-listing nach Aggregation
+  const deduped = [];
+  for (const [listingId, totalQty] of map.entries()) {
+    if (totalQty > 9999) {
+      throw new HttpsError(
+        "invalid-argument",
+        `aggregated quantity for ${listingId} exceeds 9999`,
+      );
+    }
+    deduped.push({ listingId, quantity: totalQty });
+  }
+  return deduped;
+}
+
+// ─── Generic Per-User Rate-Limit (Security-Audit Round 5, 2026-04-29) ──
+// Schuetzt teure CFs (Stripe-API-Calls, Firestore-Writes) gegen Spam von
+// authentifizierten Usern. Pro UID + key (CF-Name) ein Daily-Counter.
+// Doc: `artifacts/{appId}/rateLimits/{uid}` mit Sub-Object pro Key.
+// CF-only-Schreiben via Admin-SDK; Firestore-Rules-Default-deny blockt
+// Client-Zugriff.
+//
+// Race: paralleler Schreib auf den Counter im selben ms-Fenster koennte
+// Cap um 1 ueberschreiten (Lese-then-Write nicht atomar). Acceptable —
+// Limit-Wert ist sowieso konservativ + Spam-Schutz ist statistisch.
+async function enforceRateLimit(uid, key, dailyLimit) {
+  if (!uid) return;
+  const today = new Date().toISOString().slice(0, 10);
+  const ref = db.collection("artifacts").doc(APP_ID)
+    .collection("rateLimits").doc(uid);
+  const snap = await ref.get();
+  const data = snap.exists ? snap.data() : {};
+  const entry = data[key] || {};
+  const todayCount = entry.date === today ? (entry.count || 0) : 0;
+  if (todayCount >= dailyLimit) {
+    throw new HttpsError(
+      "resource-exhausted",
+      `Daily limit reached (${dailyLimit} ${key} per day). Try again tomorrow.`,
+    );
+  }
+  await ref.set({
+    [key]: {
+      date: today,
+      count: todayCount + 1,
+    },
+  }, { merge: true });
+}
+
+function requireAdminSecret(req, res) {
+  if (!ADMIN_TRIGGER_SECRET) {
+    console.error("ADMIN_TRIGGER_SECRET not configured — manual endpoint refused");
+    res.status(503).json({ error: "Admin secret not configured" });
+    return false;
+  }
+  const auth = (req.headers.authorization || "").trim();
+  const expected = `Bearer ${ADMIN_TRIGGER_SECRET}`;
+  // Length-check first (timingSafeEqual wirft bei unterschiedlicher Laenge)
+  if (auth.length !== expected.length) {
+    res.status(403).json({ error: "Forbidden" });
+    return false;
+  }
+  let ok = false;
+  try {
+    ok = crypto.timingSafeEqual(Buffer.from(auth), Buffer.from(expected));
+  } catch (_) {
+    ok = false;
+  }
+  if (!ok) {
+    res.status(403).json({ error: "Forbidden" });
+    return false;
+  }
+  return true;
+}
 
 // ── Cardmarket public data URLs ──
 
@@ -72,6 +199,63 @@ function todayEpoch() {
   const d = new Date();
   d.setHours(12, 0, 0, 0);
   return Math.floor(d.getTime() / 1000);
+}
+
+// ─── Phase D outlier detection ────────────────────────────────────────
+// Two distinct guards run during the daily fetch:
+//
+// 1. spikeGuard(trend, avg7, ...): catches UPWARD spikes where today's
+//    trend has been pulled high by a single recent inflated listing.
+//    If trend > avg7 * SPIKE_RATIO, we fall back to avg7 — the 7-day
+//    mean is more stable and resists single-listing distortion. Only
+//    fires when both values are positive. We don't apply this in the
+//    DOWNWARD direction because legitimate market crashes need to
+//    propagate through history quickly; movementGuard handles
+//    pathological down-spikes against yesterday's stored point.
+//
+// 2. movementGuard(today, yesterday, ...): catches >2x or <0.5x ratio
+//    against the previous stored history point. When triggered, today's
+//    point is NOT written (yesterday's value is preserved as the most
+//    recent point). This prevents Cardmarket trend-correction events
+//    (e.g. "trend was lagged inflated yesterday, snapped to reality
+//    today") from being recorded as legitimate -98% market moves.
+//
+// Thresholds:
+//   SPIKE_RATIO     = 2.0  → trend > 2× avg7 = use avg7 instead
+//   MOVEMENT_RATIO_HI = 2.0 → today/yesterday > 2 → skip write
+//   MOVEMENT_RATIO_LO = 0.5 → today/yesterday < 0.5 → skip write
+// Both guards log clearly so anomalies are visible in cron logs.
+
+const SPIKE_RATIO = 2.0;
+const MOVEMENT_RATIO_HI = 2.0;
+const MOVEMENT_RATIO_LO = 0.5;
+
+function spikeGuard(trend, avg7, cmId, variant) {
+  if (trend <= 0) return 0;
+  if (avg7 > 0 && trend > avg7 * SPIKE_RATIO) {
+    console.warn(
+      `🚨 SPIKE GUARD ${cmId} (${variant}): trend=${trend} > ${SPIKE_RATIO}× avg7=${avg7} → using avg7`,
+    );
+    return avg7;
+  }
+  return trend;
+}
+
+/**
+ * Returns true if writing today's point would create an implausible
+ * jump against yesterday's stored value. When true, caller should
+ * skip the write so yesterday's point remains the latest.
+ */
+function movementGuard(todayPrice, yesterdayPrice, cmId, variant) {
+  if (yesterdayPrice <= 0 || todayPrice <= 0) return false;
+  const ratio = todayPrice / yesterdayPrice;
+  if (ratio > MOVEMENT_RATIO_HI || ratio < MOVEMENT_RATIO_LO) {
+    console.warn(
+      `🚨 MOVEMENT GUARD ${cmId} (${variant}): today=${todayPrice} vs yesterday=${yesterdayPrice} ratio=${ratio.toFixed(3)} — skipping write`,
+    );
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -418,6 +602,32 @@ function orderItemsSummary(items) {
  */
 async function sendNotification(uid, title, body, data = {}) {
   try {
+    // Write notification document for in-app deep linking (works regardless of FCM handler issues)
+    // Auto-detect role from order data if not provided
+    let role = data.role || null;
+    if (!role && data.type === "order" && data.orderId) {
+      try {
+        const orderDoc = await db.collection("artifacts").doc(APP_ID).collection("orders").doc(data.orderId).get();
+        if (orderDoc.exists) {
+          role = orderDoc.data().sellerId === uid ? "seller" : "buyer";
+        }
+      } catch (_) { /* ignore — role stays null */ }
+    }
+
+    await db
+      .collection("artifacts").doc(APP_ID)
+      .collection("users").doc(uid)
+      .collection("notifications").add({
+        type: data.type || "general",
+        orderId: data.orderId || null,
+        role,
+        title,
+        body,
+        seen: false,
+        navigated: false,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
     const tokenDoc = await db
       .collection("artifacts").doc(APP_ID)
       .collection("users").doc(uid)
@@ -439,22 +649,31 @@ async function sendNotification(uid, title, body, data = {}) {
           notification: { title, body },
           data,
           android: { notification: { channelId: "order_updates" } },
-          apns: { payload: { aps: { sound: "default" } } },
+          apns: {
+            payload: {
+              aps: {
+                sound: "default",
+                "content-available": 1,
+                "mutable-content": 1,
+              },
+            },
+          },
         });
+        console.log(`FCM push sent to ${uid}: "${title}" token=${token.substring(0, 15)}...`);
       } catch (err) {
+        console.error(`FCM FAILED for ${uid}: code=${err.code} msg=${err.message} token=${token.substring(0, 15)}...`);
+        // Only remove truly invalid tokens — NOT transient server errors.
+        // third-party-auth-error is an APNs auth issue on Firebase's side, not a bad token.
         if (
           err.code === "messaging/registration-token-not-registered" ||
-          err.code === "messaging/invalid-registration-token" ||
-          err.code === "messaging/third-party-auth-error"
+          err.code === "messaging/invalid-registration-token"
         ) {
           staleTokens.push(token);
-        } else {
-          console.error(`FCM send failed for ${uid}: ${err.message}`);
         }
       }
     }
 
-    // Clean up stale tokens
+    // Clean up stale tokens (but NOT sandbox tokens — those fail with third-party-auth-error in dev builds)
     if (staleTokens.length > 0) {
       const deleteData = {};
       for (const t of staleTokens) {
@@ -503,8 +722,9 @@ async function updatePrices() {
   const EXP_MAP = {
     6286: "OGN", 6289: "OGS", 6399: "SFD",
     6322: "OGNX", 6483: "SFDX", 6480: "OGNX",
-    // TODO: UNL (Unleashed) — add idExpansion when available on Cardmarket
+    6491: "UNL", // Unleashed — Cardmarket live ab April 2026 (275 Produkte)
     // TODO: OGSX (Proving Grounds Extras) — add idExpansion when available on Cardmarket
+    // TODO: OPP / PR / JDG — neue Riftcodex-Sets, Cardmarket-IDs noch nicht ermittelt
   };
   const knownExps = new Set(Object.keys(EXP_MAP).map(Number));
 
@@ -600,6 +820,18 @@ async function updatePrices() {
         if (primaryPrice === nonFoilPrice && foilPrice === 0) isPrimaryFoil = false;
       }
 
+      // Promo sets (OGNX, SFDX, OGSX) exist only as foil.
+      // Foil price is always primary. Fallback to non-foil when foil = 0
+      // (CM sellers sometimes list foil cards as non-foil).
+      if (setId === "OGNX" || setId === "SFDX" || setId === "OGSX") {
+        isPrimaryFoil = true;
+        if (foilPrice > 0) {
+          primaryPrice = foilPrice;
+        } else {
+          primaryPrice = nonFoilPrice; // CM-Seller listen Foils manchmal als NF
+        }
+      }
+
       if (primaryPrice <= 0) continue;
 
       // Per-variant stats from CM price guide
@@ -642,10 +874,43 @@ async function updatePrices() {
         sp: "",
       };
 
-      // History points use max(trend, low) to prevent unrealistic dips
-      // on low-liquidity cards where trend can be wildly below actual buy price
-      const histFoil = foilPrice > 0 ? Math.max(foilPrice, l30F) : 0;
-      const histNf = nonFoilPrice > 0 ? Math.max(nonFoilPrice, l30Nf) : 0;
+      // ── Phase A: history points = pg.trend directly (= consistent with
+      //    prices[cmId].p which is also stored as trend). Old logic used
+      //    Math.max(trend, low) to "prevent unrealistic dips on low-
+      //    liquidity cards", but in practice that locked in inflated
+      //    Pre-Release/Discovery-Phase trend values for new sets — the
+      //    Cardmarket trend takes weeks to catch down to reality after a
+      //    set drop, while `low` already reflects the post-launch market.
+      //    Daily history-points captured the inflated trend, then when
+      //    trend finally normalized we'd see phantom -98% c24 events
+      //    (Blazing Scorcher OGN #1 Common: history decayed €4.81 → €0.02
+      //    over 11 days, today's c24=-98.1% from yesterday's stored
+      //    €1.05 → today's €0.02). Trend-only writes a CONSISTENT signal
+      //    matching what we display as currentPrice.
+      //
+      // ── Phase D: Outlier-Detection on top of trend.
+      //    spikeGuard(...) handles upward spikes (single inflated listing
+      //    pushes trend >>2x avg7) by falling back to avg7. Movement-check
+      //    against yesterday's stored point happens later in the merge
+      //    loop — see "OUTLIER GUARD" block ~Z. 880.
+      const histFoil = spikeGuard(foilPrice, avg7F, cmId, "Foil");
+      const histNf = spikeGuard(nonFoilPrice, avg7Nf, cmId, "NonFoil");
+      // Spike-corrected display-price: when spikeGuard fired (histX !=
+      // raw), clamp the displayed pF/pNf/p to the spike-corrected value
+      // so display + history + c24 stay in sync. Otherwise pNf zeigt den
+      // anomalen Tageswert (e.g. 0.44), mergedNf hat den korrigierten
+      // (e.g. 0.11) → c24 wird 340% statt 10% (Calm Rune SFD 2026-04-28).
+      // Wichtig: AUCH wenn movementGuard spaeter im merge-loop NICHT
+      // feuert (weil die spike-korrigierte history sane gegen yesterday
+      // ist), bleibt das Display sonst ueber-anomal — siehe SFD-Swap-Pfad.
+      if (foilPrice > 0 && histFoil > 0 && Math.abs(histFoil - foilPrice) > 0.001) {
+        prices[cmId].pF = round2(histFoil);
+        if (isPrimaryFoil) prices[cmId].p = round2(histFoil);
+      }
+      if (nonFoilPrice > 0 && histNf > 0 && Math.abs(histNf - nonFoilPrice) > 0.001) {
+        prices[cmId].pNf = round2(histNf);
+        if (!isPrimaryFoil) prices[cmId].p = round2(histNf);
+      }
       historyWrites.push({
         cmId,
         isPrimaryFoil,
@@ -707,7 +972,16 @@ async function updatePrices() {
     // Not in price guide — preserve previous overview price if available
     if (prevPrices[cmId]) {
       prices[cmId] = { ...prevPrices[cmId], n: meta.name, s: meta.set, metal: true };
-      // Keep sparkline + history growing via existing history doc
+      // Push history point so Metal cards build up chart data over time
+      const metalPrice = prices[cmId].pNf || prices[cmId].pF || prices[cmId].p;
+      if (metalPrice > 0) {
+        historyWrites.push({
+          cmId,
+          isPrimaryFoil: false,
+          foilPoint: null,
+          nonFoilPoint: { t: today, p: round2(metalPrice) },
+        });
+      }
       metalMatched++;
     }
   }
@@ -731,6 +1005,25 @@ async function updatePrices() {
         prices[cmA][f] = prices[cmB][f];
         prices[cmB][f] = tmp;
       }
+    }
+  }
+
+  // Also swap historyWrites for SFD Rune pairs so the correct (post-swap)
+  // prices are written to the correct history documents.
+  const hwIndex = {};
+  for (let i = 0; i < historyWrites.length; i++) hwIndex[historyWrites[i].cmId] = i;
+  for (const [cmA, cmB] of Object.entries(SFD_RUNE_SWAP)) {
+    const iA = hwIndex[cmA], iB = hwIndex[cmB];
+    if (iA !== undefined && iB !== undefined) {
+      const tmpFoil = historyWrites[iA].foilPoint;
+      const tmpNf = historyWrites[iA].nonFoilPoint;
+      const tmpPrimary = historyWrites[iA].isPrimaryFoil;
+      historyWrites[iA].foilPoint = historyWrites[iB].foilPoint;
+      historyWrites[iA].nonFoilPoint = historyWrites[iB].nonFoilPoint;
+      historyWrites[iA].isPrimaryFoil = historyWrites[iB].isPrimaryFoil;
+      historyWrites[iB].foilPoint = tmpFoil;
+      historyWrites[iB].nonFoilPoint = tmpNf;
+      historyWrites[iB].isPrimaryFoil = tmpPrimary;
     }
   }
 
@@ -762,12 +1055,41 @@ async function updatePrices() {
     );
 
     for (let j = 0; j < chunk.length; j++) {
-      const { cmId, isPrimaryFoil, foilPoint, nonFoilPoint } = chunk[j];
+      let { cmId, isPrimaryFoil, foilPoint, nonFoilPoint } = chunk[j];
       const existingDoc = existingDocs[j];
 
       // Load existing point counts for safety validation
       const existingFoilCount = existingDoc.exists ? (existingDoc.data().points || []).length : 0;
       const existingNfCount = existingDoc.exists ? (existingDoc.data().pointsNf || []).length : 0;
+
+      // ── OUTLIER GUARD (Phase D) ──
+      // movementGuard catches >2x or <0.5x ratio against yesterday's
+      // stored point. When the ratio is implausible:
+      //   1. skip writing today's history point (yesterday stays latest)
+      //   2. ALSO clamp prices[cmId].pF / pNf / p to yesterday's value
+      //      so display + history + c24 stay in sync. Otherwise pNf zeigt
+      //      den anomalen Tageswert, mergedNf hat ihn nicht → c24 wird
+      //      gegen den nicht-geblockten Wert gerechnet und es gibt einen
+      //      Phantom-Movement (Calm Rune SFD c24=+340% am 2026-04-28 weil
+      //      0.44 Display-Preis gegen 0.10 History-Baseline gerechnet).
+      const existingFoilPts = existingDoc.exists ? (existingDoc.data().points || []) : [];
+      const existingNfPts = existingDoc.exists ? (existingDoc.data().pointsNf || []) : [];
+      const lastFoilPt = existingFoilPts.length > 0 ? existingFoilPts[existingFoilPts.length - 1] : null;
+      const lastNfPt = existingNfPts.length > 0 ? existingNfPts[existingNfPts.length - 1] : null;
+      if (foilPoint && lastFoilPt && movementGuard(foilPoint.p, lastFoilPt.p, cmId, "Foil")) {
+        foilPoint = null;
+        if (prices[cmId]) {
+          prices[cmId].pF = round2(lastFoilPt.p);
+          if (isPrimaryFoil) prices[cmId].p = round2(lastFoilPt.p);
+        }
+      }
+      if (nonFoilPoint && lastNfPt && movementGuard(nonFoilPoint.p, lastNfPt.p, cmId, "NonFoil")) {
+        nonFoilPoint = null;
+        if (prices[cmId]) {
+          prices[cmId].pNf = round2(lastNfPt.p);
+          if (!isPrimaryFoil) prices[cmId].p = round2(lastNfPt.p);
+        }
+      }
 
       // Merge foil history: load existing + append today's price
       const foilMap = new Map();
@@ -808,7 +1130,8 @@ async function updatePrices() {
       if (prices[cmId]) {
         prices[cmId].sp = sparkCsv;
 
-        // Compute c24 per variant from stored history (most recent point before today)
+        // Compute c24 per variant from own history (most recent point before today).
+        // After history migration + historyWrite swap, each doc has its correct prices.
         const prevFoilPts = mergedFoil.filter((pt) => pt.t < today);
         if (prevFoilPts.length > 0 && prices[cmId].pF > 0) {
           const prev = prevFoilPts[prevFoilPts.length - 1].p;
@@ -916,8 +1239,10 @@ exports.fetchPricesManual = onRequest(
   {
     timeoutSeconds: 540,
     memory: "512MiB",
+    secrets: ["ADMIN_TRIGGER_SECRET"],
   },
   async (req, res) => {
+    if (!requireAdminSecret(req, res)) return;
     console.log("Manual fetch triggered");
     try {
       const result = await updatePrices();
@@ -933,7 +1258,7 @@ exports.fetchPricesManual = onRequest(
 // ─── Email Verification (Seller Onboarding) ───
 // ═══════════════════════════════════════════
 
-const crypto = require("crypto");
+// crypto is required at the top of the file (used by requireAdminSecret + email codes)
 const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
 
 /**
@@ -953,23 +1278,52 @@ exports.sendVerificationCode = onCall(
       throw new HttpsError("invalid-argument", "Valid email required");
     }
 
+    // ─── Rate-Limit (Security-Audit Round 2, 2026-04-29) ─────────────
+    // Schuetzt vor:
+    //   1. E-Mail-Bombing: User schickt 10000x sendVerificationCode mit
+    //      victim@example.com → 10000 Verification-Mails ans Opfer auf
+    //      Riftr-Resend-Kosten + Reputation-Risiko (Resend kann uns
+    //      sperren wenn Spam-Reports kommen).
+    //   2. Brute-Force-Reset-Loop: Code wird per Send invalidiert; ohne
+    //      Limit kann Angreifer beliebig oft Reset → 5-Attempts-Limit
+    //      pro Code wird nutzlos (immer neuer Code, neue 5 Attempts).
+    // Limit: 5 Codes pro UID pro Tag (UTC). Counter im
+    // emailVerification-Doc (gleicher Doc den wir gleich schreiben).
+    const verifyRef = db
+      .collection("artifacts").doc(APP_ID)
+      .collection("users").doc(uid)
+      .collection("data").doc("emailVerification");
+
+    const today = new Date().toISOString().slice(0, 10); // "YYYY-MM-DD" UTC
+    const existing = await verifyRef.get();
+    if (existing.exists) {
+      const data = existing.data();
+      if (data.rateLimitDate === today && (data.sendCountToday || 0) >= 5) {
+        throw new HttpsError(
+          "resource-exhausted",
+          "Too many verification attempts today. Please try again tomorrow."
+        );
+      }
+    }
+
     // Generate 6-digit code
     const code = crypto.randomInt(100000, 999999).toString();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
 
     // Store code (hashed) in Firestore
     const codeHash = crypto.createHash("sha256").update(code).digest("hex");
-    await db
-      .collection("artifacts").doc(APP_ID)
-      .collection("users").doc(uid)
-      .collection("data").doc("emailVerification")
-      .set({
-        email,
-        codeHash,
-        expiresAt: expiresAt.toISOString(),
-        attempts: 0,
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
+    const newCount = existing.exists && existing.data().rateLimitDate === today
+      ? (existing.data().sendCountToday || 0) + 1
+      : 1;
+    await verifyRef.set({
+      email,
+      codeHash,
+      expiresAt: expiresAt.toISOString(),
+      attempts: 0,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      rateLimitDate: today,
+      sendCountToday: newCount,
+    });
 
     // Send email via Resend API
     if (!RESEND_API_KEY) {
@@ -1007,7 +1361,11 @@ exports.sendVerificationCode = onCall(
       throw new HttpsError("internal", "Failed to send verification email");
     }
 
-    console.log(`Verification code sent to ${email} for uid ${uid}`);
+    // Security-Audit Round 3 (2026-04-29): kein `email` mehr in Cloud-Logs
+    // (DSGVO-relevant, war mildes PII-Leak — Logs werden an Datenexport-
+    // Anfragen herausgegeben muessen). Email-Hash via crypto loggen wenn
+    // Forensik noetig ist; UID alleine reicht fuer normale Ops.
+    console.log(`Verification code sent for uid ${uid}`);
     return { success: true };
   }
 );
@@ -1077,7 +1435,10 @@ exports.verifyEmailCode = onCall(
     // Clean up verification doc
     await verRef.delete();
 
-    console.log(`Email ${data.email} verified for uid ${uid}`);
+    // Security-Audit Round 3 (2026-04-29): kein `email` mehr in Cloud-Logs.
+    // Return-value behaelt email weil das App-Side-only ist (an den User
+    // selbst zurueck, nicht in Logs).
+    console.log(`Email verified for uid ${uid}`);
     return { success: true, email: data.email };
   }
 );
@@ -1088,7 +1449,16 @@ exports.verifyEmailCode = onCall(
 
 const STRIPE_SECRET = (process.env.STRIPE_SECRET_KEY || "").trim();
 const STRIPE_WEBHOOK_SECRET = (process.env.STRIPE_WEBHOOK_SECRET || "").trim();
-const RETURN_BASE = "https://getriftr.app";
+// Stripe Connect Onboarding Return-URLs.
+// VORHER: "https://getriftr.app" (Marketing-Site) — alle URLs landeten dort
+// auf der Landing-Page (catch-all rewrite), Verkaeufer sah nach KYC keine
+// klare „Setup-Complete"-Bestaetigung, sondern die generelle Marketing-Page.
+// JETZT: dedicated Web-App-Hosting mit echten stripe-return.html /
+// stripe-refresh.html — User bekommt nach KYC eine klare Erfolgs-Page mit
+// Hinweis „Du kannst zur App zurueck wechseln". Hosting-Site ist nach
+// Web-App-Offline-Schaltung (2026-04-29) bewusst minimal — nur die zwei
+// Stripe-Pages und ein App-Store-Hinweis-Lander.
+const RETURN_BASE = "https://riftr-10527.web.app";
 
 function getStripe() {
   if (!STRIPE_SECRET) {
@@ -1179,57 +1549,10 @@ async function getTrustLevel(uid) {
   return doc.data();
 }
 
-/** Get total balance (positive cents) from Stripe customer.balance. */
-async function getBalance(uid) {
-  const customerId = await getStripeCustomerId(uid);
-  const stripe = getStripe();
-  const customer = await stripe.customers.retrieve(customerId);
-  // Stripe convention: negative balance = credit/funds available
-  return Math.abs(Math.min(customer.balance, 0));
-}
-
-/** Get available balance (total minus escrow minus pending payouts; 0 if frozen). */
-async function getAvailableBalance(uid) {
-  const balDoc = await db.doc(`artifacts/${APP_ID}/users/${uid}/wallet/balance`).get();
-  if (!balDoc.exists) return 0;
-  const data = balDoc.data();
-  if (data.frozen) return 0;
-  return data.available || 0;
-}
-
-/** Count today's top-up transactions for rate limiting. */
-async function countTodayTopUps(uid) {
-  const startOfDay = new Date();
-  startOfDay.setHours(0, 0, 0, 0);
-  const snap = await db.collection(`artifacts/${APP_ID}/users/${uid}/walletTransactions`)
-    .where("type", "==", "top_up")
-    .where("createdAt", ">=", startOfDay)
-    .get();
-  return snap.size;
-}
-
-/** Count purchases in the last hour for rate limiting. */
-async function countHourlyPurchases(uid) {
-  const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
-  const snap = await db.collection(`artifacts/${APP_ID}/users/${uid}/walletTransactions`)
-    .where("type", "==", "purchase")
-    .where("createdAt", ">=", oneHourAgo)
-    .get();
-  return snap.size;
-}
-
-/** Sum today's payout amounts (in cents) for daily limit. */
-async function getTodayPayoutTotal(uid) {
-  const startOfDay = new Date();
-  startOfDay.setHours(0, 0, 0, 0);
-  const snap = await db.collection(`artifacts/${APP_ID}/users/${uid}/walletTransactions`)
-    .where("type", "==", "payout")
-    .where("createdAt", ">=", startOfDay)
-    .get();
-  let total = 0;
-  snap.forEach(doc => { total += Math.abs(doc.data().amount || 0); });
-  return total;
-}
+// NOTE (Phase 2, 2026-04-28): Helpers `getBalance`, `getAvailableBalance`,
+// `countTodayTopUps`, `countHourlyPurchases`, `getTodayPayoutTotal` wurden
+// entfernt — sie wurden nur von den geloeschten Wallet-Buy-Functions
+// (topUpBalance / purchaseWithBalance / requestPayout) genutzt.
 
 /** Log a wallet transaction and return the doc ref. */
 async function logTransaction(uid, type, amount, orderId, description, fee = 0, transferId = null, piId = null) {
@@ -1422,6 +1745,46 @@ exports.stripeWebhook = onRequest(
       return;
     }
 
+    // ─── Event-ID Deduplication (Security-Audit Round 4, 2026-04-29) ─────
+    // Stripe schickt Events bei Network-Issues / Retries manchmal mehrfach.
+    // Status-basierte Idempotenz fängt die meisten Branches (PI succeeded,
+    // payment_failed, canceled), aber `charge.dispute.created` wuerde bei
+    // Replay 2× Push an Seller + 2× Admin-Alert + 2× wallet.balance freezen
+    // (idempotent aber laute Logs).
+    //
+    // Pattern: `firestore.create()` failed mit ALREADY_EXISTS wenn Doc da
+    // ist — atomar, kein Race-Condition-Window. Wenn create erfolgreich →
+    // Event ist neu → normal verarbeiten.
+    //
+    // Stripe-Event-IDs sind globally unique (`evt_xxx`) — sicher als Key.
+    const stripeEventRef = db.collection("artifacts").doc(APP_ID)
+      .collection("stripe_events").doc(event.id);
+    try {
+      await stripeEventRef.create({
+        eventId: event.id,
+        type: event.type,
+        livemode: !!event.livemode,
+        processedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    } catch (createErr) {
+      // ALREADY_EXISTS → Replay, schon verarbeitet, einfach 200 zurueck.
+      // Andere Errors → loggen + weiterverarbeiten (lieber doppelt als gar
+      // nicht — nur ALREADY_EXISTS skipt).
+      if (createErr.code === 6 /* ALREADY_EXISTS */ ||
+          (createErr.message || "").includes("already exists")) {
+        console.log(
+          `Stripe webhook replay detected: event ${event.id} (${event.type}) ` +
+          `already processed, returning 200 ohne Re-Run`,
+        );
+        res.status(200).send("ok-already-processed");
+        return;
+      }
+      console.warn(
+        `stripe_events.create failed for ${event.id}: ${createErr.message} — ` +
+        `proceeding without dedup-record (event will run)`,
+      );
+    }
+
     if (event.type === "account.updated") {
       const account = event.data.object;
       const uid = account.metadata?.uid;
@@ -1453,46 +1816,15 @@ exports.stripeWebhook = onRequest(
       );
     }
 
-    // Handle PaymentIntent events for order status updates
-    if (event.type === "payment_intent.succeeded") {
+    // ── Buyer-Auth erfolgreich (capture_method: manual) ─────────────
+    // createPaymentIntent setzt capture_method:"manual". Stripe feuert
+    // `payment_intent.amount_capturable_updated` direkt nach erfolgreicher
+    // Buyer-Authorisierung (vor Capture). Hier flippen wir Order
+    // pending_payment → paid + benachrichtigen Verkaeufer. Capture selbst
+    // passiert spaeter in `markShipped`, wo `payment_intent.succeeded`
+    // dann nur noch idempotent durchlaeuft (Order ist schon "paid").
+    if (event.type === "payment_intent.amount_capturable_updated") {
       const pi = event.data.object;
-
-      // ── Wallet Top-Up ──
-      if (pi.metadata?.type === "top_up" && pi.metadata?.uid) {
-        const topUpUid = pi.metadata.uid;
-        const topUpAmount = pi.amount;
-        try {
-          const customerId = pi.customer;
-          if (customerId) {
-            // Credit the customer balance (make more negative = more credit)
-            const cust = await stripe.customers.retrieve(customerId);
-            await stripe.customers.update(customerId, {
-              balance: cust.balance - topUpAmount,
-            });
-          }
-
-          // Transaction log — top-ups are always immediately available
-          const txRef = db.collection(`artifacts/${APP_ID}/users/${topUpUid}/walletTransactions`).doc();
-          await txRef.set({
-            type: "top_up",
-            amount: topUpAmount,
-            status: "completed",
-            stripePaymentIntentId: pi.id,
-            description: `Guthaben aufgeladen: €${(topUpAmount / 100).toFixed(2)}`,
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
-
-          await updateBalanceCache(topUpUid);
-
-          sendNotification(topUpUid, "Balance topped up!",
-            `€${(topUpAmount / 100).toFixed(2)} added to your balance.`);
-          console.log(`Top-up ${pi.id} succeeded: ${topUpUid} +€${(topUpAmount / 100).toFixed(2)}`);
-        } catch (err) {
-          console.error(`Top-up webhook error for ${pi.id}:`, err);
-        }
-      }
-
-      // ── Legacy Direct Pay (order with orderId in metadata) ──
       const orderId = pi.metadata?.orderId;
       if (orderId) {
         const orderRef = db.collection("artifacts").doc(APP_ID)
@@ -1503,15 +1835,51 @@ exports.stripeWebhook = onRequest(
             status: "paid",
             paidAt: admin.firestore.FieldValue.serverTimestamp(),
           });
-          console.log(`Order ${orderId} payment confirmed via webhook`);
+          console.log(`Order ${orderId}: amount_capturable_updated → status=paid`);
           const whOrder = orderDoc.data();
           const whSummary = orderItemsSummary(whOrder.items);
-          sendNotification(whOrder.sellerId, "New order!", `${whSummary} — €${(whOrder.totalPaid || 0).toFixed(2)}. Ship within 7 days.`);
+          sendNotification(whOrder.sellerId, "New order!", `${whSummary} — €${(whOrder.totalPaid || 0).toFixed(2)}. Ship within 7 days.`, { type: "order", orderId });
         }
       }
     }
 
-    if (event.type === "payment_intent.payment_failed") {
+    // Handle PaymentIntent events for order status updates.
+    // payment_intent.succeeded fires AFTER capture (markShipped called
+    // paymentIntents.capture). For our manual-capture flow this means the
+    // order is already in "paid" status from amount_capturable_updated;
+    // this handler is therefore idempotent — only triggers if the order
+    // somehow missed the capturable_updated event (defensive fallback).
+    if (event.type === "payment_intent.succeeded") {
+      const pi = event.data.object;
+      const orderId = pi.metadata?.orderId;
+      if (orderId) {
+        const orderRef = db.collection("artifacts").doc(APP_ID)
+          .collection("orders").doc(orderId);
+        const orderDoc = await orderRef.get();
+        if (orderDoc.exists && orderDoc.data().status === "pending_payment") {
+          await orderRef.update({
+            status: "paid",
+            paidAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+          console.log(`Order ${orderId} payment confirmed via webhook (succeeded fallback)`);
+          const whOrder = orderDoc.data();
+          const whSummary = orderItemsSummary(whOrder.items);
+          sendNotification(whOrder.sellerId, "New order!", `${whSummary} — €${(whOrder.totalPaid || 0).toFixed(2)}. Ship within 7 days.`, { type: "order", orderId });
+        }
+      }
+    }
+
+    // Order auf cancelled flippen + Listing-Reservation freigeben.
+    // Greift bei BEIDEN Events:
+    //   - `payment_intent.payment_failed` → echte Decline (Card-Decline,
+    //     Radar-Block, 3DS-Failed, etc.)
+    //   - `payment_intent.canceled` → User dismissed PaymentSheet, oder die
+    //     `cancelPendingOrder` CF hat den PI cancelled, oder Stripe-Auto-
+    //     Expiry. Defensive Doppel-Sicherung gegen orphan pending_payment.
+    if (
+      event.type === "payment_intent.payment_failed" ||
+      event.type === "payment_intent.canceled"
+    ) {
       const pi = event.data.object;
       const orderId = pi.metadata?.orderId;
       if (orderId) {
@@ -1522,6 +1890,9 @@ exports.stripeWebhook = onRequest(
           await orderRef.update({
             status: "cancelled",
             cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
+            cancelReason: event.type === "payment_intent.canceled"
+              ? "payment_intent_canceled"
+              : "payment_intent_failed",
           });
           // Release listing reservation
           const order = orderDoc.data();
@@ -1539,39 +1910,64 @@ exports.stripeWebhook = onRequest(
               }
             }
           }
-          console.log(`Order ${orderId} payment failed, cancelled`);
+          console.log(`Order ${orderId} cancelled via webhook (${event.type})`);
         }
       }
     }
 
-    // ── Chargeback: INSTANT account freeze ──
+    // ── Chargeback: INSTANT account freeze + Verkaeufer-Push ──
     if (event.type === "charge.dispute.created") {
       const dispute = event.data.object;
       try {
         const disputePi = dispute.payment_intent
           ? await stripe.paymentIntents.retrieve(dispute.payment_intent)
           : null;
-        const disputeUid = disputePi?.metadata?.uid;
-        if (disputeUid) {
+        const buyerUid = disputePi?.metadata?.buyerId || disputePi?.metadata?.uid;
+        const chargebackOrderId = disputePi?.metadata?.orderId;
+        const sellerUidFromPi = disputePi?.metadata?.sellerId;
+
+        // Phase 6: Push an Verkaeufer der Chargeback-Order — der Seller
+        // muss WISSEN dass eine Bestellung im Chargeback ist und ggf.
+        // Tracking-Beleg / Versand-Beweis einreichen kann.
+        if (chargebackOrderId && sellerUidFromPi) {
+          sendNotification(
+            sellerUidFromPi,
+            "Chargeback gemeldet",
+            `Käufer hat einen Chargeback bei der Bank eingereicht. ` +
+            `Bitte sende uns deinen Tracking-Beleg / Versand-Beweis.`,
+            { type: "order", orderId: chargebackOrderId },
+          );
+          console.log(
+            `Chargeback-Push an Seller ${sellerUidFromPi} fuer Order ${chargebackOrderId}`,
+          );
+        }
+
+        if (buyerUid) {
           // Suspend account
-          await db.doc(`artifacts/${APP_ID}/users/${disputeUid}/data/trustLevel`).update({
+          await db.doc(`artifacts/${APP_ID}/users/${buyerUid}/data/trustLevel`).update({
             level: "suspended",
             flags: admin.firestore.FieldValue.arrayUnion("chargeback_dispute"),
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           });
 
-          // Freeze balance
-          await db.doc(`artifacts/${APP_ID}/users/${disputeUid}/wallet/balance`).update({
-            available: 0,
-            frozen: true,
-            frozenReason: "chargeback_dispute",
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
+          // Freeze balance (legacy wallet — Phase 6+ has no functional balance,
+          // aber das Frozen-Flag dient als Defensiv-Marker fuer alte Daten).
+          try {
+            await db.doc(`artifacts/${APP_ID}/users/${buyerUid}/wallet/balance`).update({
+              available: 0,
+              frozen: true,
+              frozenReason: "chargeback_dispute",
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+          } catch (e) {
+            // wallet/balance Doc existiert evtl. nicht (neue User) — kein Fehler.
+            console.log(`Chargeback: wallet/balance freeze skipped for ${buyerUid}: ${e.message}`);
+          }
 
-          // Pause open orders (as buyer)
+          // Pause open orders (as buyer) — andere Verkaeufer warnen, nicht zu versenden
           const openOrders = await db.collection("artifacts").doc(APP_ID)
             .collection("orders")
-            .where("buyerId", "==", disputeUid)
+            .where("buyerId", "==", buyerUid)
             .where("status", "in", ["paid", "shipped"])
             .get();
           for (const orderDoc of openOrders.docs) {
@@ -1579,12 +1975,16 @@ exports.stripeWebhook = onRequest(
               status: "frozen",
               frozenReason: "buyer_chargeback",
             });
-            sendNotification(orderDoc.data().sellerId, "Order paused",
-              "An order has been temporarily paused. Please do not ship.");
+            sendNotification(
+              orderDoc.data().sellerId,
+              "Order paused",
+              "An order has been temporarily paused. Please do not ship.",
+              { type: "order", orderId: orderDoc.id }, // Bug-Fix: orderDoc.id (war undefined)
+            );
           }
 
-          sendAdminAlert("CHARGEBACK", `User ${disputeUid} chargeback. Account frozen.`);
-          console.log(`CHARGEBACK: User ${disputeUid} frozen (dispute ${dispute.id})`);
+          sendAdminAlert("CHARGEBACK", `User ${buyerUid} chargeback. Account frozen.`);
+          console.log(`CHARGEBACK: User ${buyerUid} frozen (dispute ${dispute.id})`);
         }
       } catch (err) {
         console.error("charge.dispute.created handler error:", err);
@@ -1625,16 +2025,10 @@ exports.stripeWebhook = onRequest(
       }
     }
 
-    // ── Transfer completed (payout to seller bank) ──
-    if (event.type === "transfer.paid") {
-      const transfer = event.data.object;
-      const payoutUid = transfer.metadata?.uid;
-      if (payoutUid && transfer.metadata?.type === "payout") {
-        sendNotification(payoutUid, "Payout completed",
-          `€${(transfer.amount / 100).toFixed(2)} has arrived at your bank account.`);
-        console.log(`Transfer ${transfer.id} paid to ${payoutUid}`);
-      }
-    }
+    // (Phase 2 cleanup, 2026-04-28) `transfer.paid` Handler entfernt — das
+    // Event existiert in Stripe nicht (war Dead-Code aus dem alten Wallet-
+    // requestPayout-Pfad). Stripe-Connect-Payouts an Verkäufer-Bank-Accounts
+    // laufen automatisch ueber `delay_days` — kein Webhook-Handling noetig.
 
     res.status(200).send("ok");
   }
@@ -1694,7 +2088,7 @@ exports.confirmPayment = onCall(
 
     // Notify seller about new order
     const cpSummary = orderItemsSummary(order.items);
-    sendNotification(order.sellerId, "New order!", `${cpSummary} — €${(order.totalPaid || 0).toFixed(2)}. Ship within 7 days.`);
+    sendNotification(order.sellerId, "New order!", `${cpSummary} — €${(order.totalPaid || 0).toFixed(2)}. Ship within 7 days.`, { type: "order", orderId: orderId });
 
     return { success: true };
   }
@@ -1704,10 +2098,23 @@ exports.confirmPayment = onCall(
 // ─── Marketplace: Buy Flow & Orders ───
 // ═══════════════════════════════════════════
 
-// Simplified shipping rates (same as Flutter ShippingRates).
+// Simplified shipping rates — MUSS mit Flutter `lib/data/shipping_rates.dart`
+// (ShippingRates._routes) synchron gehalten werden. Drift fuehrt zu User-vs-
+// Charge-Diskrepanz im Checkout (Frontend zeigt €X, Backend zieht €Y).
+//
+// TECH-DEBT (Phase 7+): Shipping-Rates zu shared JSON-Asset extrahieren, das
+// beide Seiten lesen — keine Drift-Quelle mehr. Bis dahin: bei jeder Aenderung
+// in shipping_rates.dart muss die hier auch nachgezogen werden.
+//
+// Backend-Tabelle nutzt nur die billigste Letter-Tier (`Standardbrief` in DE,
+// max 4 Karten). Frontend hat das Tier-Ladder fuer Bundle-Size-Optimierung —
+// wird hier vereinfacht auf den ersten Tier-Preis reduziert. Multi-Card-
+// Bundles > 4 Karten werden im Backend daher zu niedrig berechnet (Phase 7
+// Fix muss die Tier-Auswahl auch hierher portieren).
+//
 // { countryCode: { letter: { domestic, eu }, tracked: {...}, insured: {...} } }
 const SHIPPING_RATES = {
-  DE: { letter: { domestic: 1.10, eu: 1.80 }, tracked: { domestic: 3.75, eu: 4.45 }, insured: { domestic: 4.85, eu: 6.00 } },
+  DE: { letter: { domestic: 1.25, eu: 1.80 }, tracked: { domestic: 3.95, eu: 4.45 }, insured: { domestic: 7.19, eu: 6.00 } },
   FR: { letter: { domestic: 1.16, eu: 2.25 }, tracked: { domestic: 5.05, eu: 5.05 }, insured: { domestic: 7.20, eu: 7.20 } },
   NL: { letter: { domestic: 1.14, eu: 1.80 }, tracked: { domestic: 4.00, eu: 8.50 }, insured: { domestic: 5.00, eu: 9.50 } },
   BE: { letter: { domestic: 1.14, eu: 1.80 }, tracked: { domestic: 4.00, eu: 6.00 }, insured: { domestic: 5.00, eu: 7.50 } },
@@ -1753,6 +2160,37 @@ function getShippingRate(sellerCountry, buyerCountry, method) {
 
 const PLATFORM_FEE_RATE = 0.05; // 5%
 const PLATFORM_FEE_CAP = 100.00; // €100 max
+const MIN_FEE = 0.05; // €0.05 minimum fee
+const CHEAP_CARD_THRESHOLD = 0.50; // Below this, buyer pays service fee
+
+/**
+ * Calculate platform fee based on new fee structure.
+ * - Card < €0.50: Buyer pays €0.05 service fee, seller gets full price
+ * - Card >= €0.50: Seller pays max(€0.05, 5%), buyer pays nothing extra
+ * Returns { platformFee, buyerServiceFee, feePayer, sellerPayout, buyerTotal }
+ */
+function calculateFees(subtotal, shippingCost) {
+  if (subtotal < CHEAP_CARD_THRESHOLD) {
+    // Buyer pays €0.05 service fee
+    return {
+      platformFee: MIN_FEE,
+      buyerServiceFee: MIN_FEE,
+      feePayer: "buyer",
+      sellerPayout: round2(subtotal + shippingCost), // Seller gets full price + shipping
+      buyerTotal: round2(subtotal + shippingCost + MIN_FEE),
+    };
+  } else {
+    // Seller pays max(€0.05, 5%)
+    const fee = Math.min(Math.max(MIN_FEE, round2(subtotal * PLATFORM_FEE_RATE)), PLATFORM_FEE_CAP);
+    return {
+      platformFee: fee,
+      buyerServiceFee: 0,
+      feePayer: "seller",
+      sellerPayout: round2(subtotal - fee + shippingCost),
+      buyerTotal: round2(subtotal + shippingCost),
+    };
+  }
+}
 
 /**
  * createPaymentIntent — Callable, authenticated.
@@ -1767,6 +2205,12 @@ exports.createPaymentIntent = onCall(
     }
 
     const uid = request.auth.uid;
+
+    // Rate-Limit (Round 5, 2026-04-29): 50 createPaymentIntent calls/User/Tag.
+    // Heavy-Buyer real-world: ~10-20/Tag. 50 = 2-3x headroom. Schuetzt
+    // gegen Stripe-API-Quota-Burn + Firestore-Order-Doc-Spam.
+    await enforceRateLimit(uid, "createPaymentIntent", 50);
+
     const { listingId, quantity, items, shippingMethod, shippingAddress } = request.data;
 
     // Support both single-listing and cart (items array) mode
@@ -1779,8 +2223,12 @@ exports.createPaymentIntent = onCall(
       throw new HttpsError("invalid-argument", "Missing shipping info");
     }
 
-    // 1. Fetch all listings (single or cart)
-    const cartEntries = isCart ? items : [{ listingId, quantity }];
+    // 1. Fetch all listings (single or cart).
+    // Round 6 (2026-04-29): items-array geht durch dedupeAndValidateItems
+    // damit Duplicate-listingId-Over-Allocation nicht mehr moeglich ist.
+    const cartEntries = isCart
+      ? dedupeAndValidateItems(items)
+      : [{ listingId, quantity }];
     const listingRefs = [];
     const listingDocs = [];
     const listingData = [];
@@ -1796,7 +2244,19 @@ exports.createPaymentIntent = onCall(
       if (data.status !== "active" && data.status !== "reserved") {
         throw new HttpsError("failed-precondition", `Listing ${entry.listingId} is not active`);
       }
-      const available = data.quantity - (data.reservedQty || 0);
+      // Phase 4 Bugfix (2026-04-28): User-eigene Cart-Reservation aus
+      // reservedQty rausrechnen, sonst blockiert sich der Buyer selbst
+      // (Cart-Service reserviert beim Add-to-Cart). Mirror der Logik in
+      // processMultiSellerCart.
+      const cartResRef = db.collection("artifacts").doc(APP_ID)
+        .collection("users").doc(uid)
+        .collection("cartReservations").doc(entry.listingId);
+      const cartResDoc = await cartResRef.get();
+      const ownCartReservedQty = cartResDoc.exists
+        ? (cartResDoc.data().quantity || cartResDoc.data().qty || 0)
+        : 0;
+      const otherReservedQty = Math.max(0, (data.reservedQty || 0) - ownCartReservedQty);
+      const available = data.quantity - otherReservedQty;
       if ((entry.quantity || 1) > available) {
         throw new HttpsError("failed-precondition", `Not enough qty for ${data.cardName}`);
       }
@@ -1809,6 +2269,22 @@ exports.createPaymentIntent = onCall(
     const sellerId = listingData[0].sellerId;
     if (listingData.some(l => l.sellerId !== sellerId)) {
       throw new HttpsError("failed-precondition", "All cart items must be from the same seller");
+    }
+
+    // SELF-BUY-CHECK (Security-Audit Round 5, 2026-04-29):
+    // Vorher fehlte hier der Self-Buy-Guard — `processMultiSellerCart` und
+    // `reserveForCart` hatten ihn, `createPaymentIntent` aber nicht. Direkt-
+    // Kauf-Flow (ohne Cart) ermoeglichte:
+    //   1. Seller erstellt Listing fuer €100
+    //   2. Seller ruft createPaymentIntent direkt auf, kauft eigenes Listing
+    //   3. Verlust: ~5% Riftr + 1.5% Stripe = ~€7
+    //   4. confirmDelivery → submitReview → 5-Sterne Eigen-Bewertung
+    //   5. = €7 fuer einen fake Review = Power-Seller-Status pumpen
+    if (sellerId === uid) {
+      throw new HttpsError(
+        "permission-denied",
+        "Cannot buy your own listings",
+      );
     }
 
     // 3. Get seller's Stripe account
@@ -1855,45 +2331,90 @@ exports.createPaymentIntent = onCall(
         condition: listing.condition || "NM",
         quantity: qty,
         pricePerCard,
+        ...(listing.setCode ? {setCode: listing.setCode} : {}),
+        ...(listing.collectorNumber ? {collectorNumber: listing.collectorNumber} : {}),
+        ...(listing.language ? {language: listing.language} : {}),
+        // Persist foil flag — seller needs to know which variant to ship.
+        ...(listing.isFoil ? {isFoil: true} : {}),
       });
     }
     subtotal = round2(subtotal);
 
-    const rawFee = round2(subtotal * PLATFORM_FEE_RATE);
-    const platformFee = Math.min(rawFee, PLATFORM_FEE_CAP);
     const sellerCountry = listingData[0].sellerCountry || "";
     const buyerCountry = (shippingAddress.country || "").toUpperCase();
     const anyInsuredOnly = listingData.some(l => l.insuredOnly);
     const effectiveMethod = anyInsuredOnly ? "insured" : shippingMethod;
     const shippingCost = round2(getShippingRate(sellerCountry, buyerCountry, effectiveMethod));
-    const totalPaid = round2(subtotal + shippingCost);
-    const sellerPayout = round2(subtotal - platformFee + shippingCost);
 
-    // Amounts in cents for Stripe
-    const totalCents = Math.round(totalPaid * 100);
-    const feeCents = Math.round(platformFee * 100);
+    // ── Fee-Logik (Phase-1) ──
+    // Multi-Seller-Cart: Frontend orchestriert N sequenzielle Calls, einer
+    // pro Verkäufer. `sellerCount` (Gesamtzahl im User-Cart) und
+    // `chargeIndex` (0-basiert) werden vom Frontend mitgegeben — Service-
+    // Gebühr wird NUR auf Charge #0 gepackt, andere PIs tragen nur ihre
+    // eigene Provision. Default = Single-Seller-Verhalten (1, 0).
+    const sellerCount = Math.max(1, request.data.sellerCount || 1);
+    const chargeIndex = Math.max(0, request.data.chargeIndex || 0);
 
-    // 5. Get buyer display name
+    const cartSubtotalCents = Math.round(subtotal * 100);
+    const shippingCents = Math.round(shippingCost * 100);
+    const fees = calculateOrderFees(cartSubtotalCents, sellerCount);
+
+    // Service-Gebühr: nur auf erstem Charge berechnen
+    const serviceFeeForThisChargeCents = (chargeIndex === 0)
+      ? fees.serviceFeeCents : 0;
+    const applicationFeeCents =
+      serviceFeeForThisChargeCents + fees.platformCommissionCents;
+
+    const totalCents = cartSubtotalCents + shippingCents + serviceFeeForThisChargeCents;
+    const sellerPayoutCents = cartSubtotalCents - fees.platformCommissionCents + shippingCents;
+
+    // EUR-Floats für Order-Doc + Frontend-Display
+    const platformFee = fees.platformCommissionCents / 100;
+    const buyerServiceFee = serviceFeeForThisChargeCents / 100;
+    const totalPaid = totalCents / 100;
+    const sellerPayout = sellerPayoutCents / 100;
+    const feeCents = applicationFeeCents;
+    const feePayer = "split"; // Käufer Service-Gebühr, Verkäufer Provision
+
+    // Tier-aware Auszahlungs-Delay (account-level wird via syncSellerTier
+    // gesetzt; effective wird hier nur fürs Order-Doc/UI persistiert).
+    // High-Value-Cap > €100 wird in Phase 5 via capture-delay enforced;
+    // hier nur dokumentiert für Transparenz im Order-Doc.
+    const sellerProfileForDelay = sellerDoc.data();
+    const effectiveDelayDays = getEffectiveDelayDays(
+      sellerProfileForDelay,
+      totalCents,
+    );
+
+    // 5. Get buyer display name (Firestore profile → Firebase Auth → fallback)
     const buyerProfileRef = db.collection("artifacts").doc(APP_ID)
       .collection("users").doc(uid)
       .collection("data").doc("profile");
     const buyerProfileDoc = await buyerProfileRef.get();
-    const buyerName = buyerProfileDoc.exists
-      ? (buyerProfileDoc.data().displayName || "Buyer")
-      : "Buyer";
+    let buyerName = buyerProfileDoc.exists
+      ? (buyerProfileDoc.data().displayName || null)
+      : null;
+    if (!buyerName) {
+      const buyerAuth = await admin.auth().getUser(uid);
+      buyerName = buyerAuth.displayName || "Buyer";
+    }
 
     // 6. Create order doc first (need ID for PI metadata)
     const orderRef = db.collection("artifacts").doc(APP_ID)
       .collection("orders").doc();
     const orderId = orderRef.id;
 
-    // 7. Create Stripe PaymentIntent (with 3D Secure for liability shift)
+    // 7. Create Stripe PaymentIntent (with 3D Secure for liability shift).
+    // capture_method: "manual" — Funds bleiben in Authorisierung bis
+    // markShipped (siehe Z. ~2227). Gibt Riftr ein 7-Tage-Buffer (Stripe-
+    // Limit) für Buyer-Protection zwischen Charge und tatsächlichem
+    // Transfer an Verkäufer.
     const paymentIntent = await stripe.paymentIntents.create({
       amount: totalCents,
       currency: "eur",
       capture_method: "manual",
       transfer_data: { destination: sellerStripeAccountId },
-      application_fee_amount: feeCents,
+      application_fee_amount: applicationFeeCents,
       payment_method_options: {
         card: { request_three_d_secure: "challenge" },
       },
@@ -1901,25 +2422,75 @@ exports.createPaymentIntent = onCall(
         orderId,
         buyerId: uid,
         sellerId,
+        sellerCount: String(sellerCount),
+        chargeIndex: String(chargeIndex),
+        cartSubtotalCents: String(cartSubtotalCents),
+        serviceFeeCents: String(serviceFeeForThisChargeCents),
+        platformCommissionCents: String(fees.platformCommissionCents),
+        commissionRate: String(fees.commissionRateUsed),
+        effectiveDelayDays: String(effectiveDelayDays),
         itemCount: String(orderItems.length),
         cardNames: orderItems.map(i => i.cardName).join(", ").substring(0, 500),
       },
+    }, {
+      // Idempotency-Key (Security-Audit Round 2, 2026-04-29): wenn der
+      // Buyer-Frontend-Call retried (Network-Glitch, App-Background-Resume)
+      // wuerde Stripe sonst ein 2. PI mit doppeltem Hold auf der Buyer-Karte
+      // erstellen. orderId ist server-generiert und unique pro Order, also
+      // sicher als Idempotency-Anker.
+      idempotencyKey: `pi-create-${orderId}`,
     });
 
-    // 8. Write order doc
+    // 8. Build seller address from seller profile (for buyer to see)
+    const sellerProfileData = sellerDoc.data();
+    const sellerAddr = sellerProfileData.address || {};
+    const sellerAddress = {
+      name: sellerProfileData.displayName || listingData[0].sellerName || null,
+      ...(sellerAddr.street ? { street: sellerAddr.street } : {}),
+      ...(sellerAddr.city ? { city: sellerAddr.city } : {}),
+      ...(sellerAddr.zip ? { zip: sellerAddr.zip } : {}),
+      ...(sellerAddr.country ? { country: sellerAddr.country } : { country: listingData[0].sellerCountry || "" }),
+    };
+
+    // 9. Write order doc — neue Cents-basierte Felder + Legacy-EUR-Felder
+    //    fürs Frontend (parallel führen bis Frontend migriert ist).
     await orderRef.set({
       buyerId: uid,
       sellerId,
       sellerStripeAccountId,
       items: orderItems,
+
+      // Legacy EUR-Felder (Frontend kompatibel)
       subtotal,
       platformFee,
+      buyerServiceFee,
+      feePayer,
       shippingCost,
       totalPaid,
       sellerPayout,
+
+      // Neue Cents-Felder (Source of Truth für Buchhaltung)
+      cartSubtotalCents,
+      shippingCents,
+      serviceFeeCents: serviceFeeForThisChargeCents,
+      platformCommissionCents: fees.platformCommissionCents,
+      totalApplicationFeeCents: applicationFeeCents,
+      totalChargeCents: totalCents,
+      sellerPayoutCents,
+      commissionRateUsed: fees.commissionRateUsed,
+
+      // Multi-Seller-Cart-Tracking
+      sellerCount,
+      chargeIndex,
+
+      // Tier / Auszahlungs-Info (Snapshot zum Order-Zeitpunkt)
+      effectiveDelayDays,
+
       shippingAddress,
+      sellerAddress,
       shippingMethod: effectiveMethod,
       stripePaymentIntentId: paymentIntent.id,
+      paymentMethod: "stripe", // Phase-2 Pfad — Direct Charges + transfer_data
       status: "pending_payment",
       sellerName: listingData[0].sellerName || null,
       buyerName,
@@ -1928,22 +2499,718 @@ exports.createPaymentIntent = onCall(
     });
 
     // 9. Reserve quantity on all listings
+    // If items were cart-reserved, reservedQty is already set — don't double-count.
     for (let i = 0; i < cartEntries.length; i++) {
       const entry = cartEntries[i];
       const listing = listingData[i];
       const ref = listingRefs[i];
       const qty = entry.quantity || 1;
-      const newReserved = (listing.reservedQty || 0) + qty;
-      const updateData = { reservedQty: newReserved };
-      if (newReserved >= listing.quantity) {
-        updateData.status = "reserved";
+
+      const cartResRef = db.collection("artifacts").doc(APP_ID)
+        .collection("users").doc(uid)
+        .collection("cartReservations").doc(entry.listingId);
+      const cartResDoc = await cartResRef.get();
+
+      if (cartResDoc.exists) {
+        await cartResRef.delete();
+        if ((listing.reservedQty || 0) >= listing.quantity) {
+          await ref.update({ status: "reserved" });
+        }
+      } else {
+        const newReserved = (listing.reservedQty || 0) + qty;
+        const updateData = { reservedQty: newReserved };
+        if (newReserved >= listing.quantity) {
+          updateData.status = "reserved";
+        }
+        await ref.update(updateData);
       }
-      await ref.update(updateData);
     }
 
     console.log(`Order ${orderId} created: €${totalPaid} (${orderItems.length} items, PI: ${paymentIntent.id})`);
     return { clientSecret: paymentIntent.client_secret, orderId, total: totalPaid };
   }
+);
+
+/**
+ * cancelPendingOrder — Callable, authenticated.
+ *
+ * Cleanup-Pfad fuer abgebrochene Buy-Flows: Frontend ruft das auf wenn der
+ * User das Stripe-PaymentSheet schliesst ohne zu zahlen. Cancelt die Stripe-
+ * PaymentIntent, flippt Order → cancelled, gibt Listing-Reservation frei.
+ *
+ * Idempotent: bei Order != pending_payment (= bereits paid oder cancelled)
+ * gibt's einfach `alreadyHandled: true` zurueck, kein Throw.
+ *
+ * Defensiver Webhook-Handler `payment_intent.canceled` macht parallel
+ * dasselbe — falls App crashed bevor das hier feuert, oder Stripe das PI
+ * intern cancellt (z.B. Auto-Expiry).
+ */
+exports.cancelPendingOrder = onCall(
+  { region: "europe-west1", timeoutSeconds: 15, secrets: ["STRIPE_SECRET_KEY"] },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Must be signed in");
+    }
+    const uid = request.auth.uid;
+    const { orderId } = request.data;
+    if (!orderId) {
+      throw new HttpsError("invalid-argument", "orderId is required");
+    }
+
+    const orderRef = db.collection("artifacts").doc(APP_ID)
+      .collection("orders").doc(orderId);
+    const orderDoc = await orderRef.get();
+    if (!orderDoc.exists) {
+      throw new HttpsError("not-found", "Order not found");
+    }
+
+    const order = orderDoc.data();
+    if (order.buyerId !== uid) {
+      throw new HttpsError("permission-denied", "Not your order");
+    }
+    if (order.status !== "pending_payment") {
+      // Bereits behandelt (paid/cancelled/refunded) — silently no-op.
+      return { alreadyHandled: true, status: order.status };
+    }
+
+    // Stripe PI cancel — idempotent, ignoriert wenn schon cancelled
+    if (order.stripePaymentIntentId) {
+      const stripe = getStripe();
+      try {
+        await stripe.paymentIntents.cancel(order.stripePaymentIntentId);
+      } catch (e) {
+        // PI may already be cancelled, or in a terminal state — log + continue
+        console.warn(`cancelPendingOrder: PI ${order.stripePaymentIntentId} cancel skipped: ${e.message}`);
+      }
+    }
+
+    // Order → cancelled
+    await orderRef.update({
+      status: "cancelled",
+      cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
+      cancelReason: "user_dismissed_payment_sheet",
+    });
+
+    // Listing-Reservations freigeben (Mirror der Logik im
+    // payment_intent.payment_failed Webhook-Handler).
+    for (const item of (order.items || [])) {
+      if (!item.listingId) continue;
+      const listingRef = db.collection("artifacts").doc(APP_ID)
+        .collection("listings").doc(item.listingId);
+      const listingDoc = await listingRef.get();
+      if (!listingDoc.exists) continue;
+      const listing = listingDoc.data();
+      const newReserved = Math.max(0, (listing.reservedQty || 0) - (item.quantity || 1));
+      const updateData = { reservedQty: newReserved };
+      if (listing.status === "reserved") updateData.status = "active";
+      await listingRef.update(updateData);
+    }
+
+    console.log(`cancelPendingOrder: order ${orderId} cancelled by buyer ${uid}`);
+    return { success: true };
+  }
+);
+
+// ═══════════════════════════════════════════
+// ─── Phase 4: Multi-Seller-Cart Pfad ───
+// ═══════════════════════════════════════════
+//
+// Architektur (siehe CLAUDE.md → Multi-Seller-Cart Implementation):
+//
+//   1. Buyer tappt „Pay" im BulkCheckoutSheet
+//   2. Frontend ruft `setupCardForCart` → SetupIntent mit 3DS-upfront-challenge
+//   3. Frontend zeigt Stripe-PaymentSheet; User gibt Karte ein, 3DS authoriziert
+//   4. Frontend bekommt `paymentMethodId` aus dem confirmed SetupIntent
+//   5. Frontend ruft `processMultiSellerCart({ paymentMethodId, items, ... })`
+//   6. Backend Loop: pro Seller-Group ein PI mit off_session+confirm+manual-capture
+//   7. Bei Erfolg: alle Orders in `pending_payment` (Webhook flippt auf `paid`)
+//   8. Bei Teilfehler: alle vorherigen PIs `paymentIntents.cancel`-Rollback
+//      (kein refunds.create noetig — manual-capture-PIs sind in
+//       `requires_capture`, kein Geld floss; cancel gibt Auth wieder frei)
+//
+// Service-Gebuehr (multi-seller): base + 30 × (N-1) Cents, NUR auf den ersten
+// PI gepackt (chargeIndex=0). Andere PIs tragen nur ihre eigene Provision.
+// Siehe `calculateOrderFees(cartSubtotalCents, sellerCount)`.
+
+/**
+ * setupCardForCart — Callable, authenticated.
+ *
+ * Erstellt einen SetupIntent fuer eine Multi-Seller-Cart-Session. Der Buyer
+ * authoriziert seine Karte einmal (mit 3DS-Challenge), der resultierende
+ * `payment_method` ist dann fuer die folgenden off_session PaymentIntents
+ * verwendbar.
+ *
+ * Returns: `{ clientSecret, customerId }` — Frontend nutzt clientSecret
+ * fuer `Stripe.confirmSetupIntent`, danach gehoert die `payment_method`
+ * dauerhaft zum Stripe-Customer (= reusable fuer kuenftige Multi-Seller-Carts).
+ */
+exports.setupCardForCart = onCall(
+  { region: "europe-west1", timeoutSeconds: 15, secrets: ["STRIPE_SECRET_KEY"] },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Must be signed in");
+    }
+    const uid = request.auth.uid;
+    const stripe = getStripe();
+    const customerId = await ensureStripeCustomer(uid);
+
+    const setupIntent = await stripe.setupIntents.create({
+      customer: customerId,
+      payment_method_types: ["card"],
+      usage: "off_session",
+      payment_method_options: {
+        card: { request_three_d_secure: "challenge" },
+      },
+      metadata: { uid, type: "multi_seller_cart_setup" },
+    });
+
+    console.log(`setupCardForCart: SetupIntent ${setupIntent.id} for ${uid}`);
+    return {
+      clientSecret: setupIntent.client_secret,
+      setupIntentId: setupIntent.id,
+      customerId,
+    };
+  },
+);
+
+/**
+ * processMultiSellerCart — Callable, authenticated.
+ *
+ * Verarbeitet einen Multi-Seller-Cart sequenziell: pro Verkaeufer-Gruppe ein
+ * PaymentIntent mit `off_session: true, confirm: true, capture_method: "manual"`.
+ * Bei Teilfehler werden alle vorherigen PIs auto-cancelled (Auth-Release —
+ * kein Geld floss).
+ *
+ * Body params:
+ *   - paymentMethodId: string  — vom SetupIntent confirmed
+ *   - items: Array<{listingId, quantity}>  — alle Items im Cart, gemixt
+ *   - shippingMethod: string  — "letter" | "tracked" | "insured"
+ *   - shippingAddress: object  — { name, street, city, zip, country }
+ *
+ * Returns:
+ *   { status: "all_succeeded", orderIds: string[] }  — Erfolg
+ *   ODER throws HttpsError mit details bei Teilfehler.
+ *
+ * Single-Seller-Cart wird explizit abgewiesen — der Buyer muss
+ * `createPaymentIntent` (= das CheckoutSheet-Pfad) nutzen.
+ */
+exports.processMultiSellerCart = onCall(
+  { region: "europe-west1", timeoutSeconds: 60, secrets: ["STRIPE_SECRET_KEY"] },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Must be signed in");
+    }
+    const uid = request.auth.uid;
+
+    // Rate-Limit (Round 5, 2026-04-29): 30/User/Tag. Multi-Seller-Cart
+    // ist teurer als Single (N PIs in einer CF), niedrigeres Limit.
+    // Heavy-Buyer real-world: vielleicht 5-10/Tag (selten mehr als 3-5
+    // Multi-Seller-Carts pro Tag). 30 = 3x headroom.
+    await enforceRateLimit(uid, "processMultiSellerCart", 30);
+
+    const {
+      setupIntentId,
+      items,
+      shippingMethod,
+      shippingAddress,
+    } = request.data;
+
+    if (!setupIntentId || typeof setupIntentId !== "string") {
+      throw new HttpsError("invalid-argument", "setupIntentId required");
+    }
+    if (!shippingMethod || !shippingAddress) {
+      throw new HttpsError("invalid-argument", "Missing shipping info");
+    }
+
+    // Round 6 (2026-04-29): items dedupe + size-cap.
+    // Rejected: duplicate listingIds (Over-Allocation), arrays > 100,
+    // negative/missing quantities. Aggregiert quantities pro listingId.
+    const validatedItems = dedupeAndValidateItems(items);
+
+    // Resolve paymentMethodId server-side via SetupIntent — Frontend kennt
+    // den PM-Wert nicht direkt nach dem PaymentSheet (Flutter-Stripe-SDK
+    // exposed das nicht idiomatisch). SetupIntent muss vom uid auth'd sein
+    // und im status `succeeded`, sonst reject.
+    const stripe = getStripe();
+    const si = await stripe.setupIntents.retrieve(setupIntentId);
+    if (si.metadata?.uid !== uid) {
+      throw new HttpsError("permission-denied", "SetupIntent does not belong to caller");
+    }
+    if (si.status !== "succeeded") {
+      throw new HttpsError(
+        "failed-precondition",
+        `SetupIntent status is ${si.status}, expected succeeded`,
+      );
+    }
+    const paymentMethodId = si.payment_method;
+    if (!paymentMethodId || typeof paymentMethodId !== "string") {
+      throw new HttpsError(
+        "failed-precondition",
+        "SetupIntent has no payment method attached",
+      );
+    }
+
+    // 1. Fetch all listings + group by seller (uses validatedItems for dedupe-safety)
+    const listingsBySeller = new Map(); // sellerId -> [{ listingId, quantity, listing }]
+    for (const entry of validatedItems) {
+      const listingRef = db.collection("artifacts").doc(APP_ID)
+        .collection("listings").doc(entry.listingId);
+      const listingDoc = await listingRef.get();
+      if (!listingDoc.exists) {
+        throw new HttpsError("not-found", `Listing ${entry.listingId} not found`);
+      }
+      const listing = listingDoc.data();
+      if (listing.status !== "active" && listing.status !== "reserved") {
+        throw new HttpsError(
+          "failed-precondition",
+          `Listing ${entry.listingId} is not active`,
+        );
+      }
+      // Phase 4 Bugfix (2026-04-28): User-eigene Cart-Reservation aus
+      // `reservedQty` rausrechnen, sonst blockiert sich der Buyer selbst.
+      // Cart-Service reserviert beim Add-to-Cart → reservedQty++. Beim
+      // Checkout-Validate muss diese Reservation explizit nicht-blockend
+      // sein. Single-Seller-Pfad (createPaymentIntent) hat denselben
+      // Bug — wird parallel gefixed.
+      const cartResRef = db.collection("artifacts").doc(APP_ID)
+        .collection("users").doc(uid)
+        .collection("cartReservations").doc(entry.listingId);
+      const cartResDoc = await cartResRef.get();
+      const ownCartReservedQty = cartResDoc.exists
+        ? (cartResDoc.data().quantity || cartResDoc.data().qty || 0)
+        : 0;
+      const otherReservedQty = Math.max(0, (listing.reservedQty || 0) - ownCartReservedQty);
+      const available = listing.quantity - otherReservedQty;
+      if ((entry.quantity || 1) > available) {
+        throw new HttpsError(
+          "failed-precondition",
+          `Not enough qty for ${listing.cardName}`,
+        );
+      }
+      const sellerId = listing.sellerId;
+      if (!listingsBySeller.has(sellerId)) {
+        listingsBySeller.set(sellerId, []);
+      }
+      listingsBySeller.get(sellerId).push({
+        listingId: entry.listingId,
+        quantity: entry.quantity || 1,
+        listing,
+        ownCartReservedQty, // fuer spaetere Reservierungs-Logik
+      });
+    }
+
+    if (listingsBySeller.size < 2) {
+      throw new HttpsError(
+        "invalid-argument",
+        "Multi-seller cart requires items from 2+ sellers — use createPaymentIntent for single-seller.",
+      );
+    }
+
+    // SELF-BUY-CHECK
+    if (listingsBySeller.has(uid)) {
+      throw new HttpsError(
+        "permission-denied",
+        "Cannot buy your own listings",
+      );
+    }
+
+    const sellerCount = listingsBySeller.size;
+    const sellerIds = Array.from(listingsBySeller.keys());
+    const buyerCountry = (shippingAddress.country || "").toUpperCase();
+
+    // 2. Pre-fetch all sellers' Stripe accounts + verify capabilities
+    const sellerStripeIds = new Map(); // sellerId -> stripeAccountId
+    const sellerNames = new Map();
+    const sellerAddresses = new Map();
+
+    for (const sellerId of sellerIds) {
+      const sellerProfRef = db.collection("artifacts").doc(APP_ID)
+        .collection("users").doc(sellerId)
+        .collection("data").doc("sellerProfile");
+      const sellerProfDoc = await sellerProfRef.get();
+      if (!sellerProfDoc.exists || !sellerProfDoc.data().stripeAccountId) {
+        throw new HttpsError(
+          "failed-precondition",
+          `Seller ${sellerId} has no Stripe account`,
+        );
+      }
+      const stripeAccountId = sellerProfDoc.data().stripeAccountId;
+      // Verify capabilities (skip if known-active to save API calls; for safety check first time)
+      const sellerAccount = await stripe.accounts.retrieve(stripeAccountId);
+      if (!sellerAccount.charges_enabled || !sellerAccount.details_submitted) {
+        throw new HttpsError(
+          "failed-precondition",
+          `Seller ${sellerId} Stripe account is not fully onboarded.`,
+        );
+      }
+      sellerStripeIds.set(sellerId, stripeAccountId);
+      const sellerProfData = sellerProfDoc.data();
+      const sellerAddr = sellerProfData.address || {};
+      sellerNames.set(
+        sellerId,
+        sellerProfData.displayName ||
+          listingsBySeller.get(sellerId)[0].listing.sellerName ||
+          null,
+      );
+      sellerAddresses.set(sellerId, {
+        name: sellerProfData.displayName ||
+          listingsBySeller.get(sellerId)[0].listing.sellerName ||
+          null,
+        ...(sellerAddr.street ? { street: sellerAddr.street } : {}),
+        ...(sellerAddr.city ? { city: sellerAddr.city } : {}),
+        ...(sellerAddr.zip ? { zip: sellerAddr.zip } : {}),
+        ...(sellerAddr.country ? { country: sellerAddr.country } : {
+          country: listingsBySeller.get(sellerId)[0].listing.sellerCountry || "",
+        }),
+      });
+    }
+
+    // 3. Buyer info
+    const buyerProfRef = db.collection("artifacts").doc(APP_ID)
+      .collection("users").doc(uid).collection("data").doc("profile");
+    const buyerProfDoc = await buyerProfRef.get();
+    let buyerName = buyerProfDoc.exists
+      ? (buyerProfDoc.data().displayName || null)
+      : null;
+    if (!buyerName) {
+      const buyerAuth = await admin.auth().getUser(uid);
+      buyerName = buyerAuth.displayName || "Buyer";
+    }
+    const customerId = await ensureStripeCustomer(uid);
+
+    // 4. Build per-seller groups with computed amounts
+    const cartGroups = sellerIds.map((sellerId, idx) => {
+      const picks = listingsBySeller.get(sellerId);
+      const sellerCountry = picks[0].listing.sellerCountry || "";
+      const anyInsured = picks.some((p) => p.listing.insuredOnly);
+      const effectiveMethod = anyInsured ? "insured" : shippingMethod;
+      const shippingCost = round2(getShippingRate(sellerCountry, buyerCountry, effectiveMethod));
+
+      let cardSubtotal = 0;
+      const orderItems = [];
+      for (const p of picks) {
+        const lineTotal = round2(p.listing.price * p.quantity);
+        cardSubtotal += lineTotal;
+        orderItems.push({
+          listingId: p.listingId,
+          cardId: p.listing.cardId || "",
+          cardName: p.listing.cardName || "",
+          imageUrl: p.listing.imageUrl || null,
+          condition: p.listing.condition || "NM",
+          quantity: p.quantity,
+          pricePerCard: p.listing.price,
+          ...(p.listing.setCode ? { setCode: p.listing.setCode } : {}),
+          ...(p.listing.collectorNumber ? { collectorNumber: p.listing.collectorNumber } : {}),
+          ...(p.listing.language ? { language: p.listing.language } : {}),
+          ...(p.listing.isFoil ? { isFoil: true } : {}),
+        });
+      }
+      cardSubtotal = round2(cardSubtotal);
+
+      const cartSubtotalCents = Math.round(cardSubtotal * 100);
+      const shippingCents = Math.round(shippingCost * 100);
+      const fees = calculateOrderFees(cartSubtotalCents, sellerCount);
+      const serviceFeeForThisChargeCents = idx === 0 ? fees.serviceFeeCents : 0;
+      const applicationFeeCents = serviceFeeForThisChargeCents + fees.platformCommissionCents;
+      const totalCents = cartSubtotalCents + shippingCents + serviceFeeForThisChargeCents;
+      const sellerPayoutCents = cartSubtotalCents - fees.platformCommissionCents + shippingCents;
+
+      return {
+        sellerId,
+        sellerStripeAccountId: sellerStripeIds.get(sellerId),
+        chargeIndex: idx,
+        items: orderItems,
+        cardSubtotal,
+        cartSubtotalCents,
+        shippingCost,
+        shippingCents,
+        effectiveMethod,
+        platformCommissionCents: fees.platformCommissionCents,
+        commissionRateUsed: fees.commissionRateUsed,
+        serviceFeeForThisChargeCents,
+        applicationFeeCents,
+        totalCents,
+        sellerPayoutCents,
+        sellerCountry,
+        anyInsured,
+      };
+    });
+
+    // 5. Sequential PI creation with rollback on first failure
+    const successful = []; // [{ pi, orderId, group }]
+
+    for (const group of cartGroups) {
+      const orderRef = db.collection("artifacts").doc(APP_ID)
+        .collection("orders").doc();
+      const orderId = orderRef.id;
+
+      // Reserve listings BEFORE PI creation so concurrent buyers see reserved
+      // qty even before Stripe call returns.
+      //
+      // Phase 4 (2026-04-28) cart-res-aware fix: Wenn der User schon eine
+      // Cart-Reservation fuer ein Listing hat, ist die Order-Reservation ein
+      // Transfer (= reservedQty bleibt gleich, nur status flipt evtl. auf
+      // "reserved"). Sonst (= direct buy ohne vorherigen Cart-Add):
+      // increment reservedQty wie vorher.
+      //
+      // Das verhindert Ueber-Inkrementierung und das damit verbundene
+      // status="reserved"-stuck-Problem nach Rollback (siehe Test B Befund).
+      // Mirror der Logik in createPaymentIntent's Step 9 — beide Pfade
+      // muessen identisch sein damit die Reservation-Semantik konsistent ist.
+      const listingUpdates = [];
+      for (const item of group.items) {
+        const listingRef = db.collection("artifacts").doc(APP_ID)
+          .collection("listings").doc(item.listingId);
+        const listingDoc = await listingRef.get();
+        if (!listingDoc.exists) continue;
+        const listing = listingDoc.data();
+
+        const cartResRef = db.collection("artifacts").doc(APP_ID)
+          .collection("users").doc(uid)
+          .collection("cartReservations").doc(item.listingId);
+        const cartResDoc = await cartResRef.get();
+
+        if (cartResDoc.exists) {
+          // Cart-reserved → order-reserve ist Transfer. Keine reservedQty-Aenderung.
+          // Status nur flippen wenn voll-reserviert + bisher nicht-reserved.
+          const updateData = {};
+          if ((listing.reservedQty || 0) >= listing.quantity &&
+              listing.status !== "reserved") {
+            updateData.status = "reserved";
+          }
+          if (Object.keys(updateData).length > 0) {
+            await listingRef.update(updateData);
+          }
+          listingUpdates.push({
+            ref: listingRef,
+            wasCartReserved: true,
+            cartResRef,
+            prevStatus: listing.status,
+            statusChanged: !!updateData.status,
+            qtyAdded: 0,
+          });
+        } else {
+          // Direct order-reserve: increment.
+          const newReserved = (listing.reservedQty || 0) + item.quantity;
+          const updateData = { reservedQty: newReserved };
+          if (newReserved >= listing.quantity) updateData.status = "reserved";
+          await listingRef.update(updateData);
+          listingUpdates.push({
+            ref: listingRef,
+            wasCartReserved: false,
+            cartResRef: null,
+            prevStatus: listing.status,
+            statusChanged: false,
+            qtyAdded: item.quantity,
+          });
+        }
+      }
+
+      // Compute effectiveDelayDays for this seller
+      const sellerProfRef = db.collection("artifacts").doc(APP_ID)
+        .collection("users").doc(group.sellerId)
+        .collection("data").doc("sellerProfile");
+      const sellerProfDoc = await sellerProfRef.get();
+      const sellerProfData = sellerProfDoc.exists ? sellerProfDoc.data() : {};
+      const effectiveDelayDays = getEffectiveDelayDays(sellerProfData, group.totalCents);
+
+      // EUR floats for legacy fields
+      const platformFee = group.platformCommissionCents / 100;
+      const buyerServiceFee = group.serviceFeeForThisChargeCents / 100;
+      const totalPaid = group.totalCents / 100;
+      const sellerPayout = group.sellerPayoutCents / 100;
+      const subtotal = group.cardSubtotal;
+
+      let pi;
+      try {
+        pi = await stripe.paymentIntents.create({
+          amount: group.totalCents,
+          currency: "eur",
+          customer: customerId,
+          payment_method: paymentMethodId,
+          off_session: true,
+          confirm: true,
+          capture_method: "manual",
+          transfer_data: { destination: group.sellerStripeAccountId },
+          application_fee_amount: group.applicationFeeCents,
+          metadata: {
+            orderId,
+            buyerId: uid,
+            sellerId: group.sellerId,
+            sellerCount: String(sellerCount),
+            chargeIndex: String(group.chargeIndex),
+            cartSubtotalCents: String(group.cartSubtotalCents),
+            serviceFeeCents: String(group.serviceFeeForThisChargeCents),
+            platformCommissionCents: String(group.platformCommissionCents),
+            commissionRate: String(group.commissionRateUsed),
+            effectiveDelayDays: String(effectiveDelayDays),
+            multiSellerGroup: "true",
+            cardNames: group.items.map((i) => i.cardName).join(", ").substring(0, 500),
+          },
+        }, {
+          // Idempotency-Key (Security-Audit Round 2, 2026-04-29): pro
+          // Multi-Seller-Group eindeutig — orderId ist server-generiert und
+          // unique pro Order/Group. Verhindert Doppel-Charge bei Retry.
+          idempotencyKey: `pi-create-${orderId}`,
+        });
+      } catch (err) {
+        // Rollback: cancel listing reservations for THIS group + all successful PIs
+        console.error(
+          `processMultiSellerCart: PI failed at chargeIndex ${group.chargeIndex}: ${err.message}`,
+        );
+        for (const lu of listingUpdates) {
+          // revert listing reservation back
+          const listingRef = lu.ref;
+          const listingDoc = await listingRef.get();
+          if (!listingDoc.exists) continue;
+          const listing = listingDoc.data();
+
+          if (lu.wasCartReserved) {
+            // Cart-reserved Transfer: reservedQty bleibt unveraendert.
+            // Nur status zurueck setzen wenn wir ihn geaendert haben.
+            if (lu.statusChanged) {
+              await listingRef.update({ status: lu.prevStatus });
+            }
+          } else {
+            // Direct order-reserve: decrement reservedQty.
+            const newReserved = Math.max(
+              0,
+              (listing.reservedQty || 0) - lu.qtyAdded,
+            );
+            const updateData = { reservedQty: newReserved };
+            if (listing.status === "reserved" && newReserved < listing.quantity) {
+              updateData.status = "active";
+            }
+            await listingRef.update(updateData);
+          }
+        }
+
+        // Cancel previous successful PIs (manual-capture = paymentIntents.cancel
+        // releases auth, no money flow, no Stripe fee).
+        for (const s of successful) {
+          try {
+            await stripe.paymentIntents.cancel(s.pi.id);
+            await s.orderRef.update({
+              status: "cancelled",
+              cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
+              cancelReason: "multi_seller_rollback",
+            });
+            // Release listings for the cancelled order
+            for (const item of (s.group.items || [])) {
+              const lref = db.collection("artifacts").doc(APP_ID)
+                .collection("listings").doc(item.listingId);
+              const ldoc = await lref.get();
+              if (!ldoc.exists) continue;
+              const ldata = ldoc.data();
+              const newR = Math.max(0, (ldata.reservedQty || 0) - item.quantity);
+              const ud = { reservedQty: newR };
+              if (ldata.status === "reserved" && newR < ldata.quantity) {
+                ud.status = "active";
+              }
+              await lref.update(ud);
+            }
+            console.log(`Rolled back: PI ${s.pi.id}, order ${s.orderId}`);
+          } catch (rollbackErr) {
+            console.error(
+              `Rollback error for PI ${s.pi.id}: ${rollbackErr.message}`,
+            );
+          }
+        }
+
+        // Phase 4 (2026-04-28) Toast-Polish: User-facing Texte ohne
+        // Implementation-Details (kein "seller 1/2", kein "decline_code").
+        // Decline-Code-Mapping fuer die haeufigsten Faelle, sonst generisch.
+        if (err.code === "authentication_required") {
+          throw new HttpsError(
+            "failed-precondition",
+            "Your card needs an extra verification step. Please try again.",
+          );
+        }
+        if (err.code === "card_declined") {
+          // Decline-Code-Mapping zu nuetzlichen User-Hinweisen
+          const declineMessages = {
+            insufficient_funds: "Card has insufficient funds. Please try a different card.",
+            lost_card: "This card was reported lost. Please use another card.",
+            stolen_card: "This card cannot be used. Please use another card.",
+            expired_card: "Card is expired. Please use another card.",
+            incorrect_cvc: "Incorrect security code (CVC). Please check and try again.",
+            processing_error: "Card processing error. Please try again or use another card.",
+          };
+          const msg = declineMessages[err.decline_code] ||
+            "Your card was declined. Please try a different card.";
+          throw new HttpsError("failed-precondition", msg);
+        }
+
+        // Generischer Fallback — keine Implementation-Details leaken
+        throw new HttpsError(
+          "aborted",
+          "Payment couldn't be completed. Please try again.",
+        );
+      }
+
+      // PI created successfully — write order doc
+      await orderRef.set({
+        buyerId: uid,
+        sellerId: group.sellerId,
+        sellerStripeAccountId: group.sellerStripeAccountId,
+        items: group.items,
+        // Legacy EUR
+        subtotal,
+        platformFee,
+        buyerServiceFee,
+        feePayer: "split",
+        shippingCost: group.shippingCost,
+        totalPaid,
+        sellerPayout,
+        // Cents
+        cartSubtotalCents: group.cartSubtotalCents,
+        shippingCents: group.shippingCents,
+        serviceFeeCents: group.serviceFeeForThisChargeCents,
+        platformCommissionCents: group.platformCommissionCents,
+        totalApplicationFeeCents: group.applicationFeeCents,
+        totalChargeCents: group.totalCents,
+        sellerPayoutCents: group.sellerPayoutCents,
+        commissionRateUsed: group.commissionRateUsed,
+        sellerCount,
+        chargeIndex: group.chargeIndex,
+        effectiveDelayDays,
+        shippingAddress,
+        sellerAddress: sellerAddresses.get(group.sellerId),
+        shippingMethod: group.effectiveMethod,
+        stripePaymentIntentId: pi.id,
+        paymentMethod: "stripe",
+        status: "pending_payment",
+        sellerName: sellerNames.get(group.sellerId),
+        buyerName,
+        preReleaseDate: listingsBySeller.get(group.sellerId)[0].listing.preReleaseDate || null,
+        multiSellerGroupSize: sellerCount,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      // Phase 4 (2026-04-28) cart-res-cleanup: Cart-Reservation-Docs werden
+      // nach erfolgreichem Order-Doc-Write geloescht. Cart-Service ueber-
+      // wacht diese Docs fuers Cart-State-Display; mit Order-Reserve sind
+      // sie funktional ueberfluessig. Best-effort (delete-not-found ist OK).
+      for (const lu of listingUpdates) {
+        if (lu.wasCartReserved && lu.cartResRef) {
+          try {
+            await lu.cartResRef.delete();
+          } catch (_) { /* not-found = already gone */ }
+        }
+      }
+
+      successful.push({ pi, orderId, orderRef, group });
+      console.log(
+        `processMultiSellerCart: ${group.chargeIndex + 1}/${sellerCount} PI ${pi.id} order ${orderId} (${group.totalCents}ct)`,
+      );
+    }
+
+    return {
+      status: "all_succeeded",
+      orderIds: successful.map((s) => s.orderId),
+      sellerCount,
+    };
+  },
 );
 
 /**
@@ -1987,8 +3254,14 @@ exports.markShipped = onCall(
       }
     }
 
-    // Capture the PaymentIntent (only for Stripe-paid orders, not balance purchases)
-    if (order.paymentMethod !== "balance" && order.stripePaymentIntentId) {
+    // Capture the PaymentIntent. Triggers `payment_intent.succeeded` webhook
+    // (idempotent — order already in "paid" via amount_capturable_updated).
+    // Funds get released from auth-hold and start the delay_days clock for
+    // payout to the seller's Connect account.
+    //
+    // Legacy `paymentMethod === "balance"` orders (pre-Phase-2) had no
+    // PaymentIntent — `order.stripePaymentIntentId` is the gate.
+    if (order.stripePaymentIntentId) {
       const stripe = getStripe();
       await stripe.paymentIntents.capture(order.stripePaymentIntentId);
     }
@@ -2017,7 +3290,7 @@ exports.markShipped = onCall(
 
     // Notify buyer that order shipped
     const shipSummary = orderItemsSummary(order.items);
-    sendNotification(order.buyerId, "Order shipped!", `${shipSummary} is on its way.${trackingNumber ? " Tracking: " + trackingNumber : ""}`);
+    sendNotification(order.buyerId, "Order shipped!", `${shipSummary} is on its way.${trackingNumber ? " Tracking: " + trackingNumber : ""}`, { type: "order", orderId });
 
     return { success: true };
   }
@@ -2063,7 +3336,7 @@ exports.updateTrackingNumber = onCall(
     // Notify buyer
     if (trackingNumber) {
       const summary = orderItemsSummary(order.items);
-      sendNotification(order.buyerId, "Tracking updated", `${summary} — Tracking: ${trackingNumber}`);
+      sendNotification(order.buyerId, "Tracking updated", `${summary} — Tracking: ${trackingNumber}`, { type: "order", orderId: orderId });
     }
 
     console.log(`Order ${orderId} tracking updated: ${trackingNumber || "removed"}`);
@@ -2096,24 +3369,44 @@ exports.confirmDelivery = onCall(
       throw new HttpsError("not-found", "Order not found");
     }
 
-    const order = orderDoc.data();
-    if (order.buyerId !== uid) {
-      throw new HttpsError("permission-denied", "Only the buyer can confirm delivery");
+    // Race-Protection (Security-Audit Round 5, 2026-04-29):
+    // Vorher: separate read + check + update — race vs autoReleaseOrders
+    // bei dem beide Side-Effect-Loops laufen koennten (totalSales 2x,
+    // addItemsToCollection 2x → Buyer-Collection-Double, Seller-Stats inflated).
+    // Jetzt: atomarer state-flip in TX. Wenn autoReleaseOrders schon
+    // status=auto_completed gesetzt hat, schlaegt unsere TX fehl (status
+    // !== "shipped") und Side-Effects laufen NICHT. Nur die siegreiche
+    // CF triggert Side-Effects — Stats + Collection sind dann konsistent.
+    let order;
+    try {
+      order = await db.runTransaction(async (tx) => {
+        const fresh = await tx.get(orderRef);
+        if (!fresh.exists) throw new HttpsError("not-found", "Order not found");
+        const data = fresh.data();
+        if (data.buyerId !== uid) {
+          throw new HttpsError("permission-denied", "Only the buyer can confirm delivery");
+        }
+        if (data.status !== "shipped") {
+          throw new HttpsError("failed-precondition", `Order status is ${data.status}, expected shipped`);
+        }
+        tx.update(orderRef, {
+          status: "delivered",
+          deliveredAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        return data;
+      });
+    } catch (err) {
+      // HttpsError-instanceof check fuer richtige Fehlerweitergabe
+      if (err instanceof HttpsError) throw err;
+      throw new HttpsError("aborted", `confirmDelivery transaction failed: ${err.message}`);
     }
-    if (order.status !== "shipped") {
-      throw new HttpsError("failed-precondition", `Order status is ${order.status}, expected shipped`);
-    }
-
-    // Mark delivered
-    await orderRef.update({
-      status: "delivered",
-      deliveredAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
 
     // All post-status operations: if any fail, order stays delivered
     // but we log the error and still return success to the buyer
     try {
-      // Increment seller stats (set+merge so doc is created if missing)
+      // Increment seller stats (set+merge so doc is created if missing).
+      // totalSales = item count; completedSalesCount = order count (für
+      // Tier-System — siehe calculateDelayDays).
       const totalQty = (order.items || []).reduce((sum, item) => sum + (item.quantity || 1), 0);
       const sellerRef = db.collection("artifacts").doc(APP_ID)
         .collection("users").doc(order.sellerId)
@@ -2121,6 +3414,7 @@ exports.confirmDelivery = onCall(
       await sellerRef.set({
         totalSales: admin.firestore.FieldValue.increment(totalQty),
         totalRevenue: admin.firestore.FieldValue.increment(order.sellerPayout || 0),
+        completedSalesCount: admin.firestore.FieldValue.increment(1),
       }, { merge: true });
 
       // Record sale prices for analytics
@@ -2139,9 +3433,37 @@ exports.confirmDelivery = onCall(
 
       console.log(`Order ${orderId} delivered, seller ${order.sellerId} stats updated, balance cache refreshed`);
 
-      // Notify seller that delivery confirmed
+      // Phase 7: Push an Verkaeufer mit tier-aware Auszahlungs-Info.
+      // confirmDelivery setzt status=delivered. Capture lief schon bei
+      // markShipped, Geld ist in Stripe-Connect-Pending mit `delay_days`-
+      // Hold. Verkaeufer erfaehrt:
+      //   - Buyer hat Erhalt bestaetigt
+      //   - Plattform-Status: kein Streit moeglich mehr
+      //   - Auszahlung erfolgt automatisch nach delay_days (siehe Tier)
       const delSummary = orderItemsSummary(order.items);
-      sendNotification(order.sellerId, "Delivery confirmed!", `${delSummary} — €${(order.sellerPayout || 0).toFixed(2)} released.`);
+      const effDelay = order.effectiveDelayDays != null
+        ? order.effectiveDelayDays
+        : 7;
+      const dayLabel = effDelay === 1 ? "day" : "days";
+      sendNotification(
+        order.sellerId,
+        "Delivery confirmed!",
+        `${delSummary} — Käufer hat Erhalt bestätigt. Auszahlung in ${effDelay} ${dayLabel} (€${(order.sellerPayout || 0).toFixed(2)}).`,
+        { type: "order", orderId: orderId },
+      );
+
+      // Tier-Sync — abgeschlossener Verkauf kann Schwelle für Aufstieg
+      // überschreiten. Idempotent + error-safe (loggt nur).
+      try {
+        await syncSellerTier(order.sellerId);
+      } catch (err) {
+        console.error(`syncSellerTier after confirmDelivery failed for ${order.sellerId}:`, err.message);
+      }
+
+      // Public-Stats-Mirror — totalSales hat sich erhoeht, playerProfiles
+      // muss aktualisiert werden damit Listings/Social-Tab den neuen
+      // Wert sehen. (Security: PII bleibt im sellerProfile, nicht im Mirror.)
+      await syncPlayerProfile(order.sellerId);
     } catch (postErr) {
       console.error(`confirmDelivery post-status error for ${orderId}:`, postErr);
       // Don't throw — order IS delivered, buyer should see success
@@ -2150,6 +3472,135 @@ exports.confirmDelivery = onCall(
     return { success: true };
   }
 );
+
+// ═══════════════════════════════════════════
+// ─── Refund / Dispute Policy Engine (Phase 6) ───
+// ═══════════════════════════════════════════
+//
+// Single Source of Truth fuer Refund-Eligibility + Stripe-Refund-Parameter.
+// Wird von cancelOrder, acceptCancelOrder, respondToRefund und openDispute
+// aufgerufen. Differenzierte Service-Fee-Policy:
+//
+//   - Voll-Refund inkl. Service-Gebuehr (refund_application_fee: true) bei
+//     "klar Verkaeufer-Schuld":
+//       • not_arrived + (untracked OR tracked-no-trackingNumber)
+//       • wrong_card_received
+//       • damaged_in_shipping (NICHT insured)
+//
+//   - Teil-Refund OHNE Service-Gebuehr (refund_application_fee: false) bei:
+//       • Beliebigem percent < 100 (Verkaeufer hat geliefert, Streitfall)
+//       • Voll-Refund mit reason "wrong_condition" (Verkaeufer hat geliefert,
+//         aber in disputiertem Zustand)
+//
+//   - Reject (kein Refund) bei:
+//       • not_arrived + insured (Carrier-Pfad — Buyer reklamiert bei Versicherer)
+//
+// Alle Refunds nutzen `reverse_transfer: true` damit das Geld vom Verkaeufer-
+// Connect-Account zurueck zur Plattform gezogen wird (sonst absorbiert die
+// Plattform den vollen Refund-Betrag — kritischer Production-Bug pre-Phase-6).
+
+const REFUND_REASONS = {
+  NOT_ARRIVED: "not_arrived",
+  WRONG_CONDITION: "wrong_condition",
+  WRONG_CARD: "wrong_card",
+  DAMAGED: "damaged",
+};
+
+// Frontend `openDispute` sendet noch die alten Display-Labels — Mapping
+// zu Reason-Codes. Phase 7+ kann das Frontend auf Codes umstellen.
+const DISPUTE_REASON_TO_CODE = {
+  "Not arrived": REFUND_REASONS.NOT_ARRIVED,
+  "Wrong condition (worse than listed)": REFUND_REASONS.WRONG_CONDITION,
+  "Wrong card received": REFUND_REASONS.WRONG_CARD,
+  "Damaged in shipping": REFUND_REASONS.DAMAGED,
+};
+
+/**
+ * Evaluiert ob fuer eine Order + Reason ueberhaupt ein Plattform-Refund
+ * moeglich ist. Aktuell hauptsaechlich Insurance-Routing — Versicherte
+ * Sendungen die nicht ankommen werden zum Carrier weitergeleitet.
+ *
+ * @param {object} order — Order-Doc aus Firestore
+ * @param {string} reasonCode — REFUND_REASONS.* Wert
+ * @returns {{eligible: boolean, message?: string}}
+ */
+function evaluateRefundEligibility(order, reasonCode) {
+  // Insurance: bei not_arrived + insured -> Carrier-Pfad
+  if (
+    reasonCode === REFUND_REASONS.NOT_ARRIVED &&
+    order.shippingMethod === "insured"
+  ) {
+    return {
+      eligible: false,
+      message:
+        "Insured shipping covers loss — please file a claim with the carrier (Deutsche Post / DHL). " +
+        "Riftr does not process refunds for insured shipments.",
+    };
+  }
+  return { eligible: true };
+}
+
+/**
+ * Berechnet die Stripe-Refund-Parameter fuer eine konkrete Order +
+ * Reason + Percent. Differenzierte Service-Fee-Policy basierend auf Schuld.
+ *
+ * @param {object} order — Order-Doc aus Firestore
+ * @param {string} reasonCode — REFUND_REASONS.* Wert (oder null fuer cancel-Faelle)
+ * @param {number} refundPercent — 10-100; bei <100 immer service-fee-stays
+ * @returns {{
+ *   amount: number|null,        — Stripe-Refund-Amount in Cents (null = full PI amount)
+ *   refundApplicationFee: boolean,
+ *   reverseTransfer: boolean,
+ *   serviceFeeStaysWithPlatform: boolean,
+ *   refundedAmountEur: number,  — Was der Buyer tatsaechlich zurueck-bekommt
+ * }}
+ */
+function resolveRefundPolicy(order, reasonCode, refundPercent) {
+  const totalCents = Math.round((order.totalPaid || 0) * 100);
+  const serviceFeeCents =
+    order.serviceFeeCents != null
+      ? order.serviceFeeCents
+      : Math.round((order.buyerServiceFee || 0) * 100);
+
+  // "Klar Verkaeufer-Schuld" Klassifikator — Service-Fee zurueck zum Buyer.
+  const trackingNumber = order.trackingNumber || null;
+  const shippingMethod = order.shippingMethod;
+
+  const isClearSellerFault =
+    (reasonCode === REFUND_REASONS.NOT_ARRIVED &&
+      (shippingMethod === "letter" ||
+        (shippingMethod === "tracked" && !trackingNumber))) ||
+    reasonCode === REFUND_REASONS.WRONG_CARD ||
+    (reasonCode === REFUND_REASONS.DAMAGED && shippingMethod !== "insured");
+
+  // Voll-Refund + klar-Verkaeufer-Schuld: alles zurueck inkl. Service-Gebuehr
+  if (refundPercent >= 100 && isClearSellerFault) {
+    return {
+      amount: null, // null = full PI amount
+      refundApplicationFee: true,
+      reverseTransfer: true,
+      serviceFeeStaysWithPlatform: false,
+      refundedAmountEur: totalCents / 100,
+    };
+  }
+
+  // Teil-Refund ODER Voll-Refund-aber-Verkaeufer-hat-geliefert:
+  // Service-Gebuehr bleibt bei der Plattform, Rest wird (anteilig) refundet.
+  // Buyer-Refund-Amount = totalCents * percent/100, aber gecappt damit nie
+  // mehr als (totalCents - serviceFeeCents) refundet wird (= Service-Fee
+  // bleibt geschuetzt).
+  const proportional = Math.round((totalCents * refundPercent) / 100);
+  const maxNonServiceFee = totalCents - serviceFeeCents;
+  const finalAmount = Math.min(proportional, maxNonServiceFee);
+
+  return {
+    amount: finalAmount,
+    refundApplicationFee: false,
+    reverseTransfer: true,
+    serviceFeeStaysWithPlatform: true,
+    refundedAmountEur: finalAmount / 100,
+  };
+}
 
 /**
  * openDispute — Callable, buyer only.
@@ -2194,12 +3645,24 @@ exports.openDispute = onCall(
       throw new HttpsError("failed-precondition", `Order status is ${order.status}, expected shipped`);
     }
 
+    // Phase 6: Reason-Code-Mapping fuer Refund-Policy-Engine. Frontend sendet
+    // weiterhin Display-Labels — das Mapping ist serverseitig.
+    const reasonCode = DISPUTE_REASON_TO_CODE[reason];
+
+    // Phase 6: Insurance-Reject. Versicherte „Not arrived"-Faelle gehen zum
+    // Carrier (Deutsche Post / DHL), nicht zur Plattform-Schlichtung.
+    const eligibility = evaluateRefundEligibility(order, reasonCode);
+    if (!eligibility.eligible) {
+      throw new HttpsError("failed-precondition", eligibility.message);
+    }
+
     const safeDesc = typeof description === "string" ? description.trim().substring(0, 500) : null;
 
     await orderRef.update({
       status: "disputed",
       disputeStatus: "open",
       disputeReason: reason,
+      disputeReasonCode: reasonCode, // Phase 6: strukturierter Code fuer Policy
       ...(safeDesc ? { disputeDescription: safeDesc } : {}),
       disputedAt: admin.firestore.FieldValue.serverTimestamp(),
       autoReleaseAt: null, // Pause auto-release
@@ -2209,7 +3672,7 @@ exports.openDispute = onCall(
 
     // Notify seller about dispute
     const dispSummary = orderItemsSummary(order.items);
-    sendNotification(order.sellerId, "Dispute opened", `${dispSummary}: ${reason}`);
+    sendNotification(order.sellerId, "Dispute opened", `${dispSummary}: ${reason}`, { type: "order", orderId: orderId });
 
     return { success: true };
   }
@@ -2248,47 +3711,49 @@ exports.cancelOrder = onCall(
       throw new HttpsError("failed-precondition", "Order cannot be cancelled after shipping");
     }
 
-    const isBalanceOrder = order.paymentMethod === "balance";
+    // Phase 6 (2026-04-28): Legacy paymentMethod=balance Orders sind alle
+    // geloescht (114 Test-Orders). Code-Pfad nicht mehr supported — wenn doch
+    // einer durchkommt: explizite Fehlermeldung.
+    if (order.paymentMethod === "balance") {
+      throw new HttpsError(
+        "failed-precondition",
+        "Legacy balance order — please contact support.",
+      );
+    }
 
-    if (isBalanceOrder) {
-      // Balance order: refund buyer's wallet, deduct from seller's wallet
-      const stripe = getStripe();
-      const totalCents = Math.round((order.totalPaid || 0) * 100);
-      const sellerPayoutCents = Math.round((order.sellerPayout || 0) * 100);
+    const stripe = getStripe();
+    const piId = order.stripePaymentIntentId;
+    if (!piId) {
+      throw new HttpsError(
+        "failed-precondition",
+        "Order has no PaymentIntent — cannot cancel.",
+      );
+    }
 
-      // Refund buyer (add credit back)
-      const buyerCustId = await getStripeCustomerId(order.buyerId);
-      const buyerCust = await stripe.customers.retrieve(buyerCustId);
-      await stripe.customers.update(buyerCustId, {
-        balance: buyerCust.balance - totalCents,
-      });
-
-      // Deduct from seller (remove credit)
-      const sellerCustId = await getStripeCustomerId(order.sellerId);
-      const sellerCust = await stripe.customers.retrieve(sellerCustId);
-      await stripe.customers.update(sellerCustId, {
-        balance: sellerCust.balance + sellerPayoutCents,
-      });
-
-      // Log transactions
-      await logTransaction(order.buyerId, "refund", totalCents, orderId, "Order cancelled — refund");
-      await logTransaction(order.sellerId, "reversal", -sellerPayoutCents, orderId, "Order cancelled — reversal");
-    } else {
-      // Card order: Stripe refund/cancel
-      const stripe = getStripe();
-      const piId = order.stripePaymentIntentId;
-
-      if (order.status === "paid") {
-        await stripe.refunds.create({ payment_intent: piId });
-      } else {
-        await stripe.paymentIntents.cancel(piId);
-      }
+    // Phase 6: Pre-ship-Cancel ist KEIN Refund — es ist eine reine PI-
+    // Stornierung. Bei capture_method:"manual" (= unser Standard) ist die PI
+    // entweder requires_payment_method (pending_payment) oder requires_capture
+    // (paid, vor markShipped). Stripe.paymentIntents.cancel() funktioniert in
+    // beiden Faellen und gibt die Auth wieder frei — Plattform-neutral, kein
+    // Geld floss.
+    //
+    // Falls ein Order schon den Capture (= shipped) durch hatte, kommt
+    // dieser Pfad gar nicht zum Zug (status-Check oben blockiert).
+    try {
+      await stripe.paymentIntents.cancel(piId);
+    } catch (e) {
+      // Already cancelled / completed — safe to continue, weiter mit Order/
+      // Listing-Cleanup (idempotent).
+      console.warn(
+        `cancelOrder: PI ${piId} cancel skipped: ${e.message}`,
+      );
     }
 
     // Update order
     await orderRef.update({
       status: "cancelled",
       cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
+      cancelReason: "user_cancelled_pre_ship",
     });
 
     // Release listing reservation
@@ -2309,18 +3774,12 @@ exports.cancelOrder = onCall(
       }
     }
 
-    // Update balance caches for balance orders
-    if (isBalanceOrder) {
-      await updateBalanceCache(order.buyerId);
-      await updateBalanceCache(order.sellerId);
-    }
-
-    console.log(`Order ${orderId} cancelled by ${uid}`);
+    console.log(`Order ${orderId} cancelled pre-ship by ${uid}`);
 
     // Notify the other party
     const otherUid = uid === order.buyerId ? order.sellerId : order.buyerId;
     const cancelSummary = orderItemsSummary(order.items);
-    sendNotification(otherUid, "Order cancelled", `${cancelSummary} — refunded.`);
+    sendNotification(otherUid, "Order cancelled", `${cancelSummary} — refunded.`, { type: "order", orderId: orderId });
 
     return { success: true };
   }
@@ -2379,7 +3838,7 @@ exports.proposeRefund = onCall(
     console.log(`Seller ${uid} proposed ${percent}% refund (€${refundAmount.toFixed(2)}) on order ${orderId}`);
 
     const summary = orderItemsSummary(order.items);
-    sendNotification(order.buyerId, "Refund proposed", `${summary}: ${percent}% refund (€${refundAmount.toFixed(2)}) — review and accept or reject.`);
+    sendNotification(order.buyerId, "Refund proposed", `${summary}: ${percent}% refund (€${refundAmount.toFixed(2)}) — review and accept or reject.`, { type: "order", orderId });
 
     return { success: true, refundPercent: percent, refundAmount };
   }
@@ -2424,58 +3883,71 @@ exports.respondToRefund = onCall(
     const summary = orderItemsSummary(order.items);
 
     if (accept) {
-      // WALLET REFUND: Transfer balance from seller → buyer (no Stripe refund API)
-      const stripe = getStripe();
-      const refundAmount = order.proposedRefundAmount || 0;
-      const refundPercent = order.proposedRefundPercent || 100;
-      const refundCents = Math.round(refundAmount * 100);
-
-      const isBalanceOrder = order.paymentMethod === "balance";
-
-      if (isBalanceOrder) {
-        // ── Balance-paid order: transfer via Stripe Customer Balance ──
-        const buyerCustomerId = await ensureStripeCustomer(order.buyerId);
-        const sellerCustomerId = await ensureStripeCustomer(order.sellerId);
-
-        // Credit buyer balance (make more negative = more credit)
-        const buyerCust = await stripe.customers.retrieve(buyerCustomerId);
-        await stripe.customers.update(buyerCustomerId, {
-          balance: buyerCust.balance - refundCents,
-        });
-
-        // Debit seller balance (make less negative = less credit; can go positive = debt)
-        const sellerCust = await stripe.customers.retrieve(sellerCustomerId);
-        await stripe.customers.update(sellerCustomerId, {
-          balance: sellerCust.balance + refundCents,
-        });
-
-        // Log transactions
-        await logTransaction(order.buyerId, "refund", refundCents, orderId,
-          `Erstattung: ${refundPercent}% von ${summary}`);
-        await logTransaction(order.sellerId, "refund", -refundCents, orderId,
-          `Erstattung an Käufer: ${refundPercent}% von ${summary}`);
-
-        // Update balance caches
-        await updateBalanceCache(order.buyerId);
-        await updateBalanceCache(order.sellerId);
-      } else {
-        // ── Legacy direct-pay order: use Stripe refund API ──
-        const piId = order.stripePaymentIntentId;
-        if (!piId) {
-          throw new HttpsError("failed-precondition", "No payment intent found");
-        }
-        if (refundPercent >= 100) {
-          await stripe.refunds.create({ payment_intent: piId });
-        } else {
-          await stripe.refunds.create({ payment_intent: piId, amount: refundCents });
-        }
+      // Phase 6: Connect-native Refund via stripe.refunds.create mit
+      // reverse_transfer + Policy-aware refund_application_fee.
+      // Legacy paymentMethod=balance Orders gibt's nicht mehr (alle 114
+      // Test-Orders geloescht in Phase 6).
+      if (order.paymentMethod === "balance") {
+        throw new HttpsError(
+          "failed-precondition",
+          "Legacy balance order — please contact support.",
+        );
       }
 
-      // Update order
+      const piId = order.stripePaymentIntentId;
+      if (!piId) {
+        throw new HttpsError(
+          "failed-precondition",
+          "No payment intent found",
+        );
+      }
+
+      const stripe = getStripe();
+      const refundPercent = order.proposedRefundPercent || 100;
+
+      // Policy-Engine: bestimmt amount + refund_application_fee basierend
+      // auf Reason + Percent (siehe resolveRefundPolicy oben).
+      const policy = resolveRefundPolicy(
+        order,
+        order.disputeReasonCode || null,
+        refundPercent,
+      );
+
+      const refundParams = {
+        payment_intent: piId,
+        reverse_transfer: policy.reverseTransfer,
+        refund_application_fee: policy.refundApplicationFee,
+      };
+      if (policy.amount != null) {
+        refundParams.amount = policy.amount;
+      }
+
+      // Idempotency-Key (Security-Audit Round 2, 2026-04-29): bei
+      // Network-Retry oder Buyer-Tap-Spam wird hier sonst ein 2. Refund
+      // erstellt. Stripe deduped automatisch wenn idempotencyKey identisch.
+      // Key = order-spezifisch + Pfad-spezifisch damit `respondToRefund`
+      // und `adminResolveDispute` nicht versehentlich kollidieren.
+      const refund = await stripe.refunds.create(refundParams, {
+        idempotencyKey: `refund-respond-${orderId}-${refundPercent}`,
+      });
+      console.log(
+        `respondToRefund: refund ${refund.id} created for order ${orderId} ` +
+        `(percent=${refundPercent}, amount=${policy.refundedAmountEur.toFixed(2)}, ` +
+        `serviceFeeStays=${policy.serviceFeeStaysWithPlatform}, ` +
+        `reason=${order.disputeReasonCode})`,
+      );
+
+      // Order doc: actual refund amount stays as proposedRefundAmount fuer
+      // Audit; refundedAmount-Field zeigt den tatsaechlich an Buyer
+      // ausgezahlten Betrag (kann von proposedRefundAmount abweichen wenn
+      // Service-Fee bei der Plattform bleibt).
       await orderRef.update({
         status: "refunded",
         disputeStatus: "resolved",
         resolvedAt: admin.firestore.FieldValue.serverTimestamp(),
+        refundedAmount: policy.refundedAmountEur,
+        refundServiceFeeStaysWithPlatform: policy.serviceFeeStaysWithPlatform,
+        stripeRefundId: refund.id,
       });
 
       // Release listing reservation
@@ -2513,10 +3985,19 @@ exports.respondToRefund = onCall(
         await addStrike(order.sellerId, `Dispute refund ${refundPercent}% on order ${orderId}`);
       }
 
-      console.log(`Refund accepted: ${refundPercent}% (€${refundAmount.toFixed(2)}) on order ${orderId} [${isBalanceOrder ? "balance" : "stripe"}]`);
-      sendNotification(order.sellerId, "Refund accepted", `${summary}: €${refundAmount.toFixed(2)} refunded to buyer.`);
+      sendNotification(
+        order.sellerId,
+        "Refund accepted",
+        `${summary}: €${policy.refundedAmountEur.toFixed(2)} refunded to buyer.`,
+        { type: "order", orderId },
+      );
 
-      return { success: true, action: "refunded", refundAmount };
+      return {
+        success: true,
+        action: "refunded",
+        refundAmount: policy.refundedAmountEur,
+        serviceFeeStaysWithPlatform: policy.serviceFeeStaysWithPlatform,
+      };
     } else {
       // Reject — reset to open so seller can propose again
       await orderRef.update({
@@ -2527,7 +4008,7 @@ exports.respondToRefund = onCall(
       });
 
       console.log(`Refund rejected by buyer on order ${orderId}`);
-      sendNotification(order.sellerId, "Refund rejected", `${summary}: Buyer rejected your proposal. Propose a different amount.`);
+      sendNotification(order.sellerId, "Refund rejected", `${summary}: Buyer rejected your proposal. Propose a different amount.`, { type: "order", orderId });
 
       return { success: true, action: "rejected" };
     }
@@ -2586,7 +4067,7 @@ exports.cancelDispute = onCall(
     console.log(`Dispute cancelled by buyer on order ${orderId}`);
 
     const summary = orderItemsSummary(order.items);
-    sendNotification(order.sellerId, "Dispute cancelled", `${summary}: Buyer withdrew the dispute.`);
+    sendNotification(order.sellerId, "Dispute cancelled", `${summary}: Buyer withdrew the dispute.`, { type: "order", orderId: orderId });
 
     return { success: true };
   }
@@ -2619,11 +4100,41 @@ exports.autoReleaseOrders = onSchedule(
     }
 
     for (const doc of snap.docs) {
-      const order = doc.data();
-      await doc.ref.update({
-        status: "auto_completed",
-        deliveredAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
+      // Race-Protection (Security-Audit Round 5, 2026-04-29):
+      // Vorher: naiver update ohne State-Re-Check → bei concurrent
+      // confirmDelivery liefen beide Side-Effects-Loops (Double-Inc auf
+      // totalSales/totalRevenue + Double-addItemsToCollection auf Buyer-
+      // Sammlung). Jetzt atomarer State-Flip in TX. Wenn confirmDelivery
+      // den Status schon auf "delivered" gehoben hat, skippt diese
+      // Iteration cleanly — keine doppelten Side-Effects.
+      let order;
+      try {
+        order = await db.runTransaction(async (tx) => {
+          const fresh = await tx.get(doc.ref);
+          if (!fresh.exists) return null;
+          const data = fresh.data();
+          if (data.status !== "shipped") return null;
+          // Doppelt-Sicher: autoReleaseAt nochmal pruefen (Doc-Snapshot
+          // koennte stale sein nach langer Cron-Iteration).
+          if (!data.autoReleaseAt || new Date(data.autoReleaseAt) > new Date()) {
+            return null;
+          }
+          tx.update(doc.ref, {
+            status: "auto_completed",
+            deliveredAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+          return data;
+        });
+      } catch (txErr) {
+        console.error(`autoReleaseOrders ${doc.id} TX-flip failed: ${txErr.message}`);
+        continue;
+      }
+      if (!order) {
+        // Status wurde bereits durch confirmDelivery o.ae. veraendert —
+        // skip, kein Side-Effect-Run.
+        console.log(`autoReleaseOrders: skipping ${doc.id} (status already advanced)`);
+        continue;
+      }
 
       // Update seller stats (set+merge so doc is created if missing)
       const totalQty = (order.items || []).reduce((sum, item) => sum + (item.quantity || 1), 0);
@@ -2650,7 +4161,7 @@ exports.autoReleaseOrders = onSchedule(
       await updateBalanceCache(order.sellerId);
 
       // Notify buyer about auto-completion
-      sendNotification(order.buyerId, "Order auto-completed", "Your order was automatically completed.");
+      sendNotification(order.buyerId, "Order auto-completed", "Your order was automatically completed.", { type: "order", orderId: doc.id });
     }
 
     console.log(`autoReleaseOrders: completed ${snap.size} orders`);
@@ -2668,7 +4179,7 @@ exports.autoReleaseOrders = onSchedule(
       const order = doc.data();
       // Skip pre-release orders — reminders start after release date
       if (order.preReleaseDate && new Date(order.preReleaseDate) > new Date()) continue;
-      sendNotification(order.sellerId, "Shipping reminder", "You have an unshipped order. Please ship soon.");
+      sendNotification(order.sellerId, "Shipping reminder", "You have an unshipped order. Please ship soon.", { type: "order", orderId: doc.id });
     }
 
     if (!reminderSnap.empty) {
@@ -2684,13 +4195,144 @@ exports.autoReleaseOrders = onSchedule(
 
     for (const doc of preReleaseSnap.docs) {
       const order = doc.data();
-      sendNotification(order.sellerId, "Set released! 🎉", "Your pre-order is ready to ship. Please send it within 5 days.");
-      sendNotification(order.buyerId, "Set released! 🎉", "Your pre-order will be shipped soon.");
+      sendNotification(order.sellerId, "Set released! 🎉", "Your pre-order is ready to ship. Please send it within 5 days.", { type: "order", orderId: doc.id });
+      sendNotification(order.buyerId, "Set released! 🎉", "Your pre-order will be shipped soon.", { type: "order", orderId: doc.id });
     }
     if (!preReleaseSnap.empty) {
       console.log(`autoReleaseOrders: sent ${preReleaseSnap.size} release-day notification(s)`);
     }
 
+  }
+);
+
+// ── Request Cancel (Buyer) ──
+exports.requestCancelOrder = onCall(
+  { region: "europe-west1" },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) throw new HttpsError("unauthenticated", "Login required");
+    const { orderId, reason, note } = request.data;
+    if (!orderId) throw new HttpsError("invalid-argument", "orderId required");
+
+    const orderRef = db.collection("artifacts").doc(APP_ID).collection("orders").doc(orderId);
+    const orderDoc = await orderRef.get();
+    if (!orderDoc.exists) throw new HttpsError("not-found", "Order not found");
+    const order = orderDoc.data();
+
+    if (order.buyerId !== uid) throw new HttpsError("permission-denied", "Only buyer can request cancel");
+    if (order.status !== "paid") throw new HttpsError("failed-precondition", "Order must be in paid status");
+    if (order.cancelRequested) throw new HttpsError("already-exists", "Cancel already requested");
+
+    await orderRef.update({
+      cancelRequested: true,
+      cancelRequestedAt: admin.firestore.FieldValue.serverTimestamp(),
+      ...(reason ? { cancelReason: reason } : {}),
+      ...(note ? { cancelNote: note } : {}),
+    });
+
+    // Notify seller
+    const summary = orderItemsSummary(order.items || []);
+    const reasonText = reason ? `: ${reason}` : "";
+    sendNotification(order.sellerId, "Cancel requested", `Buyer wants to cancel${reasonText} — ${summary}`, { type: "order", orderId });
+
+    return { success: true };
+  }
+);
+
+// ── Accept Cancel (Seller) ──
+exports.acceptCancelOrder = onCall(
+  { region: "europe-west1", secrets: ["STRIPE_SECRET_KEY"] },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) throw new HttpsError("unauthenticated", "Login required");
+    const { orderId } = request.data;
+    if (!orderId) throw new HttpsError("invalid-argument", "orderId required");
+
+    const orderRef = db.collection("artifacts").doc(APP_ID).collection("orders").doc(orderId);
+    const orderDoc = await orderRef.get();
+    if (!orderDoc.exists) throw new HttpsError("not-found", "Order not found");
+    const order = orderDoc.data();
+
+    if (order.sellerId !== uid) throw new HttpsError("permission-denied", "Only seller can accept cancel");
+    if (order.status !== "paid") throw new HttpsError("failed-precondition", "Order must be in paid status");
+
+    // Phase 6: Connect-native pre-ship cancel. Bei capture_method:"manual"
+    // (= unser Standard) ist die PI nach amount_capturable_updated im Status
+    // requires_capture — Geld ist authorized, aber nicht captured. Cancel
+    // gibt die Auth wieder frei, kein Geld floss.
+    if (order.paymentMethod === "balance") {
+      throw new HttpsError(
+        "failed-precondition",
+        "Legacy balance order — please contact support.",
+      );
+    }
+    const piId = order.stripePaymentIntentId;
+    if (!piId) {
+      throw new HttpsError(
+        "failed-precondition",
+        "Order has no PaymentIntent — cannot cancel.",
+      );
+    }
+
+    const stripe = getStripe();
+    try {
+      await stripe.paymentIntents.cancel(piId);
+    } catch (e) {
+      console.warn(`acceptCancelOrder: PI ${piId} cancel skipped: ${e.message}`);
+    }
+
+    // Update order
+    await orderRef.update({
+      status: "cancelled",
+      cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
+      cancelRequested: false,
+      cancelReason: "buyer_requested_seller_accepted",
+    });
+
+    // Release reserved qty on listings
+    for (const item of (order.items || [])) {
+      if (item.listingId) {
+        const listingRef = db.collection("artifacts").doc(APP_ID).collection("listings").doc(item.listingId);
+        const listingDoc = await listingRef.get();
+        if (listingDoc.exists) {
+          const listing = listingDoc.data();
+          const newReserved = Math.max(0, (listing.reservedQty || 0) - (item.quantity || 1));
+          await listingRef.update({ reservedQty: newReserved, status: "active" });
+        }
+      }
+    }
+
+    // Notify buyer
+    sendNotification(order.buyerId, "Order cancelled", "Your cancellation request was accepted. Refund issued.", { type: "order", orderId });
+
+    return { success: true };
+  }
+);
+
+// ── Decline Cancel (Seller) ──
+exports.declineCancelOrder = onCall(
+  { region: "europe-west1" },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) throw new HttpsError("unauthenticated", "Login required");
+    const { orderId } = request.data;
+    if (!orderId) throw new HttpsError("invalid-argument", "orderId required");
+
+    const orderRef = db.collection("artifacts").doc(APP_ID).collection("orders").doc(orderId);
+    const orderDoc = await orderRef.get();
+    if (!orderDoc.exists) throw new HttpsError("not-found", "Order not found");
+    const order = orderDoc.data();
+
+    if (order.sellerId !== uid) throw new HttpsError("permission-denied", "Only seller can decline cancel");
+
+    await orderRef.update({
+      cancelRequested: false,
+    });
+
+    // Notify buyer
+    sendNotification(order.buyerId, "Cancel declined", "Seller declined your cancellation request. Order remains active.", { type: "order", orderId });
+
+    return { success: true };
   }
 );
 
@@ -2780,408 +4422,828 @@ exports.submitReview = onCall(
 
     // Notify seller
     const stars = "★".repeat(rating) + "☆".repeat(5 - rating);
-    sendNotification(order.sellerId, "New review: " + stars, safeComment || "You received a rating.");
+    sendNotification(order.sellerId, "New review: " + stars, safeComment || "You received a rating.", { type: "order", orderId: orderId });
+
+    // Tier-Sync — neue Bewertung kann Schwelle für Tier-Aufstieg überschreiten.
+    // Idempotent, error-safe (loggt nur, blockt nicht den Review-Flow).
+    try {
+      await syncSellerTier(order.sellerId);
+    } catch (err) {
+      console.error(`syncSellerTier after submitReview failed for ${order.sellerId}:`, err.message);
+    }
+
+    // Public-Stats-Mirror — rating + reviewCount haben sich geaendert,
+    // Listings/Social-Tab brauchen die neuen Werte fuer UI-Display.
+    await syncPlayerProfile(order.sellerId);
 
     return { success: true, avgRating, reviewCount: count };
   }
 );
 
 // ═══════════════════════════════════════════
-// ─── Wallet: Top-Up Balance ───
+// ─── Payment: Fee Calculation (Phase 0/1) ───
 // ═══════════════════════════════════════════
+//
+// Single source of truth for marketplace fees. Spec lives in
+// riftr-flutter/CLAUDE.md → "Payment-Architektur". Any change here MUST
+// be mirrored in the Flutter UI (cart summary, seller dashboard) and
+// the AGB fee section. See riftr-flutter/BACKLOG.md → "Payment-Track".
+//
+// Architecture: Stripe Connect Direct Charges with `transfer_data` +
+// `application_fee_amount`. NO platform-held funds. NO wallet logic
+// (anti-pattern, BaFin risk — see CLAUDE.md "Anti-Patterns").
 
 /**
- * topUpBalance — Callable, authenticated.
- * Creates a Stripe PaymentIntent for wallet top-up.
- * 3D Secure enforced on all card payments (liability shift).
- * Returns { clientSecret } for the Flutter PaymentSheet.
+ * Käufer-Service-Gebühr (Basis), gestaffelt nach Karten-Subtotal.
+ * Multi-Seller-Aufschlag wird separat addiert (siehe calculateOrderFees).
+ *
+ * @param {number} cartSubtotalCents — Karten-Wert ohne Versand
+ * @returns {number} Service-Gebühr in Cents
  */
-exports.topUpBalance = onCall(
-  { region: "europe-west1", timeoutSeconds: 30, secrets: ["STRIPE_SECRET_KEY"] },
-  async (request) => {
-    if (!request.auth) {
-      throw new HttpsError("unauthenticated", "Must be signed in");
-    }
+function baseServiceFeeCents(cartSubtotalCents) {
+  if (cartSubtotalCents < 1500)  return 49;   // <€15
+  if (cartSubtotalCents <= 5000) return 79;   // €15–€50
+  if (cartSubtotalCents <= 20000) return 129; // €50–€200
+  return 199;                                  // >€200
+}
 
-    const uid = request.auth.uid;
-    const { amount } = request.data; // Amount in cents
+/**
+ * Verkäufer-Provisions-Rate, gestaffelt nach Karten-Subtotal.
+ *
+ * @param {number} cartSubtotalCents
+ * @returns {number} Provisions-Rate als Dezimalwert (0.05 = 5%)
+ */
+function commissionRate(cartSubtotalCents) {
+  if (cartSubtotalCents < 1500)  return 0.05;
+  if (cartSubtotalCents <= 5000) return 0.055;
+  if (cartSubtotalCents <= 20000) return 0.06;
+  return 0.065;
+}
 
-    if (!amount || !Number.isInteger(amount)) {
-      throw new HttpsError("invalid-argument", "amount (integer cents) is required");
-    }
-
-    try {
-      // Suspended check
-      const trust = await getTrustLevel(uid);
-      if (trust.level === "suspended") {
-        throw new HttpsError("permission-denied", "Account suspended");
-      }
-      // Same limits for all accounts: €5 – €500
-      if (amount < 500) {
-        throw new HttpsError("invalid-argument", "Minimum top-up: €5");
-      }
-      if (amount > 50000) {
-        throw new HttpsError("invalid-argument", "Maximum top-up: €500");
-      }
-
-      // Rate limit: max 5 top-ups per day (all accounts)
-      const todayCount = await countTodayTopUps(uid);
-      if (todayCount >= 5) {
-        throw new HttpsError("resource-exhausted", "Daily top-up limit reached");
-      }
-
-      // Ensure Stripe Customer
-      const customerId = await ensureStripeCustomer(uid);
-      const stripe = getStripe();
-
-      // Create PaymentIntent with 3D Secure enforced
-      const paymentIntent = await stripe.paymentIntents.create({
-        amount,
-        currency: "eur",
-        customer: customerId,
-        payment_method_options: {
-          card: { request_three_d_secure: "challenge" },
-        },
-        metadata: {
-          type: "top_up",
-          uid,
-        },
-      });
-
-      console.log(`Top-up PI ${paymentIntent.id} created for ${uid}: €${(amount / 100).toFixed(2)}`);
-      return { clientSecret: paymentIntent.client_secret };
-    } catch (e) {
-      if (e instanceof HttpsError) throw e;
-      console.error("topUpBalance unexpected error:", e);
-      throw new HttpsError("internal", e.message || "Top-up failed");
-    }
+/**
+ * Berechnet alle Gebühren für eine Bestellung.
+ * Stripe-Fee trägt IMMER die Plattform (kein dynamisches on_behalf_of).
+ *
+ * Multi-Seller-Aufschlag: +30 Cents pro zusätzlichem Verkäufer im User-Cart.
+ * Wird auf den ERSTEN PaymentIntent gepackt; spätere PIs tragen nur ihre
+ * eigene Provision (sonst würde Service-Gebühr mehrfach belastet).
+ *
+ * @param {number} cartSubtotalCents — Karten-Wert dieser Verkäufer-Gruppe
+ * @param {number} sellerCount — Gesamtzahl Verkäufer im User-Cart (≥1)
+ * @returns {object} { serviceFeeCents, platformCommissionCents,
+ *                     totalApplicationFeeCents, commissionRateUsed }
+ */
+function calculateOrderFees(cartSubtotalCents, sellerCount) {
+  if (typeof cartSubtotalCents !== "number" || cartSubtotalCents < 0) {
+    throw new Error(`Invalid cartSubtotalCents: ${cartSubtotalCents}`);
   }
-);
-
-// ═══════════════════════════════════════════
-// ─── Wallet: Purchase with Balance ───
-// ═══════════════════════════════════════════
-
-/**
- * purchaseWithBalance — Callable, authenticated.
- * Deducts from buyer's Stripe Customer Balance, credits seller.
- * No Stripe PaymentIntent — pure balance transfer.
- * Supports single listing or cart mode.
- */
-exports.purchaseWithBalance = onCall(
-  { region: "europe-west1", timeoutSeconds: 30, secrets: ["STRIPE_SECRET_KEY"] },
-  async (request) => {
-    if (!request.auth) {
-      throw new HttpsError("unauthenticated", "Must be signed in");
-    }
-
-    const uid = request.auth.uid;
-    const { listingId, quantity, items, shippingMethod, shippingAddress } = request.data;
-
-    const isCart = Array.isArray(items) && items.length > 0;
-    if (!isCart && (!listingId || !quantity)) {
-      throw new HttpsError("invalid-argument", "Missing required fields");
-    }
-    if (!shippingMethod || !shippingAddress) {
-      throw new HttpsError("invalid-argument", "Missing shipping info");
-    }
-
-    // Suspended check
-    const trust = await getTrustLevel(uid);
-    if (trust.level === "suspended") {
-      throw new HttpsError("permission-denied", "Account suspended");
-    }
-
-    // Rate limit: 50 purchases per hour (all accounts)
-    const hourlyCount = await countHourlyPurchases(uid);
-    if (hourlyCount >= 50) {
-      throw new HttpsError("resource-exhausted", "Hourly purchase limit reached");
-    }
-
-    // Fetch all listings
-    const cartEntries = isCart ? items : [{ listingId, quantity }];
-    const listingRefs = [];
-    const listingDocs = [];
-    const listingDataArr = [];
-
-    for (const entry of cartEntries) {
-      const ref = db.collection("artifacts").doc(APP_ID)
-        .collection("listings").doc(entry.listingId);
-      const doc = await ref.get();
-      if (!doc.exists) {
-        throw new HttpsError("not-found", `Listing ${entry.listingId} not found`);
-      }
-      const data = doc.data();
-      if (data.status !== "active" && data.status !== "reserved") {
-        throw new HttpsError("failed-precondition", `Listing ${entry.listingId} is not active`);
-      }
-      const available = data.quantity - (data.reservedQty || 0);
-      if ((entry.quantity || 1) > available) {
-        throw new HttpsError("failed-precondition", `Not enough qty for ${data.cardName}`);
-      }
-      listingRefs.push(ref);
-      listingDocs.push(doc);
-      listingDataArr.push(data);
-    }
-
-    // All listings must be from the same seller
-    const sellerId = listingDataArr[0].sellerId;
-    if (listingDataArr.some(l => l.sellerId !== sellerId)) {
-      throw new HttpsError("failed-precondition", "All cart items must be from the same seller");
-    }
-
-    // SELF-BUY CHECK
-    if (uid === sellerId) {
-      throw new HttpsError("permission-denied", "Cannot buy your own listings");
-    }
-
-    // Calculate amounts
-    const orderItems = [];
-    let subtotal = 0;
-    for (let i = 0; i < cartEntries.length; i++) {
-      const entry = cartEntries[i];
-      const listing = listingDataArr[i];
-      const qty = entry.quantity || 1;
-      const pricePerCard = listing.price;
-      subtotal += round2(pricePerCard * qty);
-      orderItems.push({
-        listingId: entry.listingId,
-        cardId: listing.cardId || "",
-        cardName: listing.cardName || "",
-        imageUrl: listing.imageUrl || null,
-        condition: listing.condition || "NM",
-        quantity: qty,
-        pricePerCard,
-      });
-    }
-    subtotal = round2(subtotal);
-
-    const rawFee = round2(subtotal * PLATFORM_FEE_RATE);
-    const platformFee = Math.min(rawFee, PLATFORM_FEE_CAP);
-    const sellerCountry = listingDataArr[0].sellerCountry || "";
-    const buyerCountry = (shippingAddress.country || "").toUpperCase();
-    const anyInsuredOnly = listingDataArr.some(l => l.insuredOnly);
-    const effectiveMethod = anyInsuredOnly ? "insured" : shippingMethod;
-    const shippingCost = round2(getShippingRate(sellerCountry, buyerCountry, effectiveMethod));
-    const totalPaid = round2(subtotal + shippingCost);
-    const sellerPayout = round2(subtotal - platformFee + shippingCost);
-
-    // Amounts in cents for Stripe balance ops
-    const totalCents = Math.round(totalPaid * 100);
-    const sellerPayoutCents = Math.round(sellerPayout * 100);
-
-    // Check buyer has enough available balance
-    const buyerAvailable = await getAvailableBalance(uid);
-    if (buyerAvailable < totalCents) {
-      throw new HttpsError("failed-precondition", "Not enough balance");
-    }
-
-    // Get buyer display name
-    const buyerProfileRef = db.collection("artifacts").doc(APP_ID)
-      .collection("users").doc(uid)
-      .collection("data").doc("profile");
-    const buyerProfileDoc = await buyerProfileRef.get();
-    const buyerName = buyerProfileDoc.exists
-      ? (buyerProfileDoc.data().displayName || "Buyer")
-      : "Buyer";
-
-    // Ensure both parties have Stripe Customers
-    const stripe = getStripe();
-    const buyerCustomerId = await getStripeCustomerId(uid);
-    const sellerCustomerId = await ensureStripeCustomer(sellerId);
-
-    // BALANCE TRANSFER: Deduct from buyer, credit to seller
-    const buyerCustomer = await stripe.customers.retrieve(buyerCustomerId);
-    await stripe.customers.update(buyerCustomerId, {
-      balance: buyerCustomer.balance + totalCents, // Makes balance less negative = less credit
-    });
-
-    const sellerCustomer = await stripe.customers.retrieve(sellerCustomerId);
-    await stripe.customers.update(sellerCustomerId, {
-      balance: sellerCustomer.balance - sellerPayoutCents, // Makes balance more negative = more credit
-    });
-
-    // Create order doc
-    const orderRef = db.collection("artifacts").doc(APP_ID)
-      .collection("orders").doc();
-    const orderId = orderRef.id;
-
-    const requiresTracking = subtotal >= 25;
-
-    await orderRef.set({
-      buyerId: uid,
-      sellerId,
-      items: orderItems,
-      subtotal,
-      platformFee,
-      shippingCost,
-      totalPaid,
-      sellerPayout,
-      shippingAddress,
-      shippingMethod: effectiveMethod,
-      paymentMethod: "balance",
-      currency: "EUR",
-      status: "paid",
-      requiresTracking,
-      buyerName,
-      sellerName: listingDataArr[0].sellerName || null,
-      preReleaseDate: listingDataArr[0].preReleaseDate || null,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      paidAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-
-    // Reserve quantity on all listings
-    for (let i = 0; i < cartEntries.length; i++) {
-      const entry = cartEntries[i];
-      const listing = listingDataArr[i];
-      const ref = listingRefs[i];
-      const qty = entry.quantity || 1;
-      const newReserved = (listing.reservedQty || 0) + qty;
-      const updateData = { reservedQty: newReserved };
-      if (newReserved >= listing.quantity) {
-        updateData.status = "reserved";
-      }
-      await ref.update(updateData);
-    }
-
-    // Transaction logs
-    await logTransaction(uid, "purchase", -totalCents, orderId,
-      `Kauf: ${orderItems.map(i => i.cardName).join(", ").substring(0, 200)}`);
-    await logTransaction(sellerId, "sale", sellerPayoutCents, orderId,
-      `Verkauf: ${orderItems.map(i => i.cardName).join(", ").substring(0, 200)}`, Math.round(platformFee * 100));
-
-    // Update balance caches
-    await updateBalanceCache(uid);
-    await updateBalanceCache(sellerId);
-
-    // Notify seller
-    const summary = orderItemsSummary(orderItems);
-    sendNotification(sellerId, "New order!", `${summary} — €${totalPaid.toFixed(2)}. Ship within 7 days.`);
-
-    console.log(`Balance purchase: order ${orderId}, €${totalPaid} from ${uid} to ${sellerId}`);
-    return { orderId, total: totalPaid };
+  if (typeof sellerCount !== "number" || sellerCount < 1) {
+    throw new Error(`Invalid sellerCount: ${sellerCount}`);
   }
-);
+
+  const baseService = baseServiceFeeCents(cartSubtotalCents);
+  const multiSellerSurcharge = 30 * Math.max(0, sellerCount - 1);
+  const serviceFeeCents = baseService + multiSellerSurcharge;
+
+  const rate = commissionRate(cartSubtotalCents);
+  const platformCommissionCents = Math.round(cartSubtotalCents * rate);
+
+  return {
+    serviceFeeCents,
+    platformCommissionCents,
+    totalApplicationFeeCents: serviceFeeCents + platformCommissionCents,
+    commissionRateUsed: rate,
+    baseServiceFeeCents: baseService,
+    multiSellerSurchargeCents: multiSellerSurcharge,
+  };
+}
 
 // ═══════════════════════════════════════════
-// ─── Wallet: Request Payout ───
+// ─── Payment: Seller Tier / Delay Days ───
 // ═══════════════════════════════════════════
+//
+// Auszahlungs-Tier-System: delay_days dynamisch nach Verkäufer-Reputation.
+// Triggers: nach submitReview, nach confirmDelivery, plus täglicher Cron.
+// Stripe Reserve (5%/7d rolling) wird zusätzlich für Power-Seller-Tier
+// aktiviert — siehe applyTierToStripeAccount.
 
 /**
- * requestPayout — Callable, authenticated.
- * Transfers from user's Stripe Customer Balance to their Connected Account (→ bank).
- * Requires Stripe Connect onboarding (IBAN).
+ * Berechnet das passende delay_days für einen Verkäufer basierend auf
+ * Verkaufs-Anzahl + Bewertungs-Schnitt + Mindest-Reviews.
+ *
+ * Special-Case: Bei Order-Wert > €100 fällt Power-Seller-Tier (1 Tag) auf
+ * 7 Tage zurück — siehe getEffectiveDelayDays für Order-spezifische Logik.
+ *
+ * @param {object} seller — sellerProfile-Doc-Daten
+ * @param {number} seller.completedSalesCount
+ * @param {number} seller.rating — 0.0–5.0
+ * @param {number} seller.reviewCount
+ * @returns {number} delay_days (1, 3, 5, oder 7)
  */
-exports.requestPayout = onCall(
-  { region: "europe-west1", timeoutSeconds: 30, secrets: ["STRIPE_SECRET_KEY"] },
+function calculateDelayDays(seller) {
+  const sales = seller?.completedSalesCount || 0;
+  const rating = seller?.rating || 0;
+  const reviews = seller?.reviewCount || 0;
+  const hasMinReviews = reviews >= 5;
+
+  // Power-Seller: 200+ Verkäufe, ≥4.95 Sterne, ≥5 Reviews
+  if (sales >= 200 && hasMinReviews && rating >= 4.95) return 1;
+
+  // Trusted: 50+ Verkäufe, ≥4.90 Sterne, ≥5 Reviews
+  if (sales >= 50 && hasMinReviews && rating >= 4.90) return 3;
+
+  // Etabliert: 10+ Verkäufe, ≥4.75 Sterne, ≥5 Reviews
+  if (sales >= 10 && hasMinReviews && rating >= 4.75) return 5;
+
+  // Default (Neu): 7 Tage
+  return 7;
+}
+
+/**
+ * Effective delay_days bei einer KONKRETEN Bestellung.
+ * Power-Seller-Tier (1 Tag) gilt nur bei Bestellungen ≤ €100. Größere
+ * Bestellungen pauschal 7 Tage für ALLE Tiers (Schutz bei High-Value-
+ * Karten wie seltene Legends).
+ *
+ * @param {object} seller — sellerProfile
+ * @param {number} orderTotalCents — Charge-Total inkl. Versand + Service
+ * @returns {number} effective delay_days
+ */
+function getEffectiveDelayDays(seller, orderTotalCents) {
+  const baseTierDays = calculateDelayDays(seller);
+  const isHighValueOrder = orderTotalCents > 10000; // > €100
+  if (isHighValueOrder) return Math.max(baseTierDays, 7);
+  return baseTierDays;
+}
+
+/**
+ * Aktualisiert delay_days auf dem Stripe-Connect-Account des Verkäufers
+ * UND aktiviert/deaktiviert Stripe Reserve für Power-Seller-Tier.
+ *
+ * Reserve: 5% rolling 7d ist NUR für Power-Seller (1-Tag-Delay). Andere
+ * Tiers haben durch längeren Delay genug Refund-Buffer.
+ *
+ * @param {string} uid
+ * @param {string} sellerStripeAccountId
+ * @param {number} delayDays
+ */
+async function applyTierToStripeAccount(uid, sellerStripeAccountId, delayDays) {
+  const stripe = getStripe();
+
+  // 1. Payout-Schedule.
+  //
+  // Stripe enforced einen Risk-Floor (typisch 7 Tage) fuer neue Connect-Accounts.
+  // Versuch `delay_days < 7` setzen, bevor Stripe den Floor lockert, gibt
+  // 400 "You cannot lower this merchant's delay below 7" zurueck.
+  //
+  // Strategie: Wir versuchen den Tier-Soll-Wert. Failed Stripe wegen Floor →
+  // wir fallen auf den effektiven Stripe-Floor zurueck (parsen aus Error)
+  // und melden via Return-Wert, was tatsaechlich gesetzt wurde. Caller schreibt
+  // beide Werte ins Profil (`delayDays` = logischer Tier, `stripeDelayDaysActual`
+  // = was Stripe gerade enforced). Floor wird von Stripe nach Onboarding +
+  // Risk-Eval-Periode automatisch gesenkt — beim naechsten syncSellerTier-Trigger
+  // wird der Tier-Soll-Wert dann erfolgreich gesetzt.
+  let stripeDelayDaysActual = delayDays;
+  let stripeFloorActive = false;
+  try {
+    await stripe.accounts.update(sellerStripeAccountId, {
+      settings: {
+        payouts: {
+          schedule: { delay_days: delayDays, interval: "daily" },
+        },
+      },
+    });
+  } catch (e) {
+    const isFloorError =
+      e.type === "StripeInvalidRequestError" &&
+      /delay/i.test(e.message || "") &&
+      /below/i.test(e.message || "");
+    if (!isFloorError) throw e;
+
+    // Floor-Wert aus Message parsen ("...below 7" → 7); Default 7 falls Parse fehlt.
+    const m = (e.message || "").match(/below\s+(\d+)/i);
+    const floorDays = m ? parseInt(m[1], 10) : 7;
+    stripeDelayDaysActual = floorDays;
+    stripeFloorActive = true;
+
+    console.warn(
+      `applyTierToStripeAccount ${uid}: Stripe-Floor blockiert delay_days=${delayDays}, ` +
+      `setze auf Floor=${floorDays}. Wird beim naechsten Tier-Trigger erneut versucht.`,
+    );
+    await stripe.accounts.update(sellerStripeAccountId, {
+      settings: {
+        payouts: {
+          schedule: { delay_days: floorDays, interval: "daily" },
+        },
+      },
+    });
+  }
+
+  // 2. Reserve nur für Power-Seller (delayDays === 1)
+  // NB: Stripe-Reserve-Konfiguration via API ist nur für bestimmte
+  // Account-Typen verfügbar — Express-Accounts steuern Reserve über
+  // Risk-Settings die NICHT direkt API-zugänglich sind. Daher: Reserve
+  // muss MANUELL im Stripe-Dashboard pro Account konfiguriert werden
+  // wenn Tier auf Power-Seller springt. Audit-Log markiert das Event,
+  // Riftr-Admin handelt nach.
+  // TODO: Sobald Stripe API für Express-Reserve-Settings verfügbar:
+  //       hier `stripe.accounts.update({ settings: { reserve_charges: ... }})`
+  //       siehe https://docs.stripe.com/connect/account-balances#reserves
+
+  console.log(
+    `Tier-Update ${uid}: delay_days=${delayDays}` +
+    (stripeFloorActive ? ` (Stripe-Floor aktiv: actual=${stripeDelayDaysActual})` : "") +
+    (delayDays === 1 ? " [POWER-SELLER — manual Reserve setup needed]" : ""),
+  );
+
+  return { stripeDelayDaysActual, stripeFloorActive };
+}
+
+/**
+ * Trigger-Helfer: nach submitReview oder confirmDelivery aufrufen.
+ * Liest Verkäufer-Profil, berechnet neuen Tier, aktualisiert wenn Änderung.
+ * Idempotent — kann beliebig oft gerufen werden ohne Schaden.
+ *
+ * @param {string} sellerId
+ */
+/**
+ * Syncs the **public-safe** subset of profile + sellerProfile fields into the
+ * `playerProfiles/{uid}` mirror collection. Called after any CF that mutates
+ * profile/sellerProfile (submitReview, confirmDelivery, syncSellerTier,
+ * processMultiSellerCart).
+ *
+ * Rationale (Security-Audit 2026-04-29): the source-of-truth docs
+ * `users/{uid}/data/profile` + `users/{uid}/data/sellerProfile` contain PII
+ * (street/city/zip, email, address, totalRevenue, realizedGains,
+ * totalCostBasisSold, strikes, suspended, stripeAccountId) that MUST NOT
+ * be readable by other authenticated users. The `playerProfiles` mirror
+ * is the only safe surface for cross-user UI reads (Listings-Tile-Stats,
+ * Social-Tab Author-View, ProfileService.fetchProfiles).
+ *
+ * Public-safe fields synced here:
+ *   - displayName, avatarUrl, bio, country, city (UI display)
+ *   - rating, reviewCount, totalSales (seller reputation)
+ *   - memberSince (account-age badge)
+ *
+ * Idempotent. Failures are logged but never thrown — playerProfiles drift
+ * is preferable to breaking the calling CF flow. Worst-case the mirror is
+ * stale until the next sync trigger.
+ */
+async function syncPlayerProfile(uid) {
+  if (!uid) return;
+  try {
+    const userBase = db.collection("artifacts").doc(APP_ID)
+      .collection("users").doc(uid);
+    const [profileDoc, sellerDoc] = await Promise.all([
+      userBase.collection("data").doc("profile").get(),
+      userBase.collection("data").doc("sellerProfile").get(),
+    ]);
+    const profile = profileDoc.exists ? profileDoc.data() : {};
+    const seller = sellerDoc.exists ? sellerDoc.data() : {};
+
+    // Build sanitized payload — explicit allowlist, no PII passthrough.
+    const payload = {
+      // From profile (display)
+      ...(profile.displayName ? { displayName: profile.displayName } : {}),
+      ...(profile.displayName ? { displayNameLower: String(profile.displayName).toLowerCase() } : {}),
+      ...(profile.avatarUrl ? { avatarUrl: profile.avatarUrl } : {}),
+      ...(profile.bio ? { bio: profile.bio } : {}),
+      ...(profile.country ? { country: profile.country } : {}),
+      ...(profile.city ? { city: profile.city } : {}),
+      // From sellerProfile (reputation — public stats only, NEVER PII like email/address)
+      ...(seller.rating != null ? { rating: seller.rating } : {}),
+      ...(seller.reviewCount != null ? { reviewCount: seller.reviewCount } : {}),
+      ...(seller.totalSales != null ? { totalSales: seller.totalSales } : {}),
+      ...(seller.memberSince ? { memberSince: seller.memberSince } : {}),
+      updatedAt: new Date().toISOString(),
+    };
+
+    await db.collection("artifacts").doc(APP_ID)
+      .collection("playerProfiles").doc(uid)
+      .set(payload, { merge: true });
+  } catch (err) {
+    console.error(`syncPlayerProfile(${uid}) failed: ${err.message}`);
+  }
+}
+
+async function syncSellerTier(sellerId) {
+  if (!sellerId) return;
+
+  const sellerRef = db.collection("artifacts").doc(APP_ID)
+    .collection("users").doc(sellerId)
+    .collection("data").doc("sellerProfile");
+  const doc = await sellerRef.get();
+  if (!doc.exists) {
+    console.log(`syncSellerTier ${sellerId}: no sellerProfile, skipping`);
+    return;
+  }
+  const seller = doc.data();
+  const stripeAccountId = seller.stripeAccountId;
+  if (!stripeAccountId) {
+    console.log(`syncSellerTier ${sellerId}: no stripeAccountId, skipping`);
+    return;
+  }
+
+  const newDelay = calculateDelayDays(seller);
+  const currentDelay = seller.delayDays || 7;
+
+  if (newDelay === currentDelay) {
+    return; // No change
+  }
+
+  const { stripeDelayDaysActual, stripeFloorActive } =
+    await applyTierToStripeAccount(sellerId, stripeAccountId, newDelay);
+
+  // Audit-Log + Profile-Update
+  const auditRef = db.collection("artifacts").doc(APP_ID)
+    .collection("users").doc(sellerId)
+    .collection("sellerProfileAudit").doc();
+  await auditRef.set({
+    timestamp: admin.firestore.FieldValue.serverTimestamp(),
+    field: "delayDays",
+    previousValue: currentDelay,
+    newValue: newDelay,
+    stripeDelayDaysActual,
+    stripeFloorActive,
+    triggeredBy: "syncSellerTier",
+    sellerSnapshot: {
+      completedSalesCount: seller.completedSalesCount || 0,
+      rating: seller.rating || 0,
+      reviewCount: seller.reviewCount || 0,
+    },
+  });
+
+  await sellerRef.update({
+    delayDays: newDelay,
+    stripeDelayDaysActual,
+    stripeFloorActive,
+    delayDaysUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  console.log(
+    `syncSellerTier ${sellerId}: ${currentDelay} → ${newDelay} days` +
+    (stripeFloorActive ? ` (Stripe-Floor aktiv: actual=${stripeDelayDaysActual})` : ""),
+  );
+}
+
+/**
+ * setSellerDelayDays — Admin-Cloud-Function für manuellen Override.
+ * Generisch implementiert (kein hardcoded UID). Für Beta-Tester,
+ * Streit-Schlichtung, Promo-Aktionen, Test-Walkthroughs.
+ *
+ * Authentifizierung: nur Riftr-Admin-Account (per UID-Whitelist).
+ * Audit-Log mit Begründungs-Feld.
+ */
+exports.setSellerDelayDays = onCall(
+  { region: "europe-west1", timeoutSeconds: 15, secrets: ["STRIPE_SECRET_KEY"] },
   async (request) => {
     if (!request.auth) {
-      throw new HttpsError("unauthenticated", "Must be signed in");
+      throw new HttpsError("unauthenticated", "Login required");
     }
 
-    const uid = request.auth.uid;
-    const { amount } = request.data; // Amount in cents
-
-    if (!amount || !Number.isInteger(amount)) {
-      throw new HttpsError("invalid-argument", "amount (integer cents) is required");
+    // Admin-Whitelist via Custom Claim
+    const adminClaim = request.auth.token?.admin === true;
+    if (!adminClaim) {
+      throw new HttpsError("permission-denied", "Admin only");
     }
 
-    // 1. Suspended check
-    const trust = await getTrustLevel(uid);
-    if (trust.level === "suspended") {
-      throw new HttpsError("permission-denied", "Account suspended");
+    const { uid, days, reason } = request.data;
+    if (!uid || typeof uid !== "string") {
+      throw new HttpsError("invalid-argument", "uid (string) required");
+    }
+    if (!Number.isInteger(days) || days < 1 || days > 30) {
+      throw new HttpsError("invalid-argument", "days must be integer 1-30");
+    }
+    if (!reason || typeof reason !== "string" || reason.length < 5) {
+      throw new HttpsError("invalid-argument", "reason (≥5 chars) required for audit");
     }
 
-    // 2. Email verified check
-    const profileRef = db.collection("artifacts").doc(APP_ID)
+    const sellerRef = db.collection("artifacts").doc(APP_ID)
       .collection("users").doc(uid)
       .collection("data").doc("sellerProfile");
-    const profileDoc = await profileRef.get();
-    if (!profileDoc.exists || !profileDoc.data().emailVerified) {
-      throw new HttpsError("failed-precondition", "Please verify your email first");
+    const doc = await sellerRef.get();
+    if (!doc.exists) {
+      throw new HttpsError("not-found", "sellerProfile not found");
     }
-
-    // 3. Stripe Connect (IBAN) set up
-    const stripeAccountId = profileDoc.data().stripeAccountId;
+    const seller = doc.data();
+    const stripeAccountId = seller.stripeAccountId;
     if (!stripeAccountId) {
-      throw new HttpsError("failed-precondition", "Set up bank connection first (Stripe Connect)");
+      throw new HttpsError("failed-precondition", "Seller has no Stripe account");
     }
 
-    // 4. Account must be at least 7 days old
-    const userRecord = await admin.auth().getUser(uid);
-    const accountCreated = new Date(userRecord.metadata.creationTime);
-    const accountAgeMs = Date.now() - accountCreated.getTime();
-    const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
-    if (accountAgeMs < sevenDaysMs) {
-      const daysLeft = Math.ceil((sevenDaysMs - accountAgeMs) / (24 * 60 * 60 * 1000));
-      throw new HttpsError("failed-precondition",
-        `Payouts available from day 8. ${daysLeft} day${daysLeft > 1 ? "s" : ""} remaining.`);
-    }
+    const previousDelay = seller.delayDays || 7;
+    const { stripeDelayDaysActual, stripeFloorActive } =
+      await applyTierToStripeAccount(uid, stripeAccountId, days);
 
-    // 5. Minimum €5
-    if (amount < 500) {
-      throw new HttpsError("invalid-argument", "Minimum payout: €5");
-    }
-
-    // 6. Maximum €2,000 per day
-    const todayTotal = await getTodayPayoutTotal(uid);
-    if (todayTotal + amount > 200000) {
-      const remaining = Math.max(200000 - todayTotal, 0);
-      throw new HttpsError("resource-exhausted",
-        `Daily limit €2,000. €${(remaining / 100).toFixed(2)} remaining today.`);
-    }
-
-    // 7. Available balance (minus escrow)
-    const available = await getAvailableBalance(uid);
-    if (amount > available) {
-      throw new HttpsError("failed-precondition", "Not enough available balance");
-    }
-
-    // Execute payout — instant, no hold period
-    const stripe = getStripe();
-
-    const customerId = await getStripeCustomerId(uid);
-    const customer = await stripe.customers.retrieve(customerId);
-
-    // Deduct from customer balance first
-    await stripe.customers.update(customerId, {
-      balance: customer.balance + amount, // Less negative = less credit
+    // Audit-Log mit Begründung
+    const auditRef = db.collection("artifacts").doc(APP_ID)
+      .collection("users").doc(uid)
+      .collection("sellerProfileAudit").doc();
+    await auditRef.set({
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      field: "delayDays",
+      previousValue: previousDelay,
+      newValue: days,
+      stripeDelayDaysActual,
+      stripeFloorActive,
+      triggeredBy: "setSellerDelayDays (admin override)",
+      adminUid: request.auth.uid,
+      reason: reason.substring(0, 500),
     });
 
-    let transfer;
-    try {
-      transfer = await stripe.transfers.create({
-        amount,
-        currency: "eur",
-        destination: stripeAccountId,
-        metadata: { uid, type: "payout" },
-      });
-    } catch (stripeErr) {
-      // Rollback: restore customer balance
-      await stripe.customers.update(customerId, {
-        balance: customer.balance,
-      });
-      console.error(`Payout transfer failed for ${uid}:`, stripeErr.message);
+    await sellerRef.update({
+      delayDays: days,
+      stripeDelayDaysActual,
+      stripeFloorActive,
+      delayDaysUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      delayDaysOverride: true, // Markiert: nicht automatisch berechnet
+    });
 
-      if (stripeErr.code === "balance_insufficient") {
-        throw new HttpsError("unavailable",
-          "Payout temporarily unavailable — platform funds are settling. Please try again later.");
-      }
-      throw new HttpsError("internal", "Payout failed: " + stripeErr.message);
+    console.log(
+      `setSellerDelayDays admin=${request.auth.uid} target=${uid}: ` +
+      `${previousDelay}→${days} ("${reason}")` +
+      (stripeFloorActive ? ` (Stripe-Floor aktiv: actual=${stripeDelayDaysActual})` : ""),
+    );
+
+    return { success: true, previousDelay, newDelay: days, stripeDelayDaysActual, stripeFloorActive };
+  },
+);
+
+// ═══════════════════════════════════════════
+// ─── Phase 6.5: Admin-Mediation-Tools ───
+// ═══════════════════════════════════════════
+
+/**
+ * adminListDisputes — Admin-only.
+ * Listet alle Orders im Status `disputed` (mit `disputeStatus: 'open'` ODER
+ * `'sellerProposed'`) — die wo Admin als Tie-Breaker eingreifen koennte.
+ * Frontend Admin-UI rendert diese Liste.
+ */
+exports.adminListDisputes = onCall(
+  { region: "europe-west1", timeoutSeconds: 15 },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Login required");
+    }
+    if (request.auth.token?.admin !== true) {
+      throw new HttpsError("permission-denied", "Admin only");
     }
 
-    await logTransaction(uid, "payout", -amount, null,
-      "Payout to bank account", 0, transfer.id);
+    const snap = await db.collection("artifacts").doc(APP_ID)
+      .collection("orders")
+      .where("status", "==", "disputed")
+      .orderBy("disputedAt", "desc")
+      .limit(100)
+      .get();
 
-    await updateBalanceCache(uid);
+    const disputes = snap.docs.map((d) => {
+      const o = d.data();
+      return {
+        orderId: d.id,
+        buyerId: o.buyerId,
+        sellerId: o.sellerId,
+        buyerName: o.buyerName || null,
+        sellerName: o.sellerName || null,
+        items: (o.items || []).map((i) => ({
+          cardName: i.cardName,
+          quantity: i.quantity,
+          condition: i.condition,
+        })),
+        totalPaid: o.totalPaid,
+        sellerPayout: o.sellerPayout,
+        shippingMethod: o.shippingMethod,
+        trackingNumber: o.trackingNumber || null,
+        disputeReason: o.disputeReason,
+        disputeReasonCode: o.disputeReasonCode || null,
+        disputeDescription: o.disputeDescription || null,
+        disputeStatus: o.disputeStatus,
+        proposedRefundPercent: o.proposedRefundPercent || null,
+        proposedRefundAmount: o.proposedRefundAmount || null,
+        disputedAt: o.disputedAt && o.disputedAt.toDate
+          ? o.disputedAt.toDate().toISOString()
+          : null,
+        proposedAt: o.proposedAt && o.proposedAt.toDate
+          ? o.proposedAt.toDate().toISOString()
+          : null,
+      };
+    });
 
-    sendNotification(uid, "Payout initiated",
-      `€${(amount / 100).toFixed(2)} will arrive in 2-7 business days.`);
-
-    console.log(`Payout: ${uid} → €${(amount / 100).toFixed(2)} via transfer ${transfer.id}`);
-    return { transferId: transfer.id };
-  }
+    return { disputes };
+  },
 );
+
+/**
+ * adminResolveDispute — Admin-only Tie-Breaker.
+ *
+ * Loest einen festgefahrenen Dispute durch Admin-Entscheidung. Greift wenn
+ * Buyer + Seller sich nicht einigen koennen ueber `proposeRefund` /
+ * `respondToRefund`. Admin entscheidet:
+ *   - refundPercent (0-100): 0 = kein Refund (Verkaeufer recht), 100 = voll
+ *   - reason: text (= adminNote, wird im Audit-Log gespeichert)
+ *   - applyServiceFeePolicy: true = Policy-Engine entscheidet (Default),
+ *     false = Service-Fee bleibt IMMER bei Plattform unabhaengig vom Outcome
+ *
+ * Bei refundPercent > 0: nutzt Policy-Engine (resolveRefundPolicy) und cleant
+ * up wie respondToRefund. Bei 0: dispute resolved zu Verkaeufer-Gunsten,
+ * Order auf shipped zurueck mit neuem auto-release-Timer.
+ */
+exports.adminResolveDispute = onCall(
+  { region: "europe-west1", timeoutSeconds: 30, secrets: ["STRIPE_SECRET_KEY"] },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Login required");
+    }
+    if (request.auth.token?.admin !== true) {
+      throw new HttpsError("permission-denied", "Admin only");
+    }
+
+    const { orderId, refundPercent, reason, applyServiceFeePolicy = true } = request.data;
+    if (!orderId) {
+      throw new HttpsError("invalid-argument", "orderId required");
+    }
+    if (
+      typeof refundPercent !== "number" ||
+      refundPercent < 0 ||
+      refundPercent > 100
+    ) {
+      throw new HttpsError(
+        "invalid-argument",
+        "refundPercent must be 0-100",
+      );
+    }
+    if (!reason || typeof reason !== "string" || reason.length < 5) {
+      throw new HttpsError(
+        "invalid-argument",
+        "reason (≥5 chars) required for audit",
+      );
+    }
+
+    const orderRef = db.collection("artifacts").doc(APP_ID)
+      .collection("orders").doc(orderId);
+    const orderDoc = await orderRef.get();
+    if (!orderDoc.exists) {
+      throw new HttpsError("not-found", "Order not found");
+    }
+    const order = orderDoc.data();
+    if (order.status !== "disputed") {
+      throw new HttpsError(
+        "failed-precondition",
+        `Order status is ${order.status}, expected disputed`,
+      );
+    }
+    if (order.paymentMethod === "balance") {
+      throw new HttpsError(
+        "failed-precondition",
+        "Legacy balance order — manual handling required.",
+      );
+    }
+    const piId = order.stripePaymentIntentId;
+    if (!piId && refundPercent > 0) {
+      throw new HttpsError(
+        "failed-precondition",
+        "No PaymentIntent — cannot refund.",
+      );
+    }
+
+    // Admin-Audit-Log immer
+    const auditRef = db.collection("artifacts").doc(APP_ID)
+      .collection("orders").doc(orderId)
+      .collection("disputeAudit").doc();
+    const auditEntry = {
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      adminUid: request.auth.uid,
+      action: "adminResolveDispute",
+      refundPercent,
+      reason: reason.substring(0, 500),
+      applyServiceFeePolicy,
+      previousDisputeStatus: order.disputeStatus,
+    };
+
+    if (refundPercent === 0) {
+      // Pro Verkaeufer entschieden: Order zurueck zu shipped, neuer Auto-
+      // Release in 7 Tagen, dispute resolved.
+      const newAutoRelease = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+      await orderRef.update({
+        status: "shipped",
+        disputeStatus: "resolved",
+        adminResolvedAt: admin.firestore.FieldValue.serverTimestamp(),
+        adminResolvedBy: request.auth.uid,
+        adminResolutionNote: reason.substring(0, 500),
+        autoReleaseAt: newAutoRelease.toISOString(),
+        // Admin-resolved disputes counter (fuer Anti-Abuse-Tracking spaeter)
+      });
+      await auditRef.set({ ...auditEntry, outcome: "rejected_no_refund" });
+
+      sendNotification(
+        order.buyerId,
+        "Dispute resolved",
+        `Admin entschied gegen den Refund. Begruendung: ${reason.substring(0, 100)}`,
+        { type: "order", orderId },
+      );
+      sendNotification(
+        order.sellerId,
+        "Dispute resolved",
+        "Admin entschied zu deinen Gunsten. Order setzt fort.",
+        { type: "order", orderId },
+      );
+
+      console.log(`adminResolveDispute: order ${orderId} resolved 0% (seller win) by ${request.auth.uid}`);
+      return { success: true, outcome: "rejected_no_refund" };
+    }
+
+    // refundPercent > 0: tatsaechlicher Refund. Nutzt Policy-Engine wenn
+    // `applyServiceFeePolicy: true` (Default), sonst forciert Service-Fee
+    // bei Plattform.
+    const stripe = getStripe();
+    let policy;
+    if (applyServiceFeePolicy) {
+      policy = resolveRefundPolicy(
+        order,
+        order.disputeReasonCode || null,
+        refundPercent,
+      );
+    } else {
+      // Admin-Override: Service-Fee bleibt IMMER bei Plattform.
+      const totalCents = Math.round((order.totalPaid || 0) * 100);
+      const serviceFeeCents =
+        order.serviceFeeCents != null
+          ? order.serviceFeeCents
+          : Math.round((order.buyerServiceFee || 0) * 100);
+      const proportional = Math.round((totalCents * refundPercent) / 100);
+      const finalAmount = Math.min(proportional, totalCents - serviceFeeCents);
+      policy = {
+        amount: finalAmount,
+        refundApplicationFee: false,
+        reverseTransfer: true,
+        serviceFeeStaysWithPlatform: true,
+        refundedAmountEur: finalAmount / 100,
+      };
+    }
+
+    const refundParams = {
+      payment_intent: piId,
+      reverse_transfer: policy.reverseTransfer,
+      refund_application_fee: policy.refundApplicationFee,
+    };
+    if (policy.amount != null) {
+      refundParams.amount = policy.amount;
+    }
+
+    // Idempotency-Key (Security-Audit Round 2, 2026-04-29): bei
+    // Admin-Tap-Spam oder Network-Retry sonst Doppel-Refund-Risiko.
+    // Key inkludiert Admin-UID damit zwei Admins parallel nicht kollidieren
+    // (sehr unwahrscheinlich aber sauber): unterschiedliche Admin-UIDs
+    // sollen tatsaechlich beide Refunds nicht ausloesen — Order-State
+    // schuetzt aber bereits davor (status=disputed Check oben).
+    const refund = await stripe.refunds.create(refundParams, {
+      idempotencyKey: `refund-admin-${orderId}-${refundPercent}`,
+    });
+    console.log(
+      `adminResolveDispute: refund ${refund.id} created for order ${orderId} ` +
+      `(percent=${refundPercent}, amount=${policy.refundedAmountEur.toFixed(2)}, ` +
+      `serviceFeeStays=${policy.serviceFeeStaysWithPlatform})`,
+    );
+
+    await orderRef.update({
+      status: "refunded",
+      disputeStatus: "resolved",
+      resolvedAt: admin.firestore.FieldValue.serverTimestamp(),
+      adminResolvedAt: admin.firestore.FieldValue.serverTimestamp(),
+      adminResolvedBy: request.auth.uid,
+      adminResolutionNote: reason.substring(0, 500),
+      refundedAmount: policy.refundedAmountEur,
+      refundServiceFeeStaysWithPlatform: policy.serviceFeeStaysWithPlatform,
+      stripeRefundId: refund.id,
+    });
+    await auditRef.set({
+      ...auditEntry,
+      outcome: "refund_issued",
+      stripeRefundId: refund.id,
+      refundedAmountEur: policy.refundedAmountEur,
+    });
+
+    // Listing-Reservation freigeben
+    for (const item of (order.items || [])) {
+      if (!item.listingId) continue;
+      const listingRef = db.collection("artifacts").doc(APP_ID)
+        .collection("listings").doc(item.listingId);
+      const listingDoc = await listingRef.get();
+      if (listingDoc.exists) {
+        const listing = listingDoc.data();
+        const newReserved = Math.max(0, (listing.reservedQty || 0) - (item.quantity || 1));
+        const updateData = { reservedQty: newReserved };
+        if (listing.status === "reserved") updateData.status = "active";
+        await listingRef.update(updateData);
+      }
+    }
+
+    // Realized Gains reversal (mirrors respondToRefund)
+    const gainOnRecord = order.realizedGainOnShip || order.realizedGainOnDelivery || 0;
+    if (gainOnRecord && order.sellerId) {
+      const reversalAmount = gainOnRecord * (refundPercent / 100);
+      const sellerProfileRef = db.collection("artifacts").doc(APP_ID)
+        .collection("users").doc(order.sellerId).collection("data").doc("profile");
+      await sellerProfileRef.set({
+        realizedGains: admin.firestore.FieldValue.increment(-reversalAmount),
+      }, { merge: true });
+    }
+
+    // Strike if significant
+    if (refundPercent > 50) {
+      await addStrike(order.sellerId,
+        `Admin-resolved dispute refund ${refundPercent}% on order ${orderId}: ${reason.substring(0, 100)}`);
+    }
+
+    sendNotification(
+      order.buyerId,
+      "Refund issued",
+      `Admin: €${policy.refundedAmountEur.toFixed(2)} refunded.`,
+      { type: "order", orderId },
+    );
+    sendNotification(
+      order.sellerId,
+      "Refund issued",
+      `Admin entschied: €${policy.refundedAmountEur.toFixed(2)} refunded to buyer. Reason: ${reason.substring(0, 100)}`,
+      { type: "order", orderId },
+    );
+
+    return {
+      success: true,
+      outcome: "refund_issued",
+      refundAmount: policy.refundedAmountEur,
+      stripeRefundId: refund.id,
+      serviceFeeStaysWithPlatform: policy.serviceFeeStaysWithPlatform,
+    };
+  },
+);
+
+/**
+ * recalculateAllSellerTiers — Daily-Cron als Fallback.
+ * Läuft jede Nacht 03:00 Berlin und prüft alle aktiven Verkäufer-Profile.
+ * Idempotent: ruft syncSellerTier pro Verkäufer auf, der nichts ändert
+ * wenn Tier identisch bleibt.
+ */
+exports.recalculateAllSellerTiers = onSchedule(
+  {
+    schedule: "0 3 * * *",
+    timeZone: "Europe/Berlin",
+    timeoutSeconds: 540,
+    memory: "512MiB",
+    secrets: ["STRIPE_SECRET_KEY"],
+  },
+  async () => {
+    const sellersSnap = await db.collectionGroup("data")
+      .where("stripeAccountId", "!=", null)
+      .get();
+
+    let processed = 0;
+    let updated = 0;
+    let errors = 0;
+
+    for (const doc of sellersSnap.docs) {
+      // doc.ref looks like artifacts/{APP_ID}/users/{uid}/data/{docId}
+      // Only process sellerProfile-docs
+      if (doc.id !== "sellerProfile") continue;
+      const uid = doc.ref.parent.parent.id;
+      try {
+        const before = (doc.data().delayDays || 7);
+        await syncSellerTier(uid);
+        processed++;
+        const after = (await doc.ref.get()).data()?.delayDays || 7;
+        if (after !== before) updated++;
+      } catch (err) {
+        console.error(`recalculateAllSellerTiers ${uid}:`, err.message);
+        errors++;
+      }
+    }
+
+    console.log(
+      `recalculateAllSellerTiers: processed=${processed} updated=${updated} errors=${errors}`,
+    );
+  },
+);
+
+// ═══════════════════════════════════════════
+// ─── Phase 2 (2026-04-28): Wallet-Buy-Pfade entfernt ───
+// ═══════════════════════════════════════════
+//
+// Entfernte Functions: topUpBalance, purchaseWithBalance, requestPayout.
+// Architektur-Grundsatz (siehe CLAUDE.md → Payment-Architektur): Riftr
+// beruehrt zu KEINEM Zeitpunkt das Geld der User. Saemtliche Buy-Flows
+// laufen ueber `createPaymentIntent` mit `transfer_data: { destination }`
+// + `application_fee_amount`. Stripe Customer Balance / Manual-Payouts =
+// BaFin-Risiko und sind ausgeschlossen.
+//
+// Wallet-Helper-Funktionen (`ensureStripeCustomer`, `getStripeCustomerId`,
+// `updateBalanceCache`, `logTransaction`, `getTrustLevel`) bleiben erhalten —
+// sie werden weiterhin von Refund/Dispute/Cancel-Pfaden in `confirmDelivery`,
+// `cancelOrder`, dispute-handler genutzt. Phase 6 (Refund/Chargeback/Dispute)
+// raeumt diese spaeter sauber auf.
+//
+// Tote Helper aus dem Wallet-Buy-Pfad weg (Phase 2): getBalance,
+// getAvailableBalance, countTodayTopUps, countHourlyPurchases, getTodayPayoutTotal.
+//
+// `getWalletBalance` bleibt als Read-Only Earnings-View fuer Verkaeufer.
 
 // ═══════════════════════════════════════════
 // ─── Wallet: Get Balance (read-only) ───
@@ -3238,43 +5300,275 @@ function resolveBattlefields(names) {
   });
 }
 
+/**
+ * Parse Riot's organizedplay decklist page (Puppeteer-rendered innerText).
+ *
+ * Riot has shipped at least three templates we've seen in the wild:
+ *
+ *   T1 — Vegas era (mid-2025, original)
+ *     Legend Rank: 1 / 33 players
+ *     Overall Ranking: #490
+ *     Legend:                   <- block form
+ *     1 Ornn, ...
+ *     Champion:
+ *     1 Ornn, Forge God
+ *     Main Deck:                <- with colon
+ *     ...
+ *     Battlefields:
+ *     1 ...                     <- with "1 " prefix
+ *     Rune Pool:                <- explicit label
+ *     ...
+ *     Sideboard:
+ *
+ *   T2 — Bologna (Feb 2026)
+ *     Legend Rank: 1 / 33 players
+ *     Overall Ranking: #490
+ *     Legend: Ornn, ...         <- INLINE
+ *     Champion: Ornn, Forge God <- INLINE
+ *     Main Deck                 <- NO COLON
+ *     ...
+ *     8 Calm Rune               <- runes inserted directly after main deck
+ *     4 Mind Rune               <- with NO "Rune Pool" label
+ *     Battlefields              <- NO COLON
+ *     Aspirant's Climb          <- NO "1 " PREFIX
+ *     ...
+ *     Sideboard
+ *
+ *   T3 — Lille (Apr 2026)
+ *     Legend Rank:              <- EMPTY (just nbsps)
+ *     Overall Ranking: #478
+ *     Legend:                   <- block again
+ *     1 Ornn, ...
+ *     Champion:
+ *     1 Ornn, Forge God
+ *     Main Deck:                <- with colon
+ *     ...
+ *     Battlefields:             <- explicit label
+ *     1 Ornn's Forge            <- "1 " prefix
+ *     ...
+ *     Rune Pool:
+ *     ...
+ *     Sideboard:
+ *
+ * Strategy that works for all three:
+ *   - Anchor on `Overall Ranking: #N` (every block has exactly one)
+ *   - Player name = nearest non-empty non-label line BEFORE the anchor
+ *   - Sections accept label both with and without trailing colon
+ *   - Legend/Champion accept both inline (`Legend: <name>`) and block
+ *     (`Legend:\n1 <name>`) forms
+ *   - Battlefield entries accept both `1 <name>` and `<name>` rows
+ *   - Rune Pool: if no explicit label is found, scan within/after the
+ *     Main Deck section for `\d+\s+<word>\s+Rune` lines and reclassify
+ *     them as runes (Bologna inlines them at the end of Main Deck)
+ *
+ * Legend-Rank fields (legendRank/legendTotal) default to null when the
+ * template doesn't expose them — buildMetaDeck doesn't read them.
+ */
 function parseDecklistPage(bodyText) {
-  const decks = [];
-  const pattern =
-    /\n\n\n+([^\n]+)\nLegend Rank:\s*(\d+)\s*\/\s*(\d+)\s*players?\nOverall Ranking:\s*#(\d+)\s*\n+Legend:\n1\s+([^\n]+)\s*\n+Champion:\n1\s+([^\n]+)\s*\n+Main Deck:\n([\s\S]*?)\n+Battlefields:\n([\s\S]*?)\n+Rune Pool:\n([\s\S]*?)\n+Sideboard:\n([\s\S]*?)(?=\n\n\n|$)/g;
+  // Step 1 — normalise.
+  // U+00A0 (NO-BREAK SPACE) ubiquitous in Riot's rendered output.
+  // Tabs appear before some section labels.
+  const normalised = bodyText
+    .replace(/ /g, " ")
+    .replace(/\t+/g, " ")
+    .split(/\r?\n/)
+    .map((l) => l.replace(/\s+$/, "").replace(/^\s+(?=\S)/, (m) => (m.length > 4 ? "" : m)))
+    .map((l) => (l.trim() === "" ? "" : l))
+    .join("\n");
 
-  let m;
-  while ((m = pattern.exec(bodyText)) !== null) {
-    const parseCards = (block) => {
-      const r = {};
-      for (const line of block.trim().split("\n")) {
-        const cm = line.match(/^(\d+)\s+(.+)$/);
-        if (cm) r[cm[2].trim()] = parseInt(cm[1]);
+  const lines = normalised.split("\n");
+
+  // Step 2 — find every "Overall Ranking" anchor position (line index).
+  const anchors = [];
+  const overallRe = /^\s*Overall Ranking:\s*#?\s*(\d+)\s*$/i;
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(overallRe);
+    if (m) anchors.push({ line: i, overall: parseInt(m[1], 10) });
+  }
+  if (anchors.length === 0) return [];
+
+  // Helpers shared across all blocks.
+  // Section-label detector accepts both `Label:` AND `Label` (no-colon).
+  // Used to bound section scans — a label line means "stop reading the
+  // current section's body here".
+  const SECTION_NAMES = [
+    "Legend Rank", "Legend", "Champion", "Main Deck",
+    "Battlefields", "Rune Pool", "Sideboard",
+  ];
+  const isSectionLabel = (l) => {
+    const trimmed = l.replace(/^\s+/, "").replace(/\s+$/, "");
+    for (const name of SECTION_NAMES) {
+      // Match "Label" / "Label:" / "Label: <inline-content>". The inline
+      // form (T2 Bologna's "Legend: Ornn, ...") still counts as the start
+      // of a NEW section so we don't bleed into it from the previous one.
+      const re = new RegExp(`^${name}(?::|\\b).*$`, "i");
+      if (re.test(trimmed)) return true;
+    }
+    return false;
+  };
+
+  /** Parse "N CardName" lines from a section body, return Map of {name:qty}. */
+  const parseCardLines = (sectionLines) => {
+    const out = {};
+    for (const raw of sectionLines) {
+      const cm = raw.match(/^\s*(\d+)\s+(.+?)\s*$/);
+      if (cm) out[cm[2].trim()] = parseInt(cm[1], 10);
+    }
+    return out;
+  };
+
+  /** Find the line where a named section starts. Returns:
+   *    { idx: <line index>, inline: <string after colon, or "" if block> }
+   *  or null if the section isn't present in the window.
+   *  Accepts both `Label:` and `Label` (no-colon) variants. */
+  const findSectionStart = (label, startLine, endLineExclusive) => {
+    // Two regexes: WITH colon (and optional inline content), THEN no-colon.
+    // Try with-colon first because it's stricter and avoids matching
+    // accidental partial words elsewhere.
+    const reColon = new RegExp(`^\\s*${label}\\s*:\\s*(.*)\\s*$`, "i");
+    const reBare = new RegExp(`^\\s*${label}\\s*$`, "i");
+    for (let i = startLine; i < endLineExclusive; i++) {
+      const m = lines[i].match(reColon);
+      if (m) return { idx: i, inline: (m[1] || "").trim() };
+      if (reBare.test(lines[i])) return { idx: i, inline: "" };
+    }
+    return null;
+  };
+
+  /** Pull the body of a named section, stopping at the next section
+   *  label or [endLineExclusive]. Excludes the label line itself. */
+  const sliceSection = (label, startLine, endLineExclusive) => {
+    const start = findSectionStart(label, startLine, endLineExclusive);
+    if (!start) return { lines: [], inline: "", startIdx: -1, endIdx: -1 };
+    const out = [];
+    let endIdx = endLineExclusive;
+    for (let i = start.idx + 1; i < endLineExclusive; i++) {
+      const l = lines[i];
+      if (l === "") {
+        // Allow single blank separator inside the section body, stop on second.
+        if (out.length > 0 && out[out.length - 1] === "") {
+          endIdx = i;
+          break;
+        }
+        continue;
       }
-      return r;
+      if (isSectionLabel(l)) { endIdx = i; break; }
+      out.push(l);
+    }
+    return { lines: out, inline: start.inline, startIdx: start.idx, endIdx };
+  };
+
+  // Step 3 — for each anchor walk backwards to find player name.
+  // Player name heuristic: scan backwards from the anchor; the first
+  // non-empty, non-section-label line is the player. Stop at the
+  // previous anchor's footer to avoid bleeding into the prior deck.
+  const findPlayerName = (anchorIdx, prevAnchorEnd) => {
+    for (let i = anchorIdx - 1; i > prevAnchorEnd; i--) {
+      const l = lines[i];
+      if (!l) continue;
+      if (isSectionLabel(l)) continue;
+      // Skip the "Legend Rank:" line itself when it survived as a label.
+      if (/^\s*Legend Rank:\s*/i.test(l)) continue;
+      // Reject lines that look like card-quantity rows ("3 Pit Crew").
+      if (/^\s*\d+\s+/.test(l)) continue;
+      return l.trim();
+    }
+    return "";
+  };
+
+  const decks = [];
+  for (let a = 0; a < anchors.length; a++) {
+    const { line: anchorLine, overall } = anchors[a];
+    const prevAnchorEnd = a === 0 ? -1 : anchors[a - 1].line;
+    // The block runs from the anchor to the next anchor's player-name
+    // search-window boundary — the next deck's player name is ABOVE its
+    // anchor, so we stop sections at `nextAnchorLine - 4` (some buffer
+    // for empty/separator lines). Simpler & safer: stop at next anchor.
+    const nextAnchorLine = a + 1 < anchors.length ? anchors[a + 1].line : lines.length;
+
+    const player = findPlayerName(anchorLine, prevAnchorEnd);
+    if (!player) continue;
+
+    const legendSec = sliceSection("Legend", anchorLine, nextAnchorLine);
+    const championSec = sliceSection("Champion", anchorLine, nextAnchorLine);
+    const mainSec = sliceSection("Main Deck", anchorLine, nextAnchorLine);
+    const bfSec = sliceSection("Battlefields", anchorLine, nextAnchorLine);
+    const runeSec = sliceSection("Rune Pool", anchorLine, nextAnchorLine);
+    const sideSec = sliceSection("Sideboard", anchorLine, nextAnchorLine);
+
+    // ── Legend / Champion: support both inline and block forms. ──
+    // T2 (Bologna) writes them inline: `Legend: Ornn, ...`
+    // T1/T3 (Vegas/Lille) write them as a block: `Legend:\n1 Ornn, ...`
+    const blockFirstCard = (block) => {
+      for (const l of block) {
+        const m = l.match(/^\s*1\s+(.+?)\s*$/);
+        if (m) return m[1].trim();
+      }
+      return "";
     };
+    const legendName = legendSec.inline || blockFirstCard(legendSec.lines);
+    const championName = championSec.inline || blockFirstCard(championSec.lines);
+
+    if (!legendName || !championName) continue;
+
+    // ── Main Deck + Runes ──
+    // T2 Bologna inlines runes at the END of the Main Deck block with
+    // no "Rune Pool" header between them. We split by a heuristic:
+    // any "<qty> <Word> Rune" line at the END of the main-deck section
+    // is reclassified as a rune entry.
+    const allMainEntries = parseCardLines(mainSec.lines);
+    let mainDeck = allMainEntries;
+    let runes = parseCardLines(runeSec.lines);
+
+    if (Object.keys(runes).length === 0 && Object.keys(mainDeck).length > 0) {
+      // No explicit Rune Pool section. Split off trailing rune entries.
+      const split = {};
+      const cleanMain = {};
+      for (const [name, qty] of Object.entries(allMainEntries)) {
+        if (/\bRune$/i.test(name)) split[name] = qty;
+        else cleanMain[name] = qty;
+      }
+      if (Object.keys(split).length > 0) {
+        mainDeck = cleanMain;
+        runes = split;
+      }
+    }
+
+    if (Object.keys(mainDeck).length === 0) continue;
+
+    // ── Battlefields ──
+    // T1/T3: "1 Ornn's Forge"  — accept "1 <name>"
+    // T2: "Aspirant's Climb"   — accept bare name (no qty prefix)
+    // Filter out any rune-style line that snuck in due to ordering.
+    const battlefields = bfSec.lines
+      .map((l) => {
+        const withQty = l.match(/^\s*1\s+(.+?)\s*$/);
+        if (withQty) return withQty[1].trim();
+        // Bare line — strip leading/trailing whitespace, ignore empty
+        // and ignore obvious non-name junk (single-character/tab lines).
+        const bare = l.trim();
+        if (!bare || bare.length < 3) return null;
+        if (/^\d+\s/.test(bare)) return null; // a quantity line we don't want
+        return bare;
+      })
+      .filter(Boolean);
+
     decks.push({
-      player: m[1].trim(),
-      legendRank: parseInt(m[2]),
-      legendTotal: parseInt(m[3]),
-      overall: parseInt(m[4]),
-      legend: m[5].trim(),
-      champion: m[6].trim(),
-      mainDeck: parseCards(m[7]),
-      battlefields: m[8]
-        .trim()
-        .split("\n")
-        .map((l) => {
-          const x = l.match(/^1\s+(.+)$/);
-          return x ? x[1].trim() : null;
-        })
-        .filter(Boolean),
-      runes: parseCards(m[9]),
-      sideboard: parseCards(m[10]),
+      player,
+      legendRank: null,
+      legendTotal: null,
+      overall,
+      legend: legendName,
+      champion: championName,
+      mainDeck,
+      battlefields,
+      runes,
+      sideboard: parseCardLines(sideSec.lines),
     });
   }
 
-  // Deduplicate by player+overall
+  // Deduplicate by player+overall (defensive — Riot occasionally renders
+  // the same deck twice in a Top-X / Best-Of section overlap).
   const seen = new Set();
   return decks.filter((d) => {
     const key = d.player.toLowerCase() + "#" + d.overall;
@@ -3307,6 +5601,14 @@ function buildMetaDeck(deck, tournamentName, tournamentDate, sourceUrl) {
     ? `meta-${tSlug}-${deck.overall}-${slug}`
     : `meta-${tSlug}-best-${legendShort.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
 
+  // Resolve champion → add to mainDeck + store as chosenChampionId
+  const mainDeck = resolveDeckMap(deck.mainDeck);
+  const championCard = deck.champion ? CARDS_LOOKUP[deck.champion] : null;
+  const chosenChampionId = championCard ? championCard.id : "";
+  if (chosenChampionId && !mainDeck[chosenChampionId]) {
+    mainDeck[chosenChampionId] = 1;
+  }
+
   return {
     id: deckId,
     name: isTop8 ? `${legendShort} ${d1}/${d2}` : `Best ${legendShort}`,
@@ -3314,10 +5616,11 @@ function buildMetaDeck(deck, tournamentName, tournamentDate, sourceUrl) {
     legendId: legend ? legend.id : "",
     legendName: legend ? legend.name : deck.legend,
     legendImageUrl: legend ? legend.imageUrl || "" : "",
+    chosenChampionId,
     domains: [d1, d2],
     runeCount1: r1,
     runeCount2: r2,
-    mainDeck: resolveDeckMap(deck.mainDeck),
+    mainDeck,
     sideboard: resolveDeckMap(deck.sideboard),
     battlefields: resolveBattlefields(deck.battlefields),
     placement,
@@ -3330,6 +5633,56 @@ function buildMetaDeck(deck, tournamentName, tournamentDate, sourceUrl) {
     updatedAt: tournamentDate,
   };
 }
+
+// ── Toggle Deck Like ──
+exports.toggleDeckLike = onCall(
+  { region: "europe-west1" },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) throw new HttpsError("unauthenticated", "Login required");
+
+    // Rate-Limit (Round 6, 2026-04-29): 200 toggle-actions/User/Tag.
+    // Vorher konnte ein User toggle-spammen → Firestore-Quota-Burn auf
+    // Riftr-Konto. 200/Tag = ein Heavy-User der 100 Decks anschaut +
+    // 100 mal entscheidet zu liken/unliken — komfortabel ueber dem
+    // realistischen Use-Case (~5-10/Tag).
+    await enforceRateLimit(uid, "toggleDeckLike", 200);
+
+    const { deckId, collection } = request.data;
+    if (!deckId) throw new HttpsError("invalid-argument", "deckId required");
+
+    // Support both meta_decks and publicDecks
+    const validCollections = ["meta_decks", "publicDecks"];
+    const col = validCollections.includes(collection) ? collection : "meta_decks";
+
+    const deckRef = db.collection("artifacts").doc(APP_ID).collection(col).doc(deckId);
+    const likeRef = deckRef.collection("likes").doc(uid);
+
+    const result = await db.runTransaction(async (tx) => {
+      const likeDoc = await tx.get(likeRef);
+      const deckDoc = await tx.get(deckRef);
+      if (!deckDoc.exists) throw new HttpsError("not-found", "Deck not found");
+
+      if (likeDoc.exists) {
+        // Unlike
+        tx.delete(likeRef);
+        tx.update(deckRef, {
+          likeCount: admin.firestore.FieldValue.increment(-1),
+        });
+        return { liked: false };
+      } else {
+        // Like
+        tx.set(likeRef, { likedAt: new Date().toISOString() });
+        tx.update(deckRef, {
+          likeCount: admin.firestore.FieldValue.increment(1),
+        });
+        return { liked: true };
+      }
+    });
+
+    return result;
+  }
+);
 
 // Scheduled: Check daily for new tournament decklists
 exports.checkNewTournamentDecks = onSchedule(
@@ -3346,7 +5699,41 @@ exports.checkNewTournamentDecks = onSchedule(
       return;
     }
 
-    // Lazy-load Puppeteer only when needed
+    // ── Source-platform branching ──
+    // Mobalytics docs are processed via fetch+regex (no Puppeteer). Riot
+    // docs need Puppeteer for the Riot SSR rendering. Process Mobalytics
+    // first so a Puppeteer-launch failure doesn't block Asia imports.
+    const mobalyticsDocs = snap.docs.filter(
+      (d) => d.data().sourcePlatform === "mobalytics",
+    );
+    const riotDocs = snap.docs.filter(
+      (d) => (d.data().sourcePlatform || "riot") === "riot",
+    );
+
+    for (const doc of mobalyticsDocs) {
+      const t = doc.data();
+      const eventDate = t.eventDate ? new Date(t.eventDate) : null;
+      if (eventDate && eventDate > now) {
+        console.log(`Skipping ${t.name} — event date ${t.eventDate} is in the future.`);
+        continue;
+      }
+      try {
+        const r = await importMobalyticsTournament(doc.ref, t);
+        console.log(
+          `[Mobalytics-Import] ${t.name}: imported=${r.imported} ` +
+          `failedChampion=${r.failedChampion.length}`,
+        );
+      } catch (e) {
+        console.error(`[Mobalytics-Import] ${t.name} failed: ${e.message}`);
+      }
+    }
+
+    if (riotDocs.length === 0) {
+      console.log(`No Riot docs pending. Done after Mobalytics pass.`);
+      return;
+    }
+
+    // Lazy-load Puppeteer only when there's actual Riot work to do.
     const chromium = require("@sparticuz/chromium");
     const puppeteer = require("puppeteer-core");
     let browser;
@@ -3359,7 +5746,7 @@ exports.checkNewTournamentDecks = onSchedule(
         headless: chromium.headless,
       });
 
-      for (const doc of snap.docs) {
+      for (const doc of riotDocs) {
         const t = doc.data();
         const eventDate = new Date(t.eventDate);
         if (eventDate > now) {
@@ -3434,6 +5821,21 @@ exports.checkNewTournamentDecks = onSchedule(
 
         await batch.commit();
         console.log(`  ✅ Imported ${metaDecks.length} decks for ${t.name}`);
+
+        // Broadcast push to all users
+        try {
+          await admin.messaging().send({
+            topic: "all_users",
+            notification: {
+              title: "New Meta Decks!",
+              body: `${metaDecks.length} tournament decks from ${t.name}`,
+            },
+            data: { type: "meta_decks" },
+          });
+          console.log(`  📣 Push sent to all_users topic`);
+        } catch (pushErr) {
+          console.warn(`  ⚠️ Push failed: ${pushErr.message}`);
+        }
       }
     } finally {
       if (browser) await browser.close();
@@ -3443,8 +5845,9 @@ exports.checkNewTournamentDecks = onSchedule(
 
 // Manual trigger for testing
 exports.checkNewTournamentDecksManual = onRequest(
-  { timeoutSeconds: 300, memory: "1GiB", region: "us-central1" },
+  { timeoutSeconds: 300, memory: "1GiB", region: "us-central1", secrets: ["ADMIN_TRIGGER_SECRET"] },
   async (req, res) => {
+    if (!requireAdminSecret(req, res)) return;
     // Re-use the same logic
     try {
       await exports.checkNewTournamentDecks.run();
@@ -3455,4 +5858,1702 @@ exports.checkNewTournamentDecksManual = onRequest(
     }
   }
 );
+
+// ── Check for new UNL cards on Riftcodex ──
+
+const RIFTCODEX_API = "https://api.riftcodex.com";
+
+/**
+ * Fetch all UNL cards from Riftcodex API (paginated).
+ */
+async function fetchRiftcodexUNL() {
+  const all = [];
+  let page = 1;
+  let pages = 1;
+  while (page <= pages) {
+    const res = await fetch(`${RIFTCODEX_API}/cards?page=${page}`);
+    if (!res.ok) throw new Error(`Riftcodex API error: ${res.status}`);
+    const data = await res.json();
+    pages = data.pages;
+    const unl = (data.items || []).filter(c => (c.riftbound_id || "").startsWith("unl"));
+    all.push(...unl);
+    page++;
+  }
+  return all;
+}
+
+/**
+ * Transform a Riftcodex card to our cards.json format.
+ */
+function transformCard(c) {
+  let colNum = String(c.collector_number);
+  const isAltArt = c.metadata?.alternate_art || (c.name || "").includes("(Alternate Art)");
+  const isSig = c.metadata?.signature || (c.name || "").includes("(Signature)");
+  const isOver = c.metadata?.overnumbered || parseInt(colNum) > 219;
+
+  // Clean name: strip variant suffixes, convert " - " → ", "
+  let cleanName = (c.name || "")
+    .replace(/ \(Alternate Art\)$/i, "")
+    .replace(/ \(Overnumbered\)$/i, "")
+    .replace(/ \(Signature\)$/i, "")
+    .replace(/ - /, ", ");
+
+  // Collector number suffix
+  if (isAltArt && !colNum.includes("a")) colNum += "a";
+  if (isSig && !colNum.includes("*")) colNum += "*";
+
+  // Baron Nashor Ultimate fix (Riftcodex tags as Showcase, but it's Ultimate — confirmed by Riot)
+  let rarity = c.classification?.rarity || "Common";
+  if (cleanName === "Baron Nashor" && isOver && parseInt(colNum) >= 220) {
+    rarity = "Ultimate";
+  }
+
+  return {
+    id: c.id,
+    name: cleanName,
+    riftbound_id: c.riftbound_id,
+    tcgplayer_id: c.tcgplayer_id || null,
+    public_code: c.public_code || null,
+    collector_number: colNum,
+    attributes: c.attributes || {},
+    classification: { ...c.classification, rarity },
+    text: { rich: c.text?.rich || "", plain: c.text?.plain || "" },
+    set: { set_id: "UNL", label: "Unleashed" },
+    media: c.media || {},
+    tags: c.tags || [],
+    orientation: c.orientation || "portrait",
+    metadata: {
+      clean_name: cleanName,
+      alternate_art: isAltArt,
+      overnumbered: isOver,
+      signature: isSig,
+    },
+    display_name: cleanName,
+  };
+}
+
+/**
+ * Scheduled: Check daily for new UNL cards on Riftcodex.
+ * Writes new cards to Firestore card_updates collection.
+ * Sends topic push when new cards are found.
+ */
+exports.checkNewUNLCards = onSchedule(
+  { schedule: "every day 09:00", timeoutSeconds: 120, memory: "512MiB", region: "us-central1" },
+  async () => {
+    const updatesRef = db.collection("artifacts").doc(APP_ID).collection("card_updates");
+
+    // 1. Fetch all UNL cards from Riftcodex
+    const riftcodexCards = await fetchRiftcodexUNL();
+    console.log(`Riftcodex: ${riftcodexCards.length} UNL cards`);
+
+    // 2. Get known riftbound_ids from Firestore
+    const knownDoc = await updatesRef.doc("known_unl_ids").get();
+    const knownIds = new Set(knownDoc.exists ? (knownDoc.data().ids || []) : []);
+    console.log(`Known: ${knownIds.size} UNL cards`);
+
+    // 3. Find new cards
+    const newCards = riftcodexCards.filter(c => !knownIds.has(c.riftbound_id));
+    if (newCards.length === 0) {
+      console.log("checkNewUNLCards: 0 new cards");
+      return;
+    }
+
+    // 4. Transform and write to Firestore
+    const transformed = newCards.map(transformCard);
+    console.log(`checkNewUNLCards: ${transformed.length} new cards:`);
+    transformed.forEach(c => console.log(`  ${c.collector_number} ${c.name} (${c.classification.rarity})`));
+
+    // Write cards as individual documents (for app to merge)
+    let batch = db.batch();
+    let count = 0;
+    for (const card of transformed) {
+      batch.set(updatesRef.doc(card.riftbound_id.replace(/\//g, "-")), card);
+      count++;
+      if (count % 400 === 0) {
+        await batch.commit();
+        batch = db.batch();
+      }
+    }
+
+    // Update known IDs (all Riftcodex cards, not just new ones)
+    batch.set(updatesRef.doc("known_unl_ids"), {
+      ids: riftcodexCards.map(c => c.riftbound_id),
+      lastChecked: admin.firestore.FieldValue.serverTimestamp(),
+      totalCount: riftcodexCards.length,
+    });
+
+    await batch.commit();
+
+    // 5. Topic push to all users
+    try {
+      await admin.messaging().send({
+        topic: "all_users",
+        notification: {
+          title: "New UNL Cards!",
+          body: `${transformed.length} new Unleashed cards added`,
+        },
+        data: { type: "new_cards" },
+      });
+      console.log(`📣 Push sent to all_users topic`);
+    } catch (pushErr) {
+      console.warn(`⚠️ Push failed: ${pushErr.message}`);
+    }
+
+    console.log(`✅ checkNewUNLCards: imported ${transformed.length} new cards`);
+  }
+);
+
+// Manual trigger for testing
+exports.checkNewUNLCardsManual = onRequest(
+  { timeoutSeconds: 120, memory: "512MiB", region: "us-central1", secrets: ["ADMIN_TRIGGER_SECRET"] },
+  async (req, res) => {
+    if (!requireAdminSecret(req, res)) return;
+    try {
+      await exports.checkNewUNLCards.run();
+      res.json({ success: true });
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ error: e.message });
+    }
+  }
+);
+
+// ═══════════════════════════════════════════
+// ─── One-time Migration: playerProfiles ───
+// ═══════════════════════════════════════════
+
+exports.migratePlayerProfiles = onRequest(
+  { timeoutSeconds: 300, memory: "512MiB", region: "us-central1", secrets: ["ADMIN_TRIGGER_SECRET"] },
+  async (req, res) => {
+    if (!requireAdminSecret(req, res)) return;
+    try {
+      const usersRef = db.collection("artifacts").doc(APP_ID).collection("users");
+      const usersSnap = await usersRef.listDocuments();
+      let migrated = 0;
+      let skipped = 0;
+
+      // Erweiterte Migration (Security-Audit 2026-04-29): syncht jetzt auch
+      // sellerProfile public-Stats (rating, reviewCount, totalSales, memberSince)
+      // sowie bio + avatarUrl aus profile in den playerProfiles-Mirror.
+      // Existing users bekommen damit den vollen Mirror nachträglich,
+      // sodass die Author-View / fetchProfiles korrekt populated sind.
+      // Nutzt `syncPlayerProfile` Helper damit die Logik konsistent mit
+      // Live-Trigger-Pfaden ist (single source of truth).
+      for (const userDoc of usersSnap) {
+        const uid = userDoc.id;
+        const profileDoc = await userDoc.collection("data").doc("profile").get();
+        if (!profileDoc.exists) { skipped++; continue; }
+        const displayName = profileDoc.data().displayName;
+        if (!displayName || displayName.trim() === "") { skipped++; continue; }
+
+        await syncPlayerProfile(uid);
+        migrated++;
+      }
+
+      console.log(`Migration done: ${migrated} migrated, ${skipped} skipped`);
+      res.json({ success: true, migrated, skipped });
+    } catch (e) {
+      console.error("Migration failed:", e);
+      res.status(500).json({ error: e.message });
+    }
+  }
+);
+
+// ═══════════════════════════════════════════
+// ─── One-time Migration: createdAt from Firebase Auth ───
+// ═══════════════════════════════════════════
+
+exports.migrateCreatedAt = onRequest(
+  { timeoutSeconds: 300, memory: "512MiB", region: "us-central1", secrets: ["ADMIN_TRIGGER_SECRET"] },
+  async (req, res) => {
+    if (!requireAdminSecret(req, res)) return;
+    try {
+      let migrated = 0;
+      let skipped = 0;
+      let nextPageToken;
+
+      do {
+        const listResult = await admin.auth().listUsers(100, nextPageToken);
+        for (const userRecord of listResult.users) {
+          const uid = userRecord.uid;
+          const creationTime = userRecord.metadata.creationTime;
+          if (!creationTime) { skipped++; continue; }
+
+          const profileRef = db.collection("artifacts").doc(APP_ID)
+            .collection("users").doc(uid)
+            .collection("data").doc("profile");
+          const profileDoc = await profileRef.get();
+
+          // Only set createdAt if it doesn't exist yet
+          if (profileDoc.exists && profileDoc.data().createdAt) {
+            skipped++;
+            continue;
+          }
+
+          await profileRef.set({
+            createdAt: new Date(creationTime).toISOString(),
+          }, { merge: true });
+
+          migrated++;
+        }
+        nextPageToken = listResult.pageToken;
+      } while (nextPageToken);
+
+      console.log(`createdAt migration: ${migrated} migrated, ${skipped} skipped`);
+      res.json({ success: true, migrated, skipped });
+    } catch (e) {
+      console.error("createdAt migration failed:", e);
+      res.status(500).json({ error: e.message });
+    }
+  }
+);
+
+// ═══════════════════════════════════════════
+// ─── Cart Reservation System ───
+// ═══════════════════════════════════════════
+
+const CART_RESERVATION_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
+/**
+ * Reserve listing quantity for a cart item.
+ * Uses Firestore Transaction to prevent race conditions.
+ */
+// ─── Cart-Reservation Per-User-Limit (Security-Audit Round 2, 2026-04-29) ──
+// Schuetzt vor Inventory-DoS: ohne Limit kann ein User (oder ein Bot ohne
+// App Check) beliebig viele Listings dauerhaft blocken (Reserve → 30min
+// TTL → Re-Reserve in Endlosschleife). Limit:
+//   - max 50 aktive Reservations pro User gleichzeitig
+//   - max 100 Karten total summiert ueber alle Reservations
+// 50/100 = sehr grosszuegig fuer einen ehrlichen Smart-Cart der bei einem
+// 60-Karten-Deck ueber 5-10 Verkaeufer aufteilt; aber blockt Bots die
+// 1000 Listings parallel reservieren.
+const MAX_ACTIVE_RESERVATIONS_PER_USER = 50;
+const MAX_RESERVED_CARDS_PER_USER = 100;
+
+exports.reserveForCart = onCall(
+  { region: "europe-west1" },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) throw new HttpsError("unauthenticated", "Not signed in");
+
+    const { listingId, quantity } = request.data;
+    if (!listingId || !quantity || quantity < 1) {
+      throw new HttpsError("invalid-argument", "listingId and quantity required");
+    }
+    // Per-Listing-Cap: Single-Reservation darf nicht das ganze Limit
+    // alleine beanspruchen (sonst koennte 1 boeswillige Reservation alle
+    // anderen blockieren). Hard-Cap = 50 Karten pro Single-Listing-Res.
+    if (quantity > 50) {
+      throw new HttpsError("invalid-argument", "Quantity exceeds per-listing reservation cap (50)");
+    }
+
+    const listingRef = db.collection("artifacts").doc(APP_ID)
+      .collection("listings").doc(listingId);
+    const reservationRef = db.collection("artifacts").doc(APP_ID)
+      .collection("users").doc(uid)
+      .collection("cartReservations").doc(listingId);
+
+    // Pre-Transaction: aktive Reservations des Users auslesen fuer
+    // Per-User-Cap-Check. Wir lesen non-transaktional weil:
+    //  (a) Reservations werden nur durch reserveForCart/release/update
+    //      mutiert, alle gehen durch CFs, kein paralleles Listing-Schreiben.
+    //  (b) Read-then-write-Race ist sehr unwahrscheinlich (User macht nicht
+    //      gleichzeitig 2 reserveForCart-Calls fuer DIFFERENT listings) und
+    //      worst-case ueberschreitet das Limit um 1 — nicht kritisch.
+    const userReservationsSnap = await db
+      .collection("artifacts").doc(APP_ID)
+      .collection("users").doc(uid)
+      .collection("cartReservations")
+      .get();
+
+    let activeCount = 0;
+    let activeQtyTotal = 0;
+    let hasExistingForListing = false;
+    let existingQtyForListing = 0;
+    const nowMs = Date.now();
+    for (const resDoc of userReservationsSnap.docs) {
+      const res = resDoc.data();
+      const expMs = res.expiresAt ? new Date(res.expiresAt).getTime() : 0;
+      if (expMs <= nowMs) continue; // Expired Reservations ignorieren (cleanExpiredReservations cron entfernt sie spaeter)
+      activeCount++;
+      activeQtyTotal += res.quantity || 0;
+      if (resDoc.id === listingId) {
+        hasExistingForListing = true;
+        existingQtyForListing = res.quantity || 0;
+      }
+    }
+
+    // Per-User-Cap-Check: nur wenn das eine NEUE Reservation ist (nicht
+    // existing-Update) oder die existing-Quantity erhoeht wird.
+    const wouldAddCount = hasExistingForListing ? 0 : 1;
+    const wouldAddQty = Math.max(0, quantity - existingQtyForListing);
+
+    if (activeCount + wouldAddCount > MAX_ACTIVE_RESERVATIONS_PER_USER) {
+      throw new HttpsError(
+        "resource-exhausted",
+        `Cart reservation limit reached (${MAX_ACTIVE_RESERVATIONS_PER_USER}). Remove some items before adding more.`,
+      );
+    }
+    if (activeQtyTotal + wouldAddQty > MAX_RESERVED_CARDS_PER_USER) {
+      throw new HttpsError(
+        "resource-exhausted",
+        `Total cart card limit reached (${MAX_RESERVED_CARDS_PER_USER}). Remove some items before adding more.`,
+      );
+    }
+
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + CART_RESERVATION_TTL_MS);
+
+    await db.runTransaction(async (tx) => {
+      const listingDoc = await tx.get(listingRef);
+      if (!listingDoc.exists) throw new HttpsError("not-found", "Listing not found");
+
+      const listing = listingDoc.data();
+      if (listing.status !== "active") throw new HttpsError("failed-precondition", "Listing not active");
+      if (listing.sellerId === uid) throw new HttpsError("failed-precondition", "Cannot buy own listing");
+
+      const available = (listing.quantity || 0) - (listing.reservedQty || 0);
+
+      // Check if user already has a reservation for this listing
+      const existingRes = await tx.get(reservationRef);
+      const existingQty = existingRes.exists ? (existingRes.data().quantity || 0) : 0;
+      const additionalQty = quantity - existingQty;
+
+      if (additionalQty > 0 && available < additionalQty) {
+        throw new HttpsError("failed-precondition", `Only ${available + existingQty} available`);
+      }
+
+      if (additionalQty !== 0) {
+        tx.update(listingRef, {
+          reservedQty: admin.firestore.FieldValue.increment(additionalQty),
+        });
+      }
+
+      tx.set(reservationRef, {
+        listingId,
+        sellerId: listing.sellerId,
+        quantity,
+        reservedAt: now.toISOString(),
+        expiresAt: expiresAt.toISOString(),
+      });
+    });
+
+    return { success: true, expiresAt: expiresAt.toISOString() };
+  }
+);
+
+/**
+ * Release a cart reservation (remove item from cart).
+ */
+exports.releaseCartReservation = onCall(
+  { region: "europe-west1" },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) throw new HttpsError("unauthenticated", "Not signed in");
+
+    const { listingId } = request.data;
+    if (!listingId) throw new HttpsError("invalid-argument", "listingId required");
+
+    const reservationRef = db.collection("artifacts").doc(APP_ID)
+      .collection("users").doc(uid)
+      .collection("cartReservations").doc(listingId);
+    const listingRef = db.collection("artifacts").doc(APP_ID)
+      .collection("listings").doc(listingId);
+
+    await db.runTransaction(async (tx) => {
+      const resDoc = await tx.get(reservationRef);
+      if (!resDoc.exists) return; // Already released, no-op
+
+      const qty = resDoc.data().quantity || 0;
+      const listingDoc = await tx.get(listingRef);
+
+      if (listingDoc.exists) {
+        const currentReserved = listingDoc.data().reservedQty || 0;
+        tx.update(listingRef, {
+          reservedQty: Math.max(0, currentReserved - qty),
+        });
+      }
+
+      tx.delete(reservationRef);
+    });
+
+    return { success: true };
+  }
+);
+
+/**
+ * Update quantity of an existing cart reservation.
+ */
+exports.updateCartReservation = onCall(
+  { region: "europe-west1" },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) throw new HttpsError("unauthenticated", "Not signed in");
+
+    const { listingId, newQuantity } = request.data;
+    if (!listingId || newQuantity == null) {
+      throw new HttpsError("invalid-argument", "listingId and newQuantity required");
+    }
+
+    // Quantity 0 = release
+    if (newQuantity <= 0) {
+      return exports.releaseCartReservation.run({ auth: request.auth, data: { listingId } });
+    }
+
+    // Per-Listing-Cap (Security-Audit Round 2, 2026-04-29): identisch zu
+    // reserveForCart, sonst koennte ein User via update das Limit umgehen.
+    if (newQuantity > 50) {
+      throw new HttpsError("invalid-argument", "Quantity exceeds per-listing reservation cap (50)");
+    }
+
+    const reservationRef = db.collection("artifacts").doc(APP_ID)
+      .collection("users").doc(uid)
+      .collection("cartReservations").doc(listingId);
+    const listingRef = db.collection("artifacts").doc(APP_ID)
+      .collection("listings").doc(listingId);
+
+    // Per-User-Cap-Check fuer Quantity-Increase (Security-Audit Round 2):
+    // updateCartReservation kann nur die quantity einer EXISTING Reservation
+    // aendern, also activeCount aendert sich nicht — nur die Total-Card-
+    // Summe wird gegen MAX_RESERVED_CARDS_PER_USER geprueft.
+    const userReservationsSnap = await db
+      .collection("artifacts").doc(APP_ID)
+      .collection("users").doc(uid)
+      .collection("cartReservations")
+      .get();
+    const nowMs = Date.now();
+    let activeQtyTotal = 0;
+    let currentQtyForListing = 0;
+    for (const resDoc of userReservationsSnap.docs) {
+      const res = resDoc.data();
+      const expMs = res.expiresAt ? new Date(res.expiresAt).getTime() : 0;
+      if (expMs <= nowMs) continue;
+      activeQtyTotal += res.quantity || 0;
+      if (resDoc.id === listingId) {
+        currentQtyForListing = res.quantity || 0;
+      }
+    }
+    const wouldAddQty = Math.max(0, newQuantity - currentQtyForListing);
+    if (activeQtyTotal + wouldAddQty > MAX_RESERVED_CARDS_PER_USER) {
+      throw new HttpsError(
+        "resource-exhausted",
+        `Total cart card limit reached (${MAX_RESERVED_CARDS_PER_USER}). Remove some items before adding more.`,
+      );
+    }
+
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + CART_RESERVATION_TTL_MS);
+
+    await db.runTransaction(async (tx) => {
+      const resDoc = await tx.get(reservationRef);
+      if (!resDoc.exists) throw new HttpsError("not-found", "No reservation found");
+
+      const currentQty = resDoc.data().quantity || 0;
+      const diff = newQuantity - currentQty;
+
+      if (diff !== 0) {
+        const listingDoc = await tx.get(listingRef);
+        if (!listingDoc.exists) throw new HttpsError("not-found", "Listing not found");
+
+        if (diff > 0) {
+          const available = (listingDoc.data().quantity || 0) - (listingDoc.data().reservedQty || 0);
+          if (available < diff) {
+            throw new HttpsError("failed-precondition", `Only ${available + currentQty} available`);
+          }
+        }
+
+        tx.update(listingRef, {
+          reservedQty: admin.firestore.FieldValue.increment(diff),
+        });
+      }
+
+      tx.update(reservationRef, {
+        quantity: newQuantity,
+        expiresAt: expiresAt.toISOString(), // Refresh timer on update
+      });
+    });
+
+    return { success: true, expiresAt: expiresAt.toISOString() };
+  }
+);
+
+/**
+ * Firestore-Trigger: populiert sellerRating + sellerSales auf jedem neuen
+ * Listing aus dem `sellerProfile`-Doc (server-trusted source).
+ *
+ * Hintergrund (Security-Audit Round 4, 2026-04-29):
+ * Pre-Round-4 hat der Flutter-Client diese Felder beim Listing-Erstellen
+ * mitgeschickt — Self-Stats-Fraud-Vektor (Seller decompiled App, schreibt
+ * fake `sellerRating: 5.0, sellerSales: 999`). Firestore-Rules blocken
+ * jetzt Client-Writes mit non-zero Werten. Dieser Trigger laedt die
+ * authentischen Werte aus sellerProfile (CF-managed) und schreibt sie
+ * via Admin-SDK (umgeht Rules) ins Listing.
+ *
+ * Idempotent — wenn die Werte schon gesetzt sind (z.B. bei Doc-Replay
+ * durch GCP), no-op.
+ *
+ * Latency: ~1-2s zwischen Listing-Create und Trigger-Run. UI sollte
+ * `sellerSales: 0` als „New seller" rendern, nicht als „0 Sales".
+ */
+exports.populateListingSellerStats = onDocumentCreated(
+  {
+    document: `artifacts/${APP_ID}/listings/{listingId}`,
+    region: "europe-west1",
+    timeoutSeconds: 30,
+  },
+  async (event) => {
+    const snap = event.data;
+    if (!snap) return;
+    const listing = snap.data();
+    const sellerId = listing.sellerId;
+    if (!sellerId) {
+      console.warn(`populateListingSellerStats: ${snap.id} has no sellerId`);
+      return;
+    }
+
+    // Read trusted sellerProfile + playerProfile mirror.
+    // sellerProfile.rating / totalSales sind die Source-of-Truth (CF-managed,
+    // wird bei submitReview / confirmDelivery upgedatet).
+    try {
+      const sellerProfileRef = db.collection("artifacts").doc(APP_ID)
+        .collection("users").doc(sellerId)
+        .collection("data").doc("sellerProfile");
+      const sellerDoc = await sellerProfileRef.get();
+      if (!sellerDoc.exists) {
+        console.log(
+          `populateListingSellerStats: ${snap.id} seller=${sellerId} ` +
+          `has no sellerProfile yet — leaving stats at 0`,
+        );
+        return;
+      }
+      const seller = sellerDoc.data();
+      const sellerRating = (typeof seller.rating === "number") ? seller.rating : 0;
+      const sellerSales = (typeof seller.totalSales === "number") ? seller.totalSales : 0;
+
+      if (sellerRating === 0 && sellerSales === 0) {
+        // Nichts zu tun — User ist tatsaechlich ein neuer Seller.
+        return;
+      }
+
+      await snap.ref.update({
+        sellerRating,
+        sellerSales,
+      });
+      console.log(
+        `populateListingSellerStats: ${snap.id} populated rating=${sellerRating}, sales=${sellerSales}`,
+      );
+    } catch (err) {
+      console.error(
+        `populateListingSellerStats: ${snap.id} failed: ${err.message}`,
+      );
+    }
+  },
+);
+
+/**
+ * Clean up expired cart reservations (runs every 5 minutes).
+ */
+exports.cleanExpiredReservations = onSchedule(
+  { schedule: "every 5 minutes", region: "us-central1", timeoutSeconds: 120 },
+  async () => {
+    const now = new Date().toISOString();
+    const expiredSnap = await db.collectionGroup("cartReservations")
+      .where("expiresAt", "<", now)
+      .get();
+
+    if (expiredSnap.empty) {
+      console.log("No expired reservations");
+      return;
+    }
+
+    console.log(`Cleaning ${expiredSnap.size} expired reservations`);
+    let cleaned = 0;
+
+    for (const doc of expiredSnap.docs) {
+      const data = doc.data();
+      const listingId = data.listingId;
+      const qty = data.quantity || 0;
+
+      try {
+        const listingRef = db.collection("artifacts").doc(APP_ID)
+          .collection("listings").doc(listingId);
+
+        await db.runTransaction(async (tx) => {
+          const listingDoc = await tx.get(listingRef);
+          if (listingDoc.exists) {
+            const currentReserved = listingDoc.data().reservedQty || 0;
+            tx.update(listingRef, {
+              reservedQty: Math.max(0, currentReserved - qty),
+            });
+          }
+          tx.delete(doc.ref);
+        });
+        cleaned++;
+      } catch (e) {
+        console.error(`Failed to clean reservation ${doc.id}: ${e.message}`);
+      }
+    }
+
+    console.log(`Cleaned ${cleaned}/${expiredSnap.size} expired reservations`);
+  }
+);
+
+// ═══════════════════════════════════════════════════════════════════
+// ─── Tournament Auto-Discovery ───
+// ═══════════════════════════════════════════════════════════════════
+//
+// Pulls Riot's official "Eyes on <City> – What to Know" announcement
+// posts and writes one `meta_tournament_schedule` doc per discovered
+// tournament. The existing `checkNewTournamentDecks` cron then picks
+// those docs up, scrapes the corresponding `/organizedplay/<slug>/`
+// decklist post (when Riot publishes it post-event), and imports the
+// decks into `meta_decks`.
+//
+// Why announcements (not /organizedplay/)?
+//   /organizedplay/ posts appear AFTER the event with the decklists.
+//   /announcements/ "Eyes on X" posts appear BEFORE the event and are
+//   the only reliable signal that tells us "tournament X happens on
+//   date Y in city Z" — enough to seed a schedule doc whose decklist
+//   slug we predict (top-decks / best-decks / etc — multiple tries).
+//
+// Architecture:
+//   discoverTournamentsFromRiot           — daily 07:30 UTC, scheduled
+//   discoverTournamentsFromRiotManual     — HTTP, manual trigger
+//   backfillTournamentsFromRiot           — HTTP, one-time deploy backfill
+//
+// Dedup: Doc-ID = announcement slug. Idempotent — running daily is safe.
+// ═══════════════════════════════════════════════════════════════════
+
+const RIOT_BASE = "https://riftbound.leagueoflegends.com";
+const RIOT_USER_AGENT = "Riftstats-Discovery/1.0 (+https://riftr.app)";
+const ANNOUNCEMENTS_INDEX = `${RIOT_BASE}/en-us/news/announcements/`;
+const UPCOMING_EVENTS_PAGE =
+  `${RIOT_BASE}/en-us/news/announcements/riftbounds-upcoming-official-events/`;
+// Slug pattern Riot uses consistently for pre-event posts:
+// "eyes-on-lille-what-to-know", "eyes-on-atlanta-what-to-know" etc.
+const ANNOUNCEMENT_SLUG_REGEX = /^eyes-on-[a-z0-9-]+-what-to-know$/i;
+// Mobalytics fallback URL for slug-hint lookup. Used when a schedule
+// doc has been pending >30 days without any decklist hit.
+const MOBALYTICS_TOURNAMENTS = "https://mobalytics.gg/riftbound/tournaments";
+
+/**
+ * Fetch a URL with retries on transient failure (timeouts, 5xx).
+ * Throws after retries exhausted. We don't currently alert externally —
+ * just log loudly so the daily run surfaces in Cloud Logging.
+ */
+async function fetchWithRetries(url, { retries = 3, timeoutMs = 15000 } = {}) {
+  let lastErr;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+      const res = await fetch(url, {
+        headers: { "User-Agent": RIOT_USER_AGENT, Accept: "text/html" },
+        signal: ctrl.signal,
+      });
+      clearTimeout(timer);
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status} for ${url}`);
+      }
+      return await res.text();
+    } catch (e) {
+      lastErr = e;
+      console.warn(`[Discovery] fetch attempt ${attempt}/${retries} failed for ${url}: ${e.message}`);
+      if (attempt < retries) {
+        // Backoff: 1s, 2s, 4s
+        await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt - 1)));
+      }
+    }
+  }
+  throw lastErr;
+}
+
+/**
+ * Extract every announcement-slug + best-effort title from the news
+ * index HTML. Server-rendered, so we just regex over the article links.
+ *
+ * Returns [{ slug, title }] — title may be empty when Riot's markup
+ * places it outside the <a>; the article-page fetcher fills it in.
+ */
+function parseAnnouncementIndex(html) {
+  const found = new Map();
+  const linkRe =
+    /<a[^>]+href="\/en-us\/news\/announcements\/([a-z0-9-]+)\/?"[^>]*>([\s\S]*?)<\/a>/gi;
+  let m;
+  while ((m = linkRe.exec(html)) !== null) {
+    const slug = m[1].toLowerCase();
+    if (!ANNOUNCEMENT_SLUG_REGEX.test(slug)) continue;
+    // Strip nested HTML from the link content to get a rough title.
+    const innerText = m[2]
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!found.has(slug) || (!found.get(slug).title && innerText)) {
+      found.set(slug, { slug, title: innerText });
+    }
+  }
+  return [...found.values()];
+}
+
+/**
+ * Parse a single "Eyes on <City>" article body to extract:
+ *   - city            (from title or H1)
+ *   - eventDate       (ISO yyyy-mm-dd, START of event)
+ *   - eventEndDate    (ISO, optional — multi-day events)
+ *
+ * Heuristics — Riot's body prose is pretty consistent but not perfectly
+ * structured. We try several patterns and fall back to null when none
+ * match. The outer caller skips schedule-doc creation when we can't
+ * derive an eventDate (better to skip than queue garbage).
+ */
+function parseAnnouncementArticle(html, slug) {
+  // Title — prefer <h1>, fall back to <title>, fall back to slug.
+  let title =
+    (html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i)?.[1] || "")
+      .replace(/<[^>]+>/g, "")
+      .replace(/\s+/g, " ")
+      .trim() ||
+    (html.match(/<title>([\s\S]*?)<\/title>/i)?.[1] || "")
+      .replace(/\s*\|.*$/, "")
+      .trim();
+  if (!title) {
+    // Last resort: humanise the slug.
+    title = slug.replace(/-/g, " ");
+  }
+
+  // City — "Eyes on <City> –" or "Eyes on <City>:" patterns.
+  let city = "";
+  const cityMatch =
+    title.match(/Eyes\s+on\s+([A-Z][\w\s'-]+?)\s*[–:\-—]/i) ||
+    title.match(/Eyes\s+on\s+([A-Z][\w\s'-]+?)\s*$/i) ||
+    slug.match(/^eyes-on-([a-z0-9-]+?)-what-to-know$/i);
+  if (cityMatch) {
+    city = cityMatch[1]
+      .replace(/-/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .replace(/\b\w/g, (c) => c.toUpperCase());
+  }
+
+  // Event-date extraction.
+  // Riot's prose looks like:
+  //   "join us April 17th-19th at Lille Grand Palais"
+  //   "Atlanta, GA on April 24-26"
+  //   "in Bologna May 9-11, 2026"
+  // — i.e. ordinals (17th/19th), optional year, day-ranges as the
+  //  primary signal. Plain regex for single dates would also match
+  //  filler dates like "Effective March 31, 2026, four cards..." (the
+  //  bans note in the Lille article), so we PREFER date-ranges and
+  //  fall back to single dates only when no range exists.
+  //
+  // Year fallback: the announcement publish-date is in the JSON-LD
+  // (datePublished) or near the title. We grab any 20XX year on the
+  // page and use it when the inline date omits the year.
+  const text = html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ");
+
+  const months = {
+    january: 1, february: 2, march: 3, april: 4, may: 5, june: 6,
+    july: 7, august: 8, september: 9, october: 10, november: 11, december: 12,
+  };
+  const monthAlt = "(?:January|February|March|April|May|June|July|August|September|October|November|December)";
+  // Accepts ordinals (17th/1st/22nd) and plain digits.
+  const dayPart = "(\\d{1,2})(?:st|nd|rd|th)?";
+
+  // Year fallback: take the article's earliest 20XX occurrence (publish
+  // year sits at the very top of the body).
+  const fallbackYearMatch = text.match(/\b(20\d{2})\b/);
+  const fallbackYear = fallbackYearMatch ? parseInt(fallbackYearMatch[1]) : new Date().getFullYear();
+
+  let eventDate = null;
+  let eventEndDate = null;
+
+  // Pass 1 — date ranges (highest signal): "April 17th-19th[, 2026]"
+  // "April 17 – April 19, 2026"
+  const rangeRe = new RegExp(
+    `\\b${monthAlt}\\s+${dayPart}\\s*[–\\-]\\s*(?:${monthAlt}\\s+)?${dayPart}(?:\\s*,?\\s*(\\d{4}))?`,
+    "i",
+  );
+  const rm = text.match(rangeRe);
+  if (rm) {
+    const month = months[rm[0].match(new RegExp(monthAlt, "i"))[0].toLowerCase()];
+    const day = parseInt(rm[1]);
+    const endDay = parseInt(rm[2]);
+    const year = rm[3] ? parseInt(rm[3]) : fallbackYear;
+    const pad = (n) => String(n).padStart(2, "0");
+    eventDate = `${year}-${pad(month)}-${pad(day)}`;
+    if (endDay > day) eventEndDate = `${year}-${pad(month)}-${pad(endDay)}`;
+  } else {
+    // Pass 2 — single date with explicit year: "April 24, 2026". Skip
+    // the first match if it's preceded by "Effective" or "Effective:"
+    // (bans-announcement filler that occasionally appears before the
+    // event date).
+    const singleRe = new RegExp(
+      `\\b${monthAlt}\\s+${dayPart}\\s*,\\s*(\\d{4})`,
+      "gi",
+    );
+    let dm;
+    while ((dm = singleRe.exec(text)) !== null) {
+      const ctxStart = Math.max(0, dm.index - 30);
+      const ctx = text.substring(ctxStart, dm.index).toLowerCase();
+      if (/\b(effective|since|starting|deadline)\b/.test(ctx)) continue;
+      const month = months[dm[0].match(new RegExp(monthAlt, "i"))[0].toLowerCase()];
+      const day = parseInt(dm[1]);
+      const year = parseInt(dm[2]);
+      const pad = (n) => String(n).padStart(2, "0");
+      eventDate = `${year}-${pad(month)}-${pad(day)}`;
+      break;
+    }
+  }
+
+  return { city, title, eventDate, eventEndDate };
+}
+
+/**
+ * Generate decklist-slug candidates for a city. Riot has used multiple
+ * naming conventions across events:
+ *   - vegas-top-decks                   (Vegas)
+ *   - lilles-top-decks                  (Lille — note the trailing "s")
+ *   - the-best-decks-out-of-bologna     (Bologna)
+ * No single regex predicts all three, so we generate every plausible
+ * slug and the existing `checkNewTournamentDecks` cron probes them all.
+ */
+function buildSlugCandidates(city) {
+  const lower = city.toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, "");
+  if (!lower) return [];
+  return [
+    `${lower}-top-decks`,
+    `${lower}s-top-decks`,
+    `the-best-decks-out-of-${lower}`,
+    `best-decks-${lower}`,
+    `${lower}-decklists`,
+    `${lower}-results`,
+  ];
+}
+
+/**
+ * Build a tournament-name from city + slug. Convention used by existing
+ * meta_decks: "Vegas Regional Qualifier", "Bologna Regional Qualifier".
+ * We can't always tell whether an event is RQ vs Open vs City Challenge
+ * just from the announcement, so we default to "Regional Qualifier" —
+ * the manual operator can edit the doc if a specific event differs.
+ */
+function tournamentNameFor(city) {
+  return city ? `${city} Regional Qualifier` : "";
+}
+
+/**
+ * Core discovery pass. Lists the announcements index, filters Eyes-on
+ * slugs, fetches each article body for date+city, and writes any new
+ * docs to `meta_tournament_schedule`. Returns a summary object.
+ *
+ * Idempotent: doc.id == slug → existing docs are skipped untouched.
+ */
+async function runDiscoveryPass({ source = "scheduled" } = {}) {
+  const indexHtml = await fetchWithRetries(ANNOUNCEMENTS_INDEX);
+  const candidates = parseAnnouncementIndex(indexHtml);
+  console.log(`[Discovery] index: ${candidates.length} eyes-on slugs found`);
+
+  if (candidates.length === 0) {
+    // Schema change suspected — Riot may have changed the slug naming
+    // or the listing's HTML markup. Don't crash; just loudly warn so
+    // the daily log surfaces it.
+    console.warn(
+      "[Discovery] WARNING: 0 eyes-on slugs matched. " +
+      "Possible Riot schema change — check ANNOUNCEMENT_SLUG_REGEX or markup."
+    );
+  }
+
+  const scheduleRef = db.collection("artifacts").doc(APP_ID)
+    .collection("meta_tournament_schedule");
+
+  const created = [];
+  const skipped = [];
+  const failed = [];
+
+  for (const { slug, title: indexTitle } of candidates) {
+    try {
+      const docRef = scheduleRef.doc(slug);
+      const existing = await docRef.get();
+      if (existing.exists) {
+        skipped.push(slug);
+        continue;
+      }
+
+      // Fetch the article body to extract city + eventDate.
+      const articleUrl = `${RIOT_BASE}/en-us/news/announcements/${slug}/`;
+      const articleHtml = await fetchWithRetries(articleUrl);
+      const parsed = parseAnnouncementArticle(articleHtml, slug);
+
+      if (!parsed.eventDate) {
+        // Body parser couldn't find a date. Don't queue garbage —
+        // skip and log; manual operator can address if it persists.
+        console.warn(
+          `[Discovery] no eventDate parsed for ${slug} (title="${parsed.title}") — skipping`
+        );
+        failed.push({ slug, reason: "no eventDate parsed" });
+        continue;
+      }
+
+      const city = parsed.city || indexTitle.replace(/^Eyes on\s+/i, "").split(/[–:\-—]/)[0].trim();
+      const slugCandidates = buildSlugCandidates(city);
+
+      await docRef.set({
+        name: tournamentNameFor(city),
+        eventDate: parsed.eventDate,
+        eventEndDate: parsed.eventEndDate || null,
+        urlSlugs: slugCandidates,
+        imported: false,
+        sourceSlug: slug,
+        sourceUrl: articleUrl,
+        sourceTitle: parsed.title,
+        city,
+        discoveredAt: admin.firestore.FieldValue.serverTimestamp(),
+        discoverySource: source,
+        // Schema-erweitert für multi-source: "riot" (default) | "mobalytics".
+        // Decklist-Cron branched darauf — Riot benutzt Puppeteer + die
+        // urlSlugs[]-Probe gegen /organizedplay/, Mobalytics benutzt
+        // direkten Fetch der Tournament-Page + Deck-Subpages.
+        sourcePlatform: "riot",
+      });
+
+      created.push({ slug, city, eventDate: parsed.eventDate });
+      console.log(
+        `[Discovery] CREATED ${slug} → ${city} on ${parsed.eventDate} ` +
+        `(slugs: ${slugCandidates.join(", ")})`
+      );
+    } catch (e) {
+      failed.push({ slug, reason: e.message });
+      console.error(`[Discovery] failed ${slug}: ${e.message}`);
+    }
+  }
+
+  // 30-day Mobalytics fallback: for any pending schedule doc whose
+  // discoveredAt is >30 days old AND that's still imported:false, fetch
+  // Mobalytics' tournaments index and append any matching slug-hints
+  // to the urlSlugs array. Best-effort — Mobalytics pull failure
+  // doesn't fail the discovery pass.
+  let fallbackEnriched = 0;
+  try {
+    fallbackEnriched = await augmentStaleWithMobalytics(scheduleRef);
+  } catch (e) {
+    console.warn(`[Discovery] Mobalytics fallback skipped: ${e.message}`);
+  }
+
+  const summary = {
+    candidatesFound: candidates.length,
+    created: created.length,
+    skipped: skipped.length,
+    failed: failed.length,
+    mobalyticsEnriched: fallbackEnriched,
+    detail: { created, failed },
+  };
+  console.log(`[Discovery] DONE: ${JSON.stringify(summary, null, 2)}`);
+  return summary;
+}
+
+/**
+ * For schedule docs older than 30 days that still haven't been imported,
+ * try to find a slug-hint on Mobalytics' tournaments page and append it
+ * to the doc's urlSlugs array so the next decklist-cron has another
+ * shot. Returns count of docs enriched.
+ *
+ * Note: this is a heuristic. Mobalytics's slugs (`vegas-regional-qualifier`)
+ * are NOT Riot organizedplay-slugs — but the existing decklist scraper
+ * tries each candidate against Riot's `/organizedplay/<slug>/` URL, so
+ * a Mobalytics-style slug rarely hits. Real value: if Mobalytics has
+ * a "Riot top-decks link" in the tournament page, we surface that.
+ *
+ * Conservative implementation: just scrape Mobalytics's tournament
+ * names and try slug-variants derived from them. Future improvement:
+ * fetch each Mobalytics tournament page to grab the embedded Riot URL.
+ */
+async function augmentStaleWithMobalytics(scheduleRef) {
+  const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+  const stale = await scheduleRef
+    .where("imported", "==", false)
+    .get();
+
+  const candidates = stale.docs.filter((d) => {
+    const data = d.data();
+    const discoveredAt = data.discoveredAt?.toDate?.();
+    return discoveredAt && discoveredAt < cutoff;
+  });
+  if (candidates.length === 0) return 0;
+
+  let mobaHtml;
+  try {
+    mobaHtml = await fetchWithRetries(MOBALYTICS_TOURNAMENTS, { retries: 2 });
+  } catch (e) {
+    console.warn(`[Discovery] Mobalytics fetch failed: ${e.message}`);
+    return 0;
+  }
+
+  // Extract Mobalytics tournament slugs — pattern:
+  // /riftbound/tournaments/<slug>
+  const mobaSlugs = new Set();
+  const slugRe = /\/riftbound\/tournaments\/([a-z0-9-]+)/gi;
+  let m;
+  while ((m = slugRe.exec(mobaHtml)) !== null) {
+    if (m[1] !== "tournaments") mobaSlugs.add(m[1].toLowerCase());
+  }
+
+  let enriched = 0;
+  for (const doc of candidates) {
+    const data = doc.data();
+    const city = (data.city || "").toLowerCase();
+    if (!city) continue;
+    // Find any Mobalytics slug containing the city name.
+    const cityKey = city.replace(/\s+/g, "-");
+    const matched = [...mobaSlugs].filter((s) => s.includes(cityKey));
+    if (matched.length === 0) continue;
+
+    // Append novel candidates to urlSlugs.
+    const existingSlugs = new Set(data.urlSlugs || []);
+    const additions = matched.filter((s) => !existingSlugs.has(s));
+    if (additions.length === 0) continue;
+
+    await doc.ref.update({
+      urlSlugs: [...(data.urlSlugs || []), ...additions],
+      mobalyticsEnrichedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    enriched++;
+    console.log(`[Discovery] Mobalytics-enriched ${doc.id} with ${JSON.stringify(additions)}`);
+  }
+  return enriched;
+}
+
+/**
+ * Scheduled discovery — daily 07:30 UTC, 30 minutes before the
+ * decklist scraper (08:00) so newly-discovered docs are in the queue
+ * by the time the importer runs.
+ */
+exports.discoverTournamentsFromRiot = onSchedule(
+  {
+    schedule: "30 7 * * *",
+    timeZone: "UTC",
+    timeoutSeconds: 300,
+    memory: "512MiB",
+    region: "us-central1",
+  },
+  async () => {
+    await runDiscoveryPass({ source: "scheduled" });
+  }
+);
+
+/**
+ * Manual trigger for tests / first-deploy verification.
+ * Returns the same summary object as the scheduled run.
+ */
+exports.discoverTournamentsFromRiotManual = onRequest(
+  { timeoutSeconds: 300, memory: "512MiB", region: "us-central1", secrets: ["ADMIN_TRIGGER_SECRET"] },
+  async (req, res) => {
+    if (!requireAdminSecret(req, res)) return;
+    try {
+      const summary = await runDiscoveryPass({ source: "manual" });
+      res.json({ success: true, ...summary });
+    } catch (e) {
+      console.error(`[Discovery] manual trigger failed: ${e.stack || e.message}`);
+      res.status(500).json({ error: e.message });
+    }
+  }
+);
+
+/**
+ * One-time backfill — pulls the curated `riftbounds-upcoming-official-events`
+ * page in addition to the regular announcements index. The page lists
+ * past + upcoming events Riot endorses; we walk every link that looks
+ * like an Eyes-on post and run them through the same discovery
+ * pipeline. Idempotent (Doc-ID = slug), safe to re-run.
+ *
+ * Triggered manually after deploy:
+ *   curl https://us-central1-riftr-10527.cloudfunctions.net/backfillTournamentsFromRiot
+ */
+exports.backfillTournamentsFromRiot = onRequest(
+  { timeoutSeconds: 540, memory: "512MiB", region: "us-central1", secrets: ["ADMIN_TRIGGER_SECRET"] },
+  async (req, res) => {
+    if (!requireAdminSecret(req, res)) return;
+    try {
+      // Run the standard discovery first (current /announcements/ index).
+      const live = await runDiscoveryPass({ source: "backfill-live" });
+
+      // Then crawl the curated upcoming-events page for older
+      // tournaments not on the front of the index anymore.
+      const curatedHtml = await fetchWithRetries(UPCOMING_EVENTS_PAGE);
+      const curated = parseAnnouncementIndex(curatedHtml);
+      console.log(`[Backfill] curated page: ${curated.length} eyes-on slugs found`);
+
+      const scheduleRef = db.collection("artifacts").doc(APP_ID)
+        .collection("meta_tournament_schedule");
+
+      const created = [];
+      const skipped = [];
+      const failed = [];
+      for (const { slug } of curated) {
+        try {
+          const docRef = scheduleRef.doc(slug);
+          if ((await docRef.get()).exists) {
+            skipped.push(slug);
+            continue;
+          }
+          const articleHtml = await fetchWithRetries(
+            `${RIOT_BASE}/en-us/news/announcements/${slug}/`
+          );
+          const parsed = parseAnnouncementArticle(articleHtml, slug);
+          if (!parsed.eventDate) {
+            failed.push({ slug, reason: "no eventDate parsed" });
+            continue;
+          }
+          const city = parsed.city ||
+            slug.match(/^eyes-on-([a-z0-9-]+?)-what-to-know$/i)?.[1] || "";
+          await docRef.set({
+            name: tournamentNameFor(city),
+            eventDate: parsed.eventDate,
+            eventEndDate: parsed.eventEndDate || null,
+            urlSlugs: buildSlugCandidates(city),
+            imported: false,
+            sourceSlug: slug,
+            sourceUrl: `${RIOT_BASE}/en-us/news/announcements/${slug}/`,
+            sourceTitle: parsed.title,
+            city,
+            discoveredAt: admin.firestore.FieldValue.serverTimestamp(),
+            discoverySource: "backfill-curated",
+            sourcePlatform: "riot",
+          });
+          created.push({ slug, city, eventDate: parsed.eventDate });
+        } catch (e) {
+          failed.push({ slug, reason: e.message });
+        }
+      }
+
+      const total = {
+        live,
+        curated: {
+          candidatesFound: curated.length,
+          created: created.length,
+          skipped: skipped.length,
+          failed: failed.length,
+          detail: { created, failed },
+        },
+      };
+      console.log(`[Backfill] DONE: ${JSON.stringify(total, null, 2)}`);
+      res.json({ success: true, ...total });
+    } catch (e) {
+      console.error(`[Backfill] failed: ${e.stack || e.message}`);
+      res.status(500).json({ error: e.message });
+    }
+  }
+);
+
+// ═══════════════════════════════════════════════════════════════════
+// ─── Mobalytics Tournament Discovery + Decklist Import ───
+// ═══════════════════════════════════════════════════════════════════
+//
+// Second discovery source covering Asia-region tournaments (S2/S3
+// Regional Opens in Fuzhou, Chengdu, Dalian, Nanjing, Shenzhen) which
+// Riot's English /announcements/ page doesn't cover. Mobalytics is
+// server-rendered (no Puppeteer needed) and exposes:
+//   /riftbound/tournaments/<slug>            ← index per tournament
+//   /riftbound/decks/<deck-slug>             ← per-pilot decklist
+//
+// Slug schema (deterministic — we can probe known patterns):
+//   s<season>-regional-open-<city>           e.g. s2-regional-open-fuzhou
+//   s<season>-<city>-national-open           e.g. s2-shenzhen-national-open
+//   <city>-regional-qualifier                e.g. lille-regional-qualifier
+//
+// Riot-wins dedup: if a Mobalytics tournament's city already has a
+// Riot schedule doc (case-insensitive), Mobalytics's doc is skipped.
+// First-party data (Riot) trumps aggregator data (Mobalytics).
+//
+// Champion extraction: 3-stage heuristic (prefix → last-word → first
+// qty=1). Decks where ALL three stages fail are NOT imported — they
+// land in failed_champion_extraction[] for manual inspection. Riftbound
+// format requires exactly one Champion per deck, so a missing Champion
+// is treated as a parser bug, not an edge case.
+// ═══════════════════════════════════════════════════════════════════
+
+const MOBALYTICS_BASE = "https://mobalytics.gg";
+const MOBALYTICS_INDEX = `${MOBALYTICS_BASE}/riftbound/tournaments`;
+const MOBALYTICS_USER_AGENT = "Riftstats-Discovery/1.0 (+https://riftr.app)";
+// Asia cities we've seen on Mobalytics S2. Used as a deterministic probe
+// list when the index page doesn't surface them at top. S1 cities
+// (Beijing/Hangzhou/Guangzhou/Chongqing) are kept manual — verified via
+// 12 slug-variants all returning 404.
+const MOBALYTICS_PROBE_CITIES = [
+  "fuzhou", "chengdu", "dalian", "nanjing",
+  "shenzhen",
+];
+const MOBALYTICS_PROBE_SEASONS = [2, 3];
+
+/**
+ * Decode HTML entities in a string. Lightweight — only the entities
+ * we've observed Mobalytics emit (`&#x27;` for apostrophe, `&amp;`,
+ * named ASCII entities). Riftbound card names are otherwise plain ASCII
+ * + Unicode pass-through, so this list is complete enough.
+ */
+function decodeHtmlEntities(s) {
+  if (!s) return s;
+  return s
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, dec) => String.fromCharCode(parseInt(dec, 10)))
+    .replace(/&amp;/g, "&")
+    .replace(/&apos;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&nbsp;/g, " ");
+}
+
+function stripCollectorSuffix(s) {
+  return s.replace(/\s*\(\d+\)\s*$/, "").trim();
+}
+
+function properCase(s) {
+  if (!s) return "";
+  return s.split(/[\s-]+/).map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(" ");
+}
+
+/**
+ * Extract the city portion from a Mobalytics tournament-slug. Handles
+ * all three slug patterns. Returns lowercase city name or fallback.
+ */
+function cityFromMobalyticsSlug(slug) {
+  let m = slug.match(/^s\d+-regional-open-(.+)$/i);
+  if (m) return m[1];
+  m = slug.match(/^s\d+-(.+?)-national-open$/i);
+  if (m) return m[1];
+  m = slug.match(/^(.+?)-regional-qualifier$/i);
+  if (m) return m[1];
+  return slug.split(/-(regional|national|open|qualifier)/i)[0] || slug;
+}
+
+/**
+ * Parse a Mobalytics deck-page (HTML string) into a normalised deck
+ * object compatible with `buildMetaDeck`. Returns
+ *   { ok: true, deck, championSource } or { ok: false, reason }.
+ */
+function parseMobalyticsDeckPage(html) {
+  const titleMatch = html.match(/<h1[^>]*>([^<]+)<\/h1>/i);
+  if (!titleMatch) return { ok: false, reason: "no <h1>" };
+  const title = decodeHtmlEntities(titleMatch[1]);
+  // "Best of" (with space) vs "Best-Of" (with hyphen) — Mobalytics uses
+  // the hyphen variant; Riot uses the space variant. Accept both.
+  const titleRe =
+    /^(.+?):\s*(.+?)\s+(1st|2nd|3rd|Top \d+|Best[ -]Of)\s*\(([^)]+)\)\s*$/i;
+  const tm = title.match(titleRe);
+  if (!tm) return { ok: false, reason: `title regex failed: ${title}` };
+  const legendFull = tm[1].trim();
+  const tournament = tm[2].trim();
+  let placement = tm[3];
+  if (/^best[ -]of$/i.test(placement)) placement = "Best of";
+  if (/^top\s+\d+$/i.test(placement)) placement = placement.replace(/^top/i, "Top");
+  const player = tm[4].trim();
+
+  const SECTION_LABELS = ["Legend", "Champion", "Main Deck", "Battlefields", "Rune Pool", "Runes", "Sideboard"];
+  const sections = [];
+  const labelRe =
+    /<p[^>]*><span style="white-space: pre-wrap;">([^<]+)<\/span><\/p>/gi;
+  let lm;
+  while ((lm = labelRe.exec(html)) !== null) {
+    const label = lm[1].trim();
+    if (SECTION_LABELS.includes(label)) {
+      sections.push({ pos: lm.index, label });
+    }
+  }
+  sections.push({ pos: html.length, label: "__END__" });
+
+  const sliceFor = (label) => {
+    for (let i = 0; i < sections.length - 1; i++) {
+      if (sections[i].label === label) {
+        return html.substring(sections[i].pos, sections[i + 1].pos);
+      }
+    }
+    return "";
+  };
+
+  const QTY_RE =
+    /<span style="white-space: pre-wrap;">(\d+)\s*<\/span>[\s\S]*?<span class="xirccme xggjnk3">([^<]+)<\/span>/g;
+  const BARE_RE = /<span class="xirccme xggjnk3">([^<]+)<\/span>/g;
+
+  const cardsWithQty = (sectionHtml) => {
+    const out = [];
+    let m;
+    QTY_RE.lastIndex = 0;
+    while ((m = QTY_RE.exec(sectionHtml)) !== null) {
+      const qty = parseInt(m[1], 10);
+      const name = stripCollectorSuffix(decodeHtmlEntities(m[2]));
+      out.push({ name, qty });
+    }
+    return out;
+  };
+  const bareNames = (sectionHtml) => {
+    const out = [];
+    let m;
+    BARE_RE.lastIndex = 0;
+    while ((m = BARE_RE.exec(sectionHtml)) !== null) {
+      out.push(stripCollectorSuffix(decodeHtmlEntities(m[1])));
+    }
+    return out;
+  };
+
+  const mainList = cardsWithQty(sliceFor("Main Deck"));
+  const runesList = cardsWithQty(sliceFor("Runes"));
+  const runePoolList = runesList.length ? runesList : cardsWithQty(sliceFor("Rune Pool"));
+  const sideList = cardsWithQty(sliceFor("Sideboard"));
+  const battlefields = bareNames(sliceFor("Battlefields"));
+
+  // 3-stage Champion heuristic. Riftbound format = exactly one Champion
+  // per deck, so a null result is treated as a parser bug (caller rejects).
+  const legendPrefix = legendFull.split(",")[0].trim();
+  const legendLastWord = legendPrefix.split(/\s+/).pop() || "";
+
+  let champion = null;
+  let championSource = null;
+  for (const c of mainList) {
+    if (c.qty === 1 && c.name.startsWith(legendPrefix + ",")) {
+      champion = c.name; championSource = "prefix-match"; break;
+    }
+  }
+  if (!champion && legendLastWord && legendLastWord !== legendPrefix) {
+    for (const c of mainList) {
+      if (c.qty === 1 && c.name.startsWith(legendLastWord + ",")) {
+        champion = c.name; championSource = "last-word-match"; break;
+      }
+    }
+  }
+  if (!champion) {
+    for (const c of mainList) {
+      if (c.qty === 1) {
+        champion = c.name; championSource = "first-qty-1-fallback"; break;
+      }
+    }
+  }
+  if (!champion) {
+    return { ok: false, reason: "champion-heuristic failed (no qty=1 in main deck)" };
+  }
+
+  const mainDeck = {};
+  let dropped = false;
+  for (const c of mainList) {
+    if (!dropped && c.name === champion && c.qty === 1) {
+      dropped = true;
+      continue;
+    }
+    mainDeck[c.name] = (mainDeck[c.name] || 0) + c.qty;
+  }
+  const sideboard = {};
+  for (const c of sideList) sideboard[c.name] = (sideboard[c.name] || 0) + c.qty;
+  const runes = {};
+  for (const c of runePoolList) runes[c.name] = (runes[c.name] || 0) + c.qty;
+
+  // Synthetic `overall` for buildMetaDeck's ID-generation logic.
+  // Actual placement we store on the doc comes from Mobalytics's title.
+  let overall;
+  if (placement === "1st") overall = 1;
+  else if (placement === "2nd") overall = 2;
+  else if (placement === "3rd") overall = 3;
+  else if (placement === "Top 4") overall = 4;
+  else if (/^Top \d+$/.test(placement)) overall = 5;
+  else overall = 999;
+
+  return {
+    ok: true,
+    deck: {
+      player,
+      legendRank: null,
+      legendTotal: null,
+      overall,
+      legend: legendFull,
+      champion,
+      mainDeck,
+      battlefields,
+      runes,
+      sideboard,
+      _mobalyticsPlacement: placement,
+      _mobalyticsTournament: tournament,
+    },
+    championSource,
+  };
+}
+
+/**
+ * Fetch a Mobalytics tournament page → list of deck-page slugs +
+ * tournament metadata (name/city/date best-effort).
+ */
+async function fetchMobalyticsTournament(slug) {
+  const url = `${MOBALYTICS_BASE}/riftbound/tournaments/${slug}`;
+  const html = await fetchWithRetries(url, { retries: 3 });
+  const deckSlugs = new Set();
+  const re = /\/riftbound\/decks\/([a-z0-9-]+)/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) deckSlugs.add(m[1]);
+
+  const text = html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ");
+  const dm = text.match(
+    /\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})(?:st|nd|rd|th)?\s*,\s*(\d{4})/i,
+  );
+  let date = null;
+  if (dm) {
+    const months = {
+      january: 1, february: 2, march: 3, april: 4, may: 5, june: 6,
+      july: 7, august: 8, september: 9, october: 10, november: 11, december: 12,
+    };
+    const month = months[dm[1].toLowerCase()];
+    const day = parseInt(dm[2], 10);
+    const year = parseInt(dm[3], 10);
+    const pad = (n) => String(n).padStart(2, "0");
+    date = `${year}-${pad(month)}-${pad(day)}`;
+  }
+
+  const h1Match = html.match(/<h1[^>]*>([^<]+)<\/h1>/i);
+  const name = h1Match ? decodeHtmlEntities(h1Match[1]).trim() : "";
+  const city = cityFromMobalyticsSlug(slug);
+
+  return { url, slug, name, city, date, deckSlugs: [...deckSlugs] };
+}
+
+async function runMobalyticsDiscoveryPass({ source = "scheduled" } = {}) {
+  const scheduleRef = db.collection("artifacts").doc(APP_ID)
+    .collection("meta_tournament_schedule");
+
+  const candidates = [];
+  for (const season of MOBALYTICS_PROBE_SEASONS) {
+    for (const city of MOBALYTICS_PROBE_CITIES) {
+      candidates.push(`s${season}-regional-open-${city}`);
+      candidates.push(`s${season}-${city}-national-open`);
+    }
+  }
+  console.log(`[Mobalytics] probing ${candidates.length} candidate slugs`);
+
+  // Riot-wins dedup: pre-fetch existing Riot docs so we know which
+  // cities are already covered. Schedule isn't huge, single read is fine.
+  const existingSnap = await scheduleRef.get();
+  const riotCities = new Set();
+  for (const d of existingSnap.docs) {
+    const data = d.data();
+    if ((data.sourcePlatform || "riot") === "riot" && data.city) {
+      riotCities.add(data.city.toLowerCase());
+    }
+  }
+
+  const created = [];
+  const skipped = [];
+  const dedupSkipped = [];
+  const failed = [];
+
+  for (const slug of candidates) {
+    try {
+      let tournamentInfo;
+      try {
+        tournamentInfo = await fetchMobalyticsTournament(slug);
+      } catch (e) {
+        if (/HTTP 404/.test(e.message)) continue;
+        throw e;
+      }
+      if (tournamentInfo.deckSlugs.length === 0) continue;
+
+      const docId = `mobalytics-${slug}`;
+      const docRef = scheduleRef.doc(docId);
+      if ((await docRef.get()).exists) { skipped.push(slug); continue; }
+
+      const cityNormalized = (tournamentInfo.city || "").toLowerCase();
+      if (cityNormalized && riotCities.has(cityNormalized)) {
+        dedupSkipped.push({ slug, city: tournamentInfo.city, reason: "Riot doc exists for same city" });
+        console.log(`[Mobalytics] DEDUP-SKIP ${slug} — Riot already covers ${tournamentInfo.city}`);
+        continue;
+      }
+
+      await docRef.set({
+        name: tournamentInfo.name || `S2 Regional Open ${properCase(tournamentInfo.city)}`,
+        eventDate: tournamentInfo.date || null,
+        eventEndDate: null,
+        urlSlugs: [],
+        imported: false,
+        sourceSlug: slug,
+        sourceUrl: tournamentInfo.url,
+        sourceTitle: tournamentInfo.name,
+        city: properCase(tournamentInfo.city),
+        discoveredAt: admin.firestore.FieldValue.serverTimestamp(),
+        discoverySource: source,
+        sourcePlatform: "mobalytics",
+        mobalyticsSlug: slug,
+      });
+      created.push({ slug, city: tournamentInfo.city, date: tournamentInfo.date, decks: tournamentInfo.deckSlugs.length });
+      console.log(`[Mobalytics] CREATED ${docId} → ${tournamentInfo.city} on ${tournamentInfo.date || "(no date)"} (${tournamentInfo.deckSlugs.length} decks expected)`);
+    } catch (e) {
+      failed.push({ slug, reason: e.message });
+      console.error(`[Mobalytics] failed ${slug}: ${e.message}`);
+    }
+  }
+
+  const summary = {
+    candidatesProbed: candidates.length,
+    created: created.length,
+    skipped: skipped.length,
+    dedupSkipped: dedupSkipped.length,
+    failed: failed.length,
+    detail: { created, dedupSkipped, failed },
+  };
+  console.log(`[Mobalytics] DONE: ${JSON.stringify(summary, null, 2)}`);
+  return summary;
+}
+
+/**
+ * Import all decks for a Mobalytics-sourced schedule doc. Returns
+ * `{ imported, failedChampion, failedOther }` so the caller can surface
+ * the failure list per spec (`failed_champion_extraction[]` in HTTP response).
+ */
+async function importMobalyticsTournament(scheduleDocRef, scheduleData) {
+  const slug = scheduleData.mobalyticsSlug;
+  if (!slug) throw new Error(`schedule doc missing mobalyticsSlug: ${scheduleDocRef.id}`);
+  const tournamentInfo = await fetchMobalyticsTournament(slug);
+  console.log(`[Mobalytics-Import] ${slug}: ${tournamentInfo.deckSlugs.length} deck-pages to fetch`);
+
+  const metaRef = db.collection("artifacts").doc(APP_ID).collection("meta_decks");
+  const tournRef = db.collection("artifacts").doc(APP_ID).collection("meta_tournaments");
+
+  const failedChampion = [];
+  const failedOther = [];
+  let importedCount = 0;
+  let batch = db.batch();
+  let batchN = 0;
+
+  for (const deckSlug of tournamentInfo.deckSlugs) {
+    const deckUrl = `${MOBALYTICS_BASE}/riftbound/decks/${deckSlug}`;
+    try {
+      const deckHtml = await fetchWithRetries(deckUrl, { retries: 2 });
+      const parsed = parseMobalyticsDeckPage(deckHtml);
+      if (!parsed.ok) {
+        if (/champion-heuristic/.test(parsed.reason)) {
+          failedChampion.push({ url: deckUrl, slug: deckSlug, reason: parsed.reason });
+          console.warn(`[Mobalytics-Import] CHAMPION-FAIL ${deckSlug}: ${parsed.reason}`);
+        } else {
+          failedOther.push({ url: deckUrl, slug: deckSlug, reason: parsed.reason });
+          console.warn(`[Mobalytics-Import] PARSE-FAIL ${deckSlug}: ${parsed.reason}`);
+        }
+        continue;
+      }
+      const deck = parsed.deck;
+      const eventDate = scheduleData.eventDate || tournamentInfo.date || null;
+      const md = buildMetaDeck(
+        deck,
+        scheduleData.name || tournamentInfo.name,
+        eventDate,
+        deckUrl,
+      );
+      // Mobalytics-specific overrides:
+      //   1. Real placement string (not synthesised from `overall`).
+      //   2. Description without fake "Overall #N".
+      //   3. Doc-ID derived from Mobalytics's own deck-slug — the existing
+      //      Riot deckId logic strips non-ASCII characters from the player
+      //      slug (`/[^a-z0-9]+/`), which collapses every Chinese-only
+      //      player name to "" and causes silent doc collisions across
+      //      the same placement bucket. Mobalytics's deck-slug is already
+      //      URL-safe + globally unique by design; using it directly
+      //      sidesteps the Unicode issue without touching Riot's path.
+      md.id = `meta-mobalytics-${deckSlug}`;
+      md.placement = deck._mobalyticsPlacement;
+      md.description = `${md.source} ${md.placement} by ${deck.player}`;
+      md.sourcePlatform = "mobalytics";
+
+      batch.set(metaRef.doc(md.id), md);
+      batchN++;
+      importedCount++;
+      if (batchN >= 400) { await batch.commit(); batch = db.batch(); batchN = 0; }
+    } catch (e) {
+      failedOther.push({ url: deckUrl, slug: deckSlug, reason: e.message });
+      console.error(`[Mobalytics-Import] FETCH-FAIL ${deckSlug}: ${e.message}`);
+    }
+  }
+
+  batch.update(scheduleDocRef, {
+    imported: true,
+    importedAt: admin.firestore.FieldValue.serverTimestamp(),
+    deckCount: importedCount,
+    failedChampionCount: failedChampion.length,
+  });
+  const tId = (scheduleData.name || `mobalytics-${slug}`).toLowerCase().replace(/[^a-z0-9]+/g, "-");
+  batch.set(tournRef.doc(tId), {
+    name: scheduleData.name || tournamentInfo.name,
+    date: scheduleData.eventDate || tournamentInfo.date || null,
+    deckCount: importedCount,
+    sourceUrl: tournamentInfo.url,
+    sourcePlatform: "mobalytics",
+    importedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+  if (batchN > 0 || importedCount > 0) await batch.commit();
+
+  console.log(`[Mobalytics-Import] ${slug}: imported=${importedCount} failedChampion=${failedChampion.length} failedOther=${failedOther.length}`);
+  return { imported: importedCount, failedChampion, failedOther };
+}
+
+exports.discoverTournamentsFromMobalytics = onSchedule(
+  {
+    schedule: "35 7 * * *",
+    timeZone: "UTC",
+    timeoutSeconds: 300,
+    memory: "512MiB",
+    region: "us-central1",
+  },
+  async () => { await runMobalyticsDiscoveryPass({ source: "scheduled" }); },
+);
+
+/**
+ * Manual trigger — also imports decks for all Mobalytics docs flagged
+ * imported:false so the operator can verify the full discovery+import
+ * pipeline in one HTTP call. Returns failed_champion_extraction[] per spec.
+ */
+exports.discoverTournamentsFromMobalyticsManual = onRequest(
+  { timeoutSeconds: 540, memory: "1GiB", region: "us-central1", secrets: ["ADMIN_TRIGGER_SECRET"] },
+  async (req, res) => {
+    if (!requireAdminSecret(req, res)) return;
+    try {
+      const discoverSummary = await runMobalyticsDiscoveryPass({ source: "manual" });
+      const scheduleRef = db.collection("artifacts").doc(APP_ID)
+        .collection("meta_tournament_schedule");
+      const pending = await scheduleRef
+        .where("sourcePlatform", "==", "mobalytics")
+        .where("imported", "==", false)
+        .get();
+
+      const importResults = [];
+      const failed_champion_extraction = [];
+      for (const doc of pending.docs) {
+        const r = await importMobalyticsTournament(doc.ref, doc.data());
+        importResults.push({
+          docId: doc.id,
+          slug: doc.data().mobalyticsSlug,
+          imported: r.imported,
+          failedChampion: r.failedChampion.length,
+          failedOther: r.failedOther.length,
+        });
+        for (const f of r.failedChampion) {
+          failed_champion_extraction.push({
+            ...f,
+            tournament: doc.data().name,
+            mobalyticsSlug: doc.data().mobalyticsSlug,
+          });
+        }
+      }
+
+      res.json({
+        success: true,
+        discovery: discoverSummary,
+        importResults,
+        failed_champion_extraction,
+      });
+    } catch (e) {
+      console.error(`[Mobalytics-Manual] ${e.stack || e.message}`);
+      res.status(500).json({ error: e.message });
+    }
+  },
+);
+
 

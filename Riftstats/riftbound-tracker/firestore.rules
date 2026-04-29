@@ -1,0 +1,434 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helper Functions ──
+
+    function isAuth() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return isAuth() && request.auth.uid == uid;
+    }
+
+    // Anonymous-Auth-Block (Security-Audit Round 4, 2026-04-29):
+    // Wenn Firebase Console "Anonymous Sign-In" jemals (versehentlich)
+    // aktiviert wird, koennten anonyme Bots `isAuth()`-protected Endpoints
+    // treffen. Defense-in-Depth: alle Schreib-Operationen verlangen
+    // einen non-anonymous Provider. Lese-Operationen (auth-public)
+    // bleiben offen damit App Check + Rate-Limits genuegen.
+    function isVerifiedUser() {
+      return isAuth()
+        && request.auth.token.firebase.sign_in_provider != 'anonymous';
+    }
+
+    // ── Root: deny all by default ──
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // ── Temporary: Debug logs for push notification testing ──
+    match /debug_logs/{logId} {
+      allow create: if isAuth();
+      allow read: if false;
+    }
+
+    // ══════════════════════════════════
+    // ─── App Container ───
+    // ══════════════════════════════════
+    match /artifacts/{appId} {
+      allow read: if false;
+      allow write: if false;
+
+      // ── Global Collections ──
+
+      // Stripe-Event-Dedup-Records (Round 4, 2026-04-29).
+      // CF-only writes via Admin-SDK. Clients haben keinen Zugriff —
+      // weder Read noch Write. Wird durch root-deny abgedeckt, hier
+      // explicit fuer Klarheit/Audit-Trail.
+      match /stripe_events/{eventId} {
+        allow read, write: if false;
+      }
+
+      // Market overview (prices) — read-only for clients
+      match /market/{docId} {
+        allow read: if isAuth();
+        allow write: if false; // Cloud Functions only
+      }
+
+      // Market history (price charts) — read-only for clients
+      match /market_history/{docId} {
+        allow read: if isAuth();
+        allow write: if false; // Cloud Functions only
+      }
+
+      // Market sales analytics — no client access
+      match /market_sales/{cardId}/sales/{saleId} {
+        allow read, write: if false; // Cloud Functions only
+      }
+
+      // Price guide archive — no client access
+      match /price_guide_archive/{docId} {
+        allow read, write: if false; // Cloud Functions only
+      }
+
+      // ── Meta Decks (tournament decks) ──
+      match /meta_decks/{deckId} {
+        allow read: if isAuth();
+        // Allow authenticated users to increment viewCount/likeCount only
+        allow update: if isAuth()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['viewCount', 'likeCount']);
+        allow create, delete: if false; // Admin SDK / Cloud Functions only
+
+        // Likes subcollection
+        match /likes/{uid} {
+          allow read: if isAuth();
+          allow write: if isOwner(uid);
+        }
+      }
+
+      // ── Meta Tournaments — read-only for clients ──
+      match /meta_tournaments/{tournamentId} {
+        allow read: if isAuth();
+        allow write: if false; // Admin SDK / Cloud Functions only
+      }
+
+      // ── Bans & Errata — read-only for all authed clients ──
+      // Written by seed script + future Cloud Function
+      match /bans/{riftboundId} {
+        allow read: if isAuth();
+        allow write: if false; // Admin SDK / Cloud Functions only
+      }
+
+      // ── Follows ──
+      match /follows/{followId} {
+        allow read: if isAuth();
+        allow create: if isAuth()
+          && request.resource.data.followerId == request.auth.uid;
+        allow delete: if isAuth()
+          && resource.data.followerId == request.auth.uid;
+        allow update: if false;
+      }
+
+      // ── Listings ──
+      match /listings/{listingId} {
+        // Anyone authenticated can read active listings
+        allow read: if isAuth();
+
+        // Create — lockdown gegen Self-Stats-Fraud + Input-Validation.
+        // VORHER (Security-Audit Round 4, 2026-04-29): Rule pruefte nur
+        //   sellerId == auth.uid && status == 'active'. Konsequenz:
+        //   Seller konnte beliebige Felder schreiben, inkl. sellerRating
+        //   (wird auf Listing-Tile angezeigt!) und sellerSales. Echtes
+        //   Exploit: Seller schreibt sellerRating: 5.0, sellerSales: 999
+        //   → Marketplace zeigt fake-Power-Seller Stats → Buyer-Tausch.
+        //   Auch: keine price/quantity-Validierung — Seller konnte
+        //   negative Preise oder absurd grosse Quantities setzen
+        //   (Stripe-API rejected negative, aber UX-Bugs / Quota-Burn).
+        // JETZT:
+        //   - isVerifiedUser → kein Anonymous-Auth-Bot
+        //   - sellerRating/sellerSales: muessen 0 sein oder fehlen.
+        //     CF-Trigger `onListingCreate` populiert sie server-side
+        //     aus sellerProfile (Admin-SDK bypass, trusted source).
+        //   - price: numerisch, 0 < price <= 100000 (€100k cap, Tippfehler-
+        //     Schutz; teuerste Riftbound-Karte ~€2k, daher generös)
+        //   - quantity: int, 0 < qty <= 9999
+        allow create: if isVerifiedUser()
+          && request.resource.data.sellerId == request.auth.uid
+          && request.resource.data.status == 'active'
+          && request.resource.data.price is number
+          && request.resource.data.price > 0
+          && request.resource.data.price <= 100000
+          && request.resource.data.quantity is int
+          && request.resource.data.quantity > 0
+          && request.resource.data.quantity <= 9999
+          && (
+            !('sellerRating' in request.resource.data)
+            || request.resource.data.sellerRating == 0
+          )
+          && (
+            !('sellerSales' in request.resource.data)
+            || request.resource.data.sellerSales == 0
+          );
+
+        // VORHER (Security-Audit Round 3, 2026-04-29): Rule erlaubte beliebige
+        // Field-Aenderungen solange status==cancelled ODER quantity-reduziert.
+        // Konsequenz: Seller konnte mid-Cart-Reservation `price`, `condition`,
+        // `cardId` aendern und Buyer wurde mit neuen Werten gechargt.
+        // Konkretes Exploit: Buyer reserviert Listing fuer EUR10. Seller
+        // ruft app-update {quantity: q-1, price: 1000} auf. Rule akzeptiert
+        // (qty-reduziert). Checkout liest live listing.price=1000 → Buyer
+        // wird EUR1000 belastet.
+        //
+        // JETZT: 3 disjunkte Pfade, jeweils mit Field-Allowlist via
+        //   affectedKeys().hasOnly([...]):
+        // 1. Cancel: nur status (+ optionale Audit-Felder)
+        // 2. Qty-Reduce: nur quantity (Status muss 'active' bleiben)
+        // 3. Price-Edit: nur price, ABER nur wenn keine aktive Reservation
+        //    (reservedQty == 0). Sonst muss der Seller erst die Listings
+        //    aus dem Cart der Buyer rausziehen (oder warten bis TTL).
+        // CF-Writes (Admin SDK) bleiben unbehelligt — Rules gelten nur
+        // fuer direkte Client-Writes.
+        allow update: if isVerifiedUser()
+          && resource.data.sellerId == request.auth.uid
+          && request.resource.data.sellerId == resource.data.sellerId
+          && (
+            // Path 1 — Cancel listing
+            (request.resource.data.diff(resource.data).affectedKeys()
+                .hasOnly(['status', 'updatedAt', 'cancelledAt'])
+              && request.resource.data.status == 'cancelled')
+
+            // Path 2 — Reduce quantity (status stays 'active')
+            || (request.resource.data.diff(resource.data).affectedKeys()
+                  .hasOnly(['quantity', 'updatedAt'])
+                && request.resource.data.status == 'active'
+                && request.resource.data.quantity > 0
+                && request.resource.data.quantity <= resource.data.quantity)
+
+            // Path 3 — Edit price (only if no active cart reservations).
+            // Round 4 zusaetzlicher Cap: price <= 100000 (€100k) auch bei
+            // Update — sonst koennte Seller via Update das Create-Cap umgehen.
+            || (request.resource.data.diff(resource.data).affectedKeys()
+                  .hasOnly(['price', 'updatedAt'])
+                && request.resource.data.status == 'active'
+                && request.resource.data.price is number
+                && request.resource.data.price > 0
+                && request.resource.data.price <= 100000
+                && (resource.data.reservedQty == null
+                    || resource.data.reservedQty == 0))
+          );
+
+        allow delete: if false;
+      }
+
+      // ── Orders ──
+      match /orders/{orderId} {
+        // Buyer or seller can read their own orders
+        allow read: if isAuth()
+          && (resource.data.buyerId == request.auth.uid
+              || resource.data.sellerId == request.auth.uid);
+
+        // No direct client writes — all mutations via Cloud Functions
+        allow create, update, delete: if false;
+      }
+
+      // ── Player Profiles (search index, mirrored from user profile) ──
+      // VORHER (Security-Audit Round 3, 2026-04-29): write: if isOwner(uid)
+      //   ohne Field-Allowlist. Owner konnte beliebige Felder schreiben,
+      //   inkl. der Public-Stats die normalerweise CF-only sind:
+      //     - rating, reviewCount, totalSales, memberSince
+      //   = Self-Rating-Fraud im Mirror (haben wir fuer sellerProfile
+      //   bereits gefixt, aber im Mirror existierte derselbe Vektor).
+      //   User konnte sich `rating: 5.0, reviewCount: 9999` setzen und
+      //   bis zum naechsten CF-Sync (submitReview/confirmDelivery) als
+      //   fake-Power-Seller in der Search auftauchen.
+      // JETZT: Field-Allowlist. CF-Writes (Admin SDK) bypassen Rules,
+      //   bleiben also unangetastet. Der Mirror-Sync via syncPlayerProfile
+      //   (im CF-Code) kann weiterhin alle Felder schreiben.
+      match /playerProfiles/{uid} {
+        allow read: if isAuth();
+        allow create: if isOwner(uid)
+          && request.resource.data.keys().hasOnly([
+            'displayName', 'displayNameLower', 'avatarUrl', 'bio',
+            'country', 'city', 'updatedAt',
+          ]);
+        allow update: if isOwner(uid)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'displayName', 'displayNameLower', 'avatarUrl', 'bio',
+            'country', 'city', 'updatedAt',
+          ]);
+        allow delete: if false;
+      }
+
+      // ── Public Decks ──
+      match /publicDecks/{deckId} {
+        allow read: if isAuth();
+
+        // Author can publish (create)
+        allow create: if isAuth()
+          && request.resource.data.authorId == request.auth.uid;
+
+        // Author can update own deck (any field). Other authenticated users
+        // can only touch the trending counters (viewCount, copyTimestamps).
+        // likeCount goes through the `toggleDeckLike` Cloud Function (Admin SDK,
+        // bypasses rules) — no need to allow likeCount writes here.
+        // VORHER (Security-Audit 2026-04-29): Rule war `allow update: if isAuth()`
+        // ohne `affectedKeys`-Check. Jeder authentifizierte User konnte beliebige
+        // Felder fremder Decks ueberschreiben (name, mainDeck, sideboard,
+        // authorId). Behoben analog zum meta_decks-Pattern.
+        allow update: if isAuth()
+          && (
+            // Author: full control over own deck
+            resource.data.authorId == request.auth.uid
+            // Non-author: counters only
+            || request.resource.data.diff(resource.data).affectedKeys()
+                 .hasOnly(['viewCount', 'copyTimestamps'])
+          );
+
+        // Author can unpublish (delete)
+        allow delete: if isAuth()
+          && resource.data.authorId == request.auth.uid;
+
+        // Likes subcollection
+        match /likes/{uid} {
+          allow read: if isAuth();
+          allow write: if isOwner(uid);
+        }
+      }
+
+      // ── User-Scoped Data ──
+      match /users/{uid} {
+        allow read, write: if false;
+
+        // ── User Profile (display info) ──
+        // READ: owner-only. Nach Security-Audit 2026-04-29 + App-Code-Migration:
+        //   ProfileService.fetchProfiles liest jetzt aus playerProfiles-Mirror
+        //   (public-safe Subset). Direkter Read von users/{uid}/data/profile
+        //   nur noch fuer eigenen User durch listen() + updateProfile().
+        //   PII (street/city/zip, realizedGains, totalCostBasisSold) wird
+        //   damit nicht mehr cross-user-leak'd.
+        // WRITE: nur User-editable Felder. CF-managed Felder (createdAt,
+        //   realizedGains, totalCostBasisSold) sind Admin-SDK-only.
+        match /data/profile {
+          allow read: if isOwner(uid);
+          allow create: if isOwner(uid)
+            && request.resource.data.keys().hasOnly([
+              'displayName', 'bio', 'avatarUrl', 'country',
+              'street', 'city', 'zip',
+              'showWinRate', 'showCollectionProgress', 'showMatchCount',
+              'nameChangesLeft', 'updatedAt', 'createdAt',
+            ]);
+          allow update: if isOwner(uid)
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+              'displayName', 'bio', 'avatarUrl', 'country',
+              'street', 'city', 'zip',
+              'showWinRate', 'showCollectionProgress', 'showMatchCount',
+              'nameChangesLeft', 'updatedAt',
+            ]);
+          allow delete: if false;
+        }
+
+        // ── Seller Profile ──
+        // READ: owner-only nach Audit 2026-04-29. Author-View im Social-Tab
+        //   (_loadAuthorData) und Listings-Stats lesen jetzt aus dem
+        //   `playerProfiles`-Mirror der nur die public-safe Stats enthaelt
+        //   (rating/reviewCount/totalSales/memberSince — KEINE email/address/
+        //   totalRevenue/strikes/suspended/stripeAccountId). CF-Trigger
+        //   `syncPlayerProfile` haelt den Mirror aktuell.
+        // WRITE: nur User-editable Felder beim Onboarding.
+        //   VORHER kritisch: Owner konnte rating/reviewCount/strikes/suspended/
+        //   stripeAccountId/totalSales/totalRevenue beliebig setzen.
+        //   Konsequenzen die so moeglich waren:
+        //     - 5-Sterne-Self-Rating mit fake reviewCount = Verkaeufer-Pseudo-Reputation
+        //     - Strikes auf 0 zuruecksetzen → keine Account-Suspension
+        //     - stripeAccountId auf fremden acct_xxx → Geld geht zu falschem Connect-Account!
+        //     - isCommercialSeller bewusst falsch setzen → Widerrufsrecht-Pflicht entgehen
+        //   Jetzt: hard-allowlist auf User-editable Felder, alles andere CF-only.
+        match /data/sellerProfile {
+          allow read: if isOwner(uid);
+          allow create: if isOwner(uid)
+            && request.resource.data.keys().hasOnly([
+              'displayName', 'email', 'country', 'address',
+              'isCommercialSeller', 'updatedAt', 'memberSince',
+            ]);
+          allow update: if isOwner(uid)
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+              'displayName', 'email', 'country', 'address',
+              'isCommercialSeller', 'updatedAt',
+            ]);
+          allow delete: if false;
+        }
+
+        // ── Cost basis (FIFO Kauf-Historie) ──
+        // READ + WRITE: nur owner. Finanzielle Privat-Information.
+        // CF kann via Admin SDK schreiben (umgeht Rules).
+        match /data/cost_basis {
+          allow read, write: if isOwner(uid);
+        }
+
+        // ── FCM Tokens (Push-Notifications) ──
+        // READ: nur owner (Tracking-Vektor sonst).
+        // WRITE: nur owner (eigene Tokens registrieren).
+        match /data/fcmTokens {
+          allow read, write: if isOwner(uid);
+        }
+
+        // ── Email Verification ──
+        // READ owner, WRITE CF-only.
+        match /data/emailVerification {
+          allow read: if isOwner(uid);
+          allow write: if false;
+        }
+
+        // ── Collection (Karten-Sammlung) ──
+        // READ: aktuell auth-public da Social-Tab Author-View die fremde
+        //   Collection anzeigt. Profile-Privacy-Toggle `showCollectionProgress`
+        //   wird derzeit NICHT in den Rules enforced (waere cross-doc-check
+        //   noetig, kompliziert). Kein direktes PII-Leak — nur Karten + Quantity.
+        // WRITE: nur owner.
+        match /data/collection {
+          allow read: if isAuth();
+          allow write: if isOwner(uid);
+        }
+
+        // ── Portfolio History (Performance-Snapshots) ──
+        // READ + WRITE: nur owner. Finanzielle Privat-Daten
+        // (taegliche Werte der eigenen Sammlung).
+        match /data/portfolio_history {
+          allow read, write: if isOwner(uid);
+        }
+
+        // KEIN catch-all `match /data/{docId}` hier!
+        // Firestore-Rules sind OR-aggregated — ein permissiver catch-all
+        // wuerde die spezifischen field-allowlist Rules oben aushebeln.
+        // Neue data-Docs erben die Root-deny (Z. 16-18) und brauchen eine
+        // explizite Rule. Secure-by-default.
+
+        // ── Reviews (public, written by Cloud Functions only) ──
+        match /reviews/{reviewId} {
+          allow read: if isAuth();
+          allow write: if false; // Cloud Functions only
+        }
+
+        // ── Cart Reservations (managed by Cloud Functions) ──
+        match /cartReservations/{reservationId} {
+          allow read: if isOwner(uid);
+          allow create, update, delete: if false; // Cloud Functions only
+        }
+
+        // ── Matches ──
+        match /matches/{matchId} {
+          // Any authenticated user can read (for Social profile stats)
+          allow read: if isAuth();
+          allow write: if isOwner(uid);
+        }
+
+        // ── Decks ──
+        match /decks/{deckId} {
+          allow read, write: if isOwner(uid);
+        }
+
+        // ── Wallet ──
+        match /wallet/{docId} {
+          allow read: if isOwner(uid);
+          allow write: if false; // Cloud Functions only
+        }
+
+        // ── Wallet Transactions ──
+        match /walletTransactions/{txId} {
+          allow read: if isOwner(uid);
+          allow write: if false; // Cloud Functions only
+        }
+
+        // ── Notifications (Deep Link inbox) ──
+        match /notifications/{notifId} {
+          allow read: if isOwner(uid);
+          allow update: if isOwner(uid)
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['seen', 'navigated']);
+          allow create, delete: if false; // Cloud Functions only
+        }
+      }
+    }
+  }
+}

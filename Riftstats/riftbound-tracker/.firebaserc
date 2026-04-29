@@ -1,0 +1,8 @@
+{
+  "projects": {
+    "default": "riftr-10527",
+    "production": "riftr-10527"
+  },
+  "targets": {},
+  "etags": {}
+}
