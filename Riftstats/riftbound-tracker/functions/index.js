@@ -3567,14 +3567,42 @@ exports.markShipped = onCall(
       await stripe.paymentIntents.capture(order.stripePaymentIntentId);
     }
 
-    // Update order
-    const autoReleaseAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+    // First-5-Sales Extra-Hold (Round 11, 2026-04-29 — Cardmarket-Pattern):
+    // Cardmarket macht "Trustee Service" obligatorisch fuer die ersten
+    // 5 Sales jedes neuen Sellers. Sie halten Geld bis Buyer aktiv
+    // bestaetigt (kein time-based auto-release).
+    // Riftr-Adaption: doppelter Buyer-Protection-Window fuer first-5-sales.
+    // Stripe delay_days bleibt 7 (Account-level), aber autoReleaseAt wird
+    // auf 14 Tage gesetzt → Buyer hat 14 statt 7 Tage Zeit fuer Disputes.
+    // Bei dispute-in-window: refund-flow holt Geld via reverse_transfer
+    // zurueck (auch wenn Stripe schon ausgezahlt hat).
+    const sellerProfileForHold = await db.collection("artifacts").doc(APP_ID)
+      .collection("users").doc(uid)
+      .collection("data").doc("sellerProfile").get();
+    const completedSales = sellerProfileForHold.exists
+      ? (sellerProfileForHold.data().completedSalesCount || 0)
+      : 0;
+    const isFirstFiveSales = completedSales < 5;
+    const protectionDays = isFirstFiveSales ? 14 : 7;
+    const autoReleaseAt = new Date(Date.now() + protectionDays * 24 * 60 * 60 * 1000);
+
     await orderRef.update({
       status: "shipped",
       trackingNumber: trackingNumber || null,
       shippedAt: admin.firestore.FieldValue.serverTimestamp(),
       autoReleaseAt: autoReleaseAt.toISOString(),
+      ...(isFirstFiveSales ? {
+        firstFiveSalesExtraHold: true,
+        firstFiveSalesIndex: completedSales + 1,
+      } : {}),
     });
+
+    if (isFirstFiveSales) {
+      console.log(
+        `markShipped: order ${orderId} seller=${uid} new-seller-hold ` +
+        `(sale #${completedSales + 1}/5, autoReleaseAt=14d instead of 7d)`,
+      );
+    }
 
     // 1. Calculate realized gains BEFORE removing from collection (needs cost basis)
     const { totalRealizedGain } = await calculateRealizedGains(order.sellerId, order.items || []);
@@ -3690,9 +3718,16 @@ exports.confirmDelivery = onCall(
         if (data.status !== "shipped") {
           throw new HttpsError("failed-precondition", `Order status is ${data.status}, expected shipped`);
         }
+        // 30-day Dispute-Window (Round 11, 2026-04-29 — TCGplayer-Pattern):
+        // TCGplayer "Safeguard": Buyer kann bis 30 Tage nach Lieferung
+        // Dispute oeffnen. Wir setzen disputeWindowEndsAt = deliveredAt + 30d
+        // damit openDispute auch in delivered/auto_completed-Status moeglich
+        // ist (siehe openDispute-Check unten).
+        const disputeWindowEndsAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
         tx.update(orderRef, {
           status: "delivered",
           deliveredAt: admin.firestore.FieldValue.serverTimestamp(),
+          disputeWindowEndsAt: disputeWindowEndsAt.toISOString(),
         });
         return data;
       });
@@ -3954,8 +3989,25 @@ exports.openDispute = onCall(
     if (order.buyerId !== uid) {
       throw new HttpsError("permission-denied", "Only the buyer can open a dispute");
     }
-    if (order.status !== "shipped") {
-      throw new HttpsError("failed-precondition", `Order status is ${order.status}, expected shipped`);
+    // 30-day Dispute-Window (Round 11, 2026-04-29 — TCGplayer-Pattern):
+    // Vorher: Dispute nur in `shipped`-Status moeglich. Nach confirmDelivery
+    // oder auto-release wurde der Status zu delivered/auto_completed →
+    // Buyer konnte nicht mehr nachtraeglich disputen (z.B. wenn Karte
+    // 10 Tage nach „delivered" als counterfeit erkennbar wird).
+    // Jetzt: Dispute auch in delivered/auto_completed moeglich, solange
+    // disputeWindowEndsAt nicht abgelaufen ist (30 Tage nach Delivery).
+    const isShipped = order.status === "shipped";
+    const isInPostDeliveryWindow =
+      (order.status === "delivered" || order.status === "auto_completed") &&
+      order.disputeWindowEndsAt &&
+      new Date(order.disputeWindowEndsAt) > new Date();
+    if (!isShipped && !isInPostDeliveryWindow) {
+      throw new HttpsError(
+        "failed-precondition",
+        order.status === "delivered" || order.status === "auto_completed"
+          ? `Dispute window closed (30-day post-delivery period expired)`
+          : `Order status is ${order.status}, dispute not allowed`,
+      );
     }
 
     // Phase 6: Reason-Code-Mapping fuer Refund-Policy-Engine. Frontend sendet
@@ -4432,9 +4484,16 @@ exports.autoReleaseOrders = onSchedule(
           if (!data.autoReleaseAt || new Date(data.autoReleaseAt) > new Date()) {
             return null;
           }
+          // 30-day dispute window (Round 11 — TCGplayer-Pattern):
+          // auch bei auto_completed bekommt Buyer 30 Tage Dispute-Recht
+          // ab Auto-Release-Datum. Falls Buyer untaetig war + Karte
+          // doch nicht erhalten/wrong-condition, kann er nachtraeglich
+          // disputen.
+          const disputeWindowEndsAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
           tx.update(doc.ref, {
             status: "auto_completed",
             deliveredAt: admin.firestore.FieldValue.serverTimestamp(),
+            disputeWindowEndsAt: disputeWindowEndsAt.toISOString(),
           });
           return data;
         });
