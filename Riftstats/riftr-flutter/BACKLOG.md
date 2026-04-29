@@ -331,10 +331,16 @@ Test-Suite: `functions/test-scenarios/phase8_e2e_tests.js` — 46/46 Checks grue
 133. ⚠️ **Photo-Listing-Policy fuer High-Value-Items (deferred 2026-04-29)** — Round 11 TCGplayer-Pattern: Photo verpflichtend fuer Cards > $X. Reduziert Bait-and-Switch (Strategie 4) drastisch — Buyer hat Foto-Beweis vor Versand.
     - **Defer-Begruendung:** UI-Feature mit Camera-Integration in Listing-Create-Flow + Image-Storage-Backend. Pre-Public-Launch.
 
-132. ⚠️ **Mandatory Tracked-Shipping above Threshold (deferred 2026-04-29)** — Round 11: sowohl Cardmarket (>€25) als auch TCGplayer (>$20) machen Tracking obligatorisch fuer hoehere Order-Werte. Schuetzt Seller bei Lost-Order-Disputes.
-    - **Aktueller Stand:** shippingMethod ist buyer-choice (letter/tracked/insured), kein Threshold-Enforcement.
-    - **Adoption:** in createPaymentIntent + processMultiSellerCart bei totalCents > 2500 (€25): force shippingMethod="tracked" oder "insured".
-    - **Defer-Begruendung:** UI-Feature noetig (Shipping-Picker muss tracked/insured highlighten + niedrige Tier disablen). Pre-Public-Launch.
+132. ✅ **Mandatory Tracked-Shipping >€25 — Server-Side Hard-Enforcement (2026-04-29)** — Cardmarket-Pattern (>€25) + TCGplayer (>$20). Schuetzt vor Bait-and-Switch (Round 10 Strategie 4), Lost-Mail-Scam, Friendly-Fraud-Chargebacks.
+    - **Was wir vorher hatten (Soft-Enforcement, Flutter-only):**
+      - `lib/data/shipping_rates.dart::requiresTracking(bundleValue)` → true bei >€25
+      - `quoteForBundle(forceTracked: true)` skippt letter-tiers
+      - `checkout_sheet.dart` auto-picked tracked beim Cart-Add bei bundle >€25
+      - `missing_cards_optimizer` respektiert >€25 Rule fuer Smart-Cart-Plans
+    - **Was gefehlt hat:** Server-Side-Check. Hacker mit Frida/Burp koennte UI umgehen + direkten CF-Call mit `shippingMethod: "letter"` machen auch bei totalCents > 2500.
+    - **Fix:** in createPaymentIntent (post-effectiveMethod-Compute) + processMultiSellerCart (per-Seller-Group): `if (effectiveMethod === "letter" && subtotal > 25) throw HttpsError("failed-precondition", ...)`.
+    - **Insured-Override** (anyInsuredOnly) unangetastet — wenn listing insured-only flagged, shippingMethod wird ohnehin auf "insured" forced.
+    - **Deployed.** Legit-User unbetroffen (UI picked schon richtig). API-Bypass-Versuche kriegen jetzt clean rejection.
 
 131. ⚠️ **Multi-Source-Verification: Phone + Email + Stripe-IBAN (deferred 2026-04-29)** — Round 11 Recherche: Cardmarket sammelt fuer Fraud-Prevention Multi-Source-Daten. Wir haben Email + Stripe-Connect-Verified-ID — kein Phone.
     - **Adoption:** Phone-Verification beim Seller-Onboarding (zusaetzliche Hurde fuer Fraudster).
