@@ -6632,6 +6632,177 @@ exports.cleanupBetaMarketplace = onRequest(
 );
 
 // ═══════════════════════════════════════════
+// ─── Daily Backup: portfolio_history + cost_basis ───
+// ═══════════════════════════════════════════
+//
+// Belt-and-suspenders Schutz fuer kritische User-Finanz-Daten.
+// Auch wenn die Firestore-Rules append-only enforcen + delete blocken,
+// koennten Server-side-Bugs (z.B. CF mit Admin-SDK das Rules umgeht)
+// die Daten zerstoeren. Daily-Backup gibt 30-Tage-Recovery-Fenster.
+//
+// Doc-Path: artifacts/{appId}/data_backups/{YYYY-MM-DD}/users/{uid}/{type}
+// Retention: 30 Tage (alte Backups werden vom selben Cron geloescht).
+//
+// Run: jeden Tag 02:00 UTC (Berlin-zeit-spaet aber vor App-Open-Peak).
+
+exports.dailyBackupUserData = onSchedule(
+  {
+    schedule: "0 2 * * *",
+    timeZone: "UTC",
+    timeoutSeconds: 540,
+    memory: "1GiB",
+    region: "us-central1",
+  },
+  async () => {
+    const today = new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
+    const usersRef = db.collection("artifacts").doc(APP_ID).collection("users");
+    const userDocs = await usersRef.listDocuments();
+
+    let phBackedUp = 0;
+    let cbBackedUp = 0;
+    let errors = 0;
+
+    for (const userDoc of userDocs) {
+      const uid = userDoc.id;
+
+      // portfolio_history backup
+      try {
+        const phRef = userDoc.collection("data").doc("portfolio_history");
+        const phSnap = await phRef.get();
+        if (phSnap.exists) {
+          await db.collection("artifacts").doc(APP_ID)
+            .collection("data_backups").doc(today)
+            .collection("users").doc(uid)
+            .collection("data").doc("portfolio_history")
+            .set({
+              ...phSnap.data(),
+              _backedUpAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+          phBackedUp++;
+        }
+      } catch (e) {
+        errors++;
+        console.error(`backup portfolio_history ${uid}: ${e.message}`);
+      }
+
+      // cost_basis backup
+      try {
+        const cbRef = userDoc.collection("data").doc("cost_basis");
+        const cbSnap = await cbRef.get();
+        if (cbSnap.exists) {
+          await db.collection("artifacts").doc(APP_ID)
+            .collection("data_backups").doc(today)
+            .collection("users").doc(uid)
+            .collection("data").doc("cost_basis")
+            .set({
+              ...cbSnap.data(),
+              _backedUpAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+          cbBackedUp++;
+        }
+      } catch (e) {
+        errors++;
+        console.error(`backup cost_basis ${uid}: ${e.message}`);
+      }
+    }
+
+    // ── Retention: lösche Backup-Tage älter als 30 Tage ──
+    const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
+      .toISOString().slice(0, 10);
+    const allBackupDays = await db.collection("artifacts").doc(APP_ID)
+      .collection("data_backups").listDocuments();
+    let prunedDays = 0;
+    for (const dayDoc of allBackupDays) {
+      if (dayDoc.id < cutoff) {
+        // Recursive delete: alle subcollections unter diesem day-doc loeschen
+        try {
+          const usersInBackup = await dayDoc.collection("users").listDocuments();
+          for (const ub of usersInBackup) {
+            const dataDocs = await ub.collection("data").listDocuments();
+            for (const dd of dataDocs) {
+              await dd.delete();
+            }
+            await ub.delete();
+          }
+          await dayDoc.delete();
+          prunedDays++;
+        } catch (e) {
+          console.error(`prune ${dayDoc.id}: ${e.message}`);
+        }
+      }
+    }
+
+    console.log(
+      `dailyBackupUserData: phBackedUp=${phBackedUp} cbBackedUp=${cbBackedUp} ` +
+      `errors=${errors} prunedDays=${prunedDays} (date=${today})`,
+    );
+  },
+);
+
+// ═══════════════════════════════════════════
+// ─── Restore from Backup (Bearer-protected) ───
+// ═══════════════════════════════════════════
+//
+// Wenn ein User-Doc verloren geht, kann Admin via curl den letzten Backup
+// wiederherstellen. Picks automatically the LATEST backup that has the doc.
+//
+// USAGE:
+//   curl -X POST -H "Authorization: Bearer $ADMIN_TRIGGER_SECRET" \
+//     -H "Content-Type: application/json" \
+//     --data '{"uid":"DfAEtNC3rYcCIEuvODWwolNVHUA3","type":"portfolio_history"}' \
+//     https://us-central1-riftr-10527.cloudfunctions.net/restoreFromBackup
+//
+// type: "portfolio_history" oder "cost_basis"
+
+exports.restoreFromBackup = onRequest(
+  {
+    timeoutSeconds: 60,
+    region: "us-central1",
+    secrets: ["ADMIN_TRIGGER_SECRET"],
+  },
+  async (req, res) => {
+    if (!requireAdminSecret(req, res)) return;
+    const { uid, type } = req.body || {};
+    if (!uid || !type || !["portfolio_history", "cost_basis"].includes(type)) {
+      res.status(400).json({
+        error: "Body needs { uid, type: 'portfolio_history'|'cost_basis' }",
+      });
+      return;
+    }
+
+    // Find latest backup day that has this user+type
+    const allDays = await db.collection("artifacts").doc(APP_ID)
+      .collection("data_backups").listDocuments();
+    const sortedDays = allDays.map(d => d.id).sort().reverse(); // newest first
+
+    for (const day of sortedDays) {
+      const backupRef = db.collection("artifacts").doc(APP_ID)
+        .collection("data_backups").doc(day)
+        .collection("users").doc(uid)
+        .collection("data").doc(type);
+      const snap = await backupRef.get();
+      if (snap.exists) {
+        const data = snap.data();
+        delete data._backedUpAt; // strip backup metadata
+        await db.collection("artifacts").doc(APP_ID)
+          .collection("users").doc(uid)
+          .collection("data").doc(type)
+          .set(data);
+        res.json({
+          success: true,
+          restored_from: day,
+          uid,
+          type,
+        });
+        return;
+      }
+    }
+
+    res.status(404).json({ error: `No backup found for uid=${uid} type=${type}` });
+  },
+);
+
+// ═══════════════════════════════════════════
 // ─── One-time Migration: createdAt from Firebase Auth ───
 // ═══════════════════════════════════════════
 

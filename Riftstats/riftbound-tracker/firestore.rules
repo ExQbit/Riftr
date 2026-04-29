@@ -79,6 +79,13 @@ service cloud.firestore {
 
       // ── Global Collections ──
 
+      // Daily-Backup-Records (Round 11.3, 2026-04-29).
+      // Tägliche Backups von portfolio_history + cost_basis.
+      // CF-only (Admin-SDK), Clients sehen das NIE.
+      match /data_backups/{dayId}/{deepPath=**} {
+        allow read, write: if false;
+      }
+
       // Sock-Puppet/Wash-Trading-Detection-Records (Round 10, 2026-04-29).
       // Verfolgt Buyer-Seller-Pair-Velocity in 30d-Window. CF-only Admin-SDK
       // schreibt; weder Buyer noch Seller darf das einsehen (sonst wuerden
@@ -389,10 +396,27 @@ service cloud.firestore {
         }
 
         // ── Cost basis (FIFO Kauf-Historie) ──
-        // READ + WRITE: nur owner. Finanzielle Privat-Information.
-        // CF kann via Admin SDK schreiben (umgeht Rules).
+        // SCHUTZ-LEVEL: kritische Finanz-Daten (Steuer/Realized-Gains).
+        // VORFALL 2026-04-29: Cleanup-Script hat versehentlich gelöscht
+        // → echte Wochen-Historie verloren weil PITR nicht enabled war.
+        // Niemals wieder.
+        //
+        // READ: owner-only.
+        // CREATE: owner.
+        // UPDATE: owner — aber Doc kann nicht komplett geleert werden
+        //   (entries-map muss vorhanden sein wenn sie schon existierte).
+        // DELETE: VERBOTEN. Auch nicht via Admin-SDK ist die normale
+        //   Verwendung — nur via Firebase-Console-Manual-Action.
         match /data/cost_basis {
-          allow read, write: if isOwner(uid);
+          allow read: if isOwner(uid);
+          allow create: if isOwner(uid);
+          allow update: if isOwner(uid)
+            && (
+              !('entries' in resource.data)
+              || ('entries' in request.resource.data
+                  && request.resource.data.entries is map)
+            );
+          allow delete: if false;
         }
 
         // ── FCM Tokens (Push-Notifications) ──
@@ -421,10 +445,31 @@ service cloud.firestore {
         }
 
         // ── Portfolio History (Performance-Snapshots) ──
-        // READ + WRITE: nur owner. Finanzielle Privat-Daten
-        // (taegliche Werte der eigenen Sammlung).
+        // SCHUTZ-LEVEL: kritische Sammlungs-Werte-Historie. Tägliche
+        // Snapshots dürfen NIE verloren gehen — sind Wochen/Monate
+        // Aufbau-Arbeit.
+        // VORFALL 2026-04-29: Cleanup hat den Doc gelöscht → Historie
+        // unwiederbringlich weg. Niemals wieder.
+        //
+        // READ: owner-only.
+        // CREATE: owner. Snapshots können beliebig sein bei erstem Schreiben.
+        // UPDATE: owner — APPEND-ONLY auf snapshots-map. Neue Schreibungen
+        //   müssen ALLE existierenden snapshot-Keys beibehalten. Damit
+        //   ist Wipe-by-bug oder Wipe-by-cleanup strukturell unmöglich.
+        // DELETE: VERBOTEN.
         match /data/portfolio_history {
-          allow read, write: if isOwner(uid);
+          allow read: if isOwner(uid);
+          allow create: if isOwner(uid);
+          allow update: if isOwner(uid)
+            && (
+              // Erste snapshots-Schreibung (oder andere Felder ohne snapshots-touch)
+              !('snapshots' in resource.data)
+              || !('snapshots' in request.resource.data)
+              // Append-only: neue Keys MÜSSEN alle alten enthalten
+              || request.resource.data.snapshots.keys()
+                  .hasAll(resource.data.snapshots.keys())
+            );
+          allow delete: if false;
         }
 
         // KEIN catch-all `match /data/{docId}` hier!
