@@ -313,6 +313,38 @@ Test-Suite: `functions/test-scenarios/phase8_e2e_tests.js` — 46/46 Checks grue
     - **CF-Args-Audit**: alle 220 auth-checks ueberprueft, alle nutzen `request.auth.uid` (server-trusted), keine User-controlled User-IDs aus den Args. Resource-IDs (orderId, listingId) werden serverside gegen Owner geprüft.
     - Deploy: Rules + CFs (submitReview, confirmDelivery, migratePlayerProfiles) live. **Pre-Launch-Blocker geschlossen.**
 
+129. ⚠️ **Account-Reset-Loop Defense (deferred 2026-04-29)** — Round 10 Insider-Threat: Strategie 6. Nach Account-Suspend erstellt Fraudster neuen Account mit anderer Email + Stripe-Connect mit Geschwister-Ausweis + neuer Bank → continued operations.
+    - **Fix erforderlich:** Device-Fingerprinting (IP, User-Agent, hardware-id) + Email-Domain-Clustering + Stripe-IBAN-Cross-Reference.
+    - **Defer-Begruendung:** signifikanter Engineering-Aufwand, DSGVO-relevant (PII-Storage muss DSGVO-konform sein, Privacy-Policy-Update noetig). Stripe macht Teil dieser Detection bereits selbst (Multiple Connect-Accounts zur gleichen Bank-IBAN werden geflagged). Pre-Public-Launch-Track.
+
+128. ⚠️ **Triangulation-Money-Laundering Velocity-Detection (deferred 2026-04-29)** — Round 10 Insider-Threat: Strategie 2. Seller A koordiniert mit Buyer B (stolen cards). B kauft High-Value-Listings von A, money flows zu A's Connect → Bank → A behaelt 90%, gibt 10% an B. Echter Karteninhaber chargebacked spaeter, A ist schon ausgezahlt.
+    - **Primary Defense ist Stripe Radar** (Stripe-side ML-based fraud-detection). Riftr-side Velocity-Detection waere zusaetzlich:
+      - Track "neue Buyer (<7d) → High-Value zu gleichem Seller" Pattern
+      - Auto-Hold first-purchase >€500 von neuen Buyer-Accounts (extra Buyer-Verify-Step)
+    - **Defer-Begruendung:** komplexe Velocity-Logik, Risiko legit-Power-Buyer zu blockieren. Stripe Radar fängt 60-80% in der Praxis. Pre-Public-Launch-Track wenn echte Triangulation-Faelle auftreten.
+
+127. ✅ **Sock-Puppet Wash-Trading Detection (Round 10 Insider-Audit, 2026-04-29)** — HIGHEST-IMPACT-FIX in Round 10.
+    - **Attack-Pattern:** Seller A koordiniert mit 5 Friend-Accounts. Friends kaufen €1-Listings (echtes Geld!), leaven 5-Sterne-Reviews. €54 total spending → Trusted-Tier (50 Verkaeufe, 4.95★) → 3-Tage delay_days → A scammt echte Buyer mit High-Value-Listings.
+    - **Defense:** `trackBuyerSellerPair()` getriggert bei confirmDelivery + autoReleaseOrders. Per-Pair Tracking in 30d-Window mit timestamps + amounts. Doc-Path: `artifacts/{appId}/buyerSellerPairs/{buyerId}_{sellerId}`.
+    - **Threshold-Detection (zwei Pattern):**
+      1. HARD: 10+ Transaktionen in 30 Tagen (egal welcher Betrag) → SUSPECT
+      2. SOFT: 5+ Transaktionen UND avgAmount < €15 (low-value Wash-Pattern) → SUSPECT
+    - **Bei Hit:** Admin-Alert `SOCK_PUPPET_SUSPECT` mit pair-Details + reason. flaggedAt + flaggedReason im Doc gespeichert. Kein Auto-Block — echte Power-Buyer-Pairs existieren (Lieblings-Seller). Admin investigiert manuell + entscheidet ueber Suspension.
+    - **Firestore-Rule:** `buyerSellerPairs/{pairId}` ist CF-only (Admin-SDK-write, kein Client-Zugriff). Verhindert dass Fraudster die Threshold-Werte reverse-engineeren.
+    - **Memory-bound:** events-Array hat max 50 Eintraege pro Pair (legit-Pair erreicht das nie).
+    - **Deployed.**
+
+126. ✅ **Pre-Release Mass-Scam Defense (Round 10 Insider-Audit, 2026-04-29)** — HIGH-IMPACT-FIX:
+    - **Attack-Pattern:** Neuer Seller listet 100× Pre-Release-Karten "UNL Aatrox €50". 100 Buyer pre-ordern → €5000 Auth-Hold (capture geblockt vor Release-Date). Mai 8 Release-Day: Seller markShipped × 100 → alle €5000 captured → vanish bevor delay_days-Auszahlung. = €5000 Beute pro Set-Release.
+    - **Defense:** im existierenden `enforceListingSpamLimit`-Trigger zusaetzlicher Pre-Release-Cap (account-age-based):
+      - <7 Tage:  max 5 Pre-Release-Listings/Tag
+      - 7-30 Tage: max 25 Pre-Release-Listings/Tag
+      - >30 Tage:  max 100/Tag (= regular daily cap)
+    - **Counter:** `rateLimits/{uid}.preReleaseListingCreate` (analog zu existing Round 7 listing-counter).
+    - **Bei Hit:** Listing flagged `pre_release_cap_exceeded`, Admin-Alert `PRE_RELEASE_SCAM` mit reason inkl. Account-Age.
+    - **Effect:** neuer Seller kann max €250 Pre-Release-Volume aufbauen (5 × €50), nicht €5000. Macht Pre-Release-Mass-Scam uneconomic. Etablierter Seller mit echter Sales-History wird nicht beschraenkt.
+    - **Deployed.**
+
 125. ✅ **Listing-Velocity Anti-Burst (Round 9 Red-Team, 2026-04-29)** — vorher 100/Tag erlaubte 100 Listings in 5 Min = Burst-Spam-Vektor.
     - Neuer Hourly-Cap 20/h zusaetzlich zum 100/Tag im `enforceListingSpamLimit`-Trigger
     - Rolling-Window via timestamps-Array, memory-bound auf 50 Events
