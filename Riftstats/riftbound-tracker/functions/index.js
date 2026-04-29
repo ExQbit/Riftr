@@ -7095,7 +7095,52 @@ const MOBALYTICS_TOURNAMENTS = "https://mobalytics.gg/riftbound/tournaments";
  * Throws after retries exhausted. We don't currently alert externally —
  * just log loudly so the daily run surfaces in Cloud Logging.
  */
+// SSRF-Hardening (Round 11.2 / BACKLOG #102, 2026-04-29):
+// Whitelist von Hosts die fetchWithRetries ueberhaupt anhauen darf.
+// Verhindert SSRF wenn ein parsed-Slug oder eine konstruierte URL auf
+// ein malicious Host zeigt — z.B. "http://metadata.google.internal/"
+// (GCP-Internal-Metadata) oder "http://localhost:8080".
+//
+// Kontext: alle URLs die wir fetchen werden aus Konstanten + parsed
+// HTML-Content gebaut. Slug-Regex filtert schon (`[a-z0-9-]+` only),
+// aber defense-in-depth: zusaetzlich Hostname-Whitelist enforced.
+const FETCH_HOST_WHITELIST = new Set([
+  // Riot/Riftbound — Tournament-Discovery
+  "riftbound.leagueoflegends.com",
+  "www.riftbound.leagueoflegends.com",
+  "lolesports.com",
+  "www.lolesports.com",
+  // Mobalytics — Tournament-Discovery
+  "mobalytics.gg",
+  "www.mobalytics.gg",
+  // Riftcodex — Card-Data-Sync
+  "api.riftcodex.com",
+  // Cardmarket — Price-Guide-Sync
+  "downloads.s3.cardmarket.com",
+  "s3.cardmarket.com",
+]);
+
 async function fetchWithRetries(url, { retries = 3, timeoutMs = 15000 } = {}) {
+  // Hostname-Validation — defense-in-depth gegen SSRF.
+  // Auch wenn HTML-Parsing-Bugs malicious Slugs durchlassen, koennen
+  // wir nie auf etwas anderes als Whitelist-Hosts treffen.
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(url);
+  } catch (_) {
+    throw new Error(`fetchWithRetries: invalid URL ${url}`);
+  }
+  if (parsedUrl.protocol !== "https:" && parsedUrl.protocol !== "http:") {
+    throw new Error(
+      `fetchWithRetries: refusing non-http(s) protocol ${parsedUrl.protocol} (${url})`,
+    );
+  }
+  if (!FETCH_HOST_WHITELIST.has(parsedUrl.hostname)) {
+    throw new Error(
+      `fetchWithRetries: host ${parsedUrl.hostname} not in whitelist (${url})`,
+    );
+  }
+
   let lastErr;
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {

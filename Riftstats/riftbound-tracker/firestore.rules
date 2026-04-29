@@ -23,6 +23,42 @@ service cloud.firestore {
         && request.auth.token.firebase.sign_in_provider != 'anonymous';
     }
 
+    // Avatar-URL Whitelist (Round 11.2 / BACKLOG #115, 2026-04-29):
+    // Schuetzt vor Tracking-Pixel-Attacken. User koennten sonst beliebige
+    // URLs als avatarUrl setzen ("https://attacker.com/track.gif?uid=victim")
+    // → andere User laden das Bild beim Profil-View → Attacker bekommt
+    // IP-Adresse + User-Agent.
+    //
+    // Erlaubte Quellen (drei Saeulen):
+    //   1. null/empty: kein Avatar gesetzt (kein Issue)
+    //   2. Google Sign-In default: lh3.googleusercontent.com/* (passiert
+    //      automatisch beim Google-Login)
+    //   3. Firebase Storage Riftr-Bucket avatars/* (Phase B unterstuetzt
+    //      curated Legend-Crops + Shop-Logo-Uploads)
+    //
+    // Phase A (jetzt): Rule enforced. Phase B (Pre-Public-Launch): UI mit
+    // Picker fuer kuratierte Avatare + Shop-Logo-Upload-Flow zu Firebase
+    // Storage. Whitelist-Architektur stuetzt schon beide Cases ab.
+    function isValidAvatarUrl(url) {
+      return url == null || url == ''
+        || url.matches('^https://lh3\\.googleusercontent\\.com/.*')
+        || url.matches('^https://firebasestorage\\.googleapis\\.com/v0/b/riftr-10527\\.appspot\\.com/o/avatars(%2F|/).*');
+    }
+
+    // Avatar-Update-Helper: validiert wenn avatarUrl im Update enthalten ist.
+    // Wenn nicht in den affectedKeys → ueberspringt Validation (User aendert
+    // andere Felder, avatarUrl unangetastet).
+    function avatarUrlOk(req, res) {
+      return !req.data.diff(res.data).affectedKeys().hasAny(['avatarUrl'])
+        || isValidAvatarUrl(req.data.avatarUrl);
+    }
+
+    // Avatar-Create-Helper: bei create gibt's keinen `resource`, nur `request`.
+    function avatarUrlOkCreate(req) {
+      return !('avatarUrl' in req.data)
+        || isValidAvatarUrl(req.data.avatarUrl);
+    }
+
     // ── Root: deny all by default ──
     match /{document=**} {
       allow read, write: if false;
@@ -240,12 +276,14 @@ service cloud.firestore {
           && request.resource.data.keys().hasOnly([
             'displayName', 'displayNameLower', 'avatarUrl', 'bio',
             'country', 'city', 'updatedAt',
-          ]);
+          ])
+          && avatarUrlOkCreate(request.resource);
         allow update: if isOwner(uid)
           && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
             'displayName', 'displayNameLower', 'avatarUrl', 'bio',
             'country', 'city', 'updatedAt',
-          ]);
+          ])
+          && avatarUrlOk(request.resource, resource);
         allow delete: if false;
       }
 
@@ -306,14 +344,16 @@ service cloud.firestore {
               'street', 'city', 'zip',
               'showWinRate', 'showCollectionProgress', 'showMatchCount',
               'nameChangesLeft', 'updatedAt', 'createdAt',
-            ]);
+            ])
+            && avatarUrlOkCreate(request.resource);
           allow update: if isOwner(uid)
             && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
               'displayName', 'bio', 'avatarUrl', 'country',
               'street', 'city', 'zip',
               'showWinRate', 'showCollectionProgress', 'showMatchCount',
               'nameChangesLeft', 'updatedAt',
-            ]);
+            ])
+            && avatarUrlOk(request.resource, resource);
           allow delete: if false;
         }
 
