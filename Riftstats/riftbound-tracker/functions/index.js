@@ -108,6 +108,75 @@ async function enforceRateLimit(uid, key, dailyLimit) {
   }, { merge: true });
 }
 
+// ─── Account-Age-Based Daily Cap (Round 9 Red-Team-Audit, 2026-04-29) ─
+// Carder-Defense via Age-Tiering:
+//   Frische Accounts (<7 Tage) → tightest cap (5)
+//   Mittel (7-30 Tage)         → moderate cap (15)
+//   Etabliert (>30 Tage)       → full cap (25)
+//
+// Real-Carder muss 7+ Tage warten BEVOR er einen Account profitabel
+// carden kann → skaliert nicht fuer Profis (sie wollen schnell Geld).
+// Legit Power-Buyer kommt mit 5/Tag in der ersten Woche locker hin
+// (wer kauft mehr als 5 Karten in der ersten App-Woche?).
+//
+// Account-Age via Firebase Auth `user.metadata.creationTime` —
+// nicht client-controlled, nicht faelschbar.
+async function getAccountAgeDays(uid) {
+  try {
+    const userRecord = await admin.auth().getUser(uid);
+    const creationTime = userRecord.metadata?.creationTime;
+    if (!creationTime) return 999; // assume mature on missing data
+    const ageMs = Date.now() - new Date(creationTime).getTime();
+    return Math.floor(ageMs / (24 * 60 * 60 * 1000));
+  } catch (_) {
+    return 999; // Auth-failure → treat as mature (don't block legit users)
+  }
+}
+
+async function enforceAgeBasedDailyCap(uid, key, freshCap, midCap, matureCap) {
+  if (!uid) return;
+  const ageDays = await getAccountAgeDays(uid);
+  let dailyLimit;
+  if (ageDays < 7) dailyLimit = freshCap;
+  else if (ageDays < 30) dailyLimit = midCap;
+  else dailyLimit = matureCap;
+  await enforceRateLimit(uid, key, dailyLimit);
+}
+
+// ─── Hourly Velocity Rate-Limit (Round 9 Red-Team-Audit, 2026-04-29) ─
+// Schaerfere Velocity-Defense gegen Burst-Attacks:
+// "100/day" erlaubt theoretisch 100 in 5 Minuten = Burst-Spam.
+// "20/hour" macht Burst-Attacks unattraktiv (max 20 in 1h Fenster).
+// Beide Limits parallel — kombiniert: realistisch 480/Tag (24*20),
+// aber praktisch limited auf Daily-Cap (100/day). Cap-Aufweichung
+// nicht moeglich.
+//
+// Window-Tracking: rolling 1-Stunde via `hourlyEvents`-Array von
+// Timestamps. Wir behalten nur die letzten N Events (memory-bound).
+async function enforceHourlyVelocity(uid, key, hourlyLimit) {
+  if (!uid) return;
+  const ref = db.collection("artifacts").doc(APP_ID)
+    .collection("rateLimits").doc(uid);
+  const snap = await ref.get();
+  const data = snap.exists ? snap.data() : {};
+  const entry = data[`${key}Hourly`] || {};
+  const events = Array.isArray(entry.events) ? entry.events : [];
+  const oneHourAgo = Date.now() - 60 * 60 * 1000;
+  const recent = events.filter((ts) => ts >= oneHourAgo);
+  if (recent.length >= hourlyLimit) {
+    throw new HttpsError(
+      "resource-exhausted",
+      `Hourly limit reached (${hourlyLimit} ${key} per hour). Try again later.`,
+    );
+  }
+  recent.push(Date.now());
+  // Cap array-size auf 2x hourlyLimit fuer memory-safety
+  const trimmed = recent.slice(-Math.max(hourlyLimit * 2, 50));
+  await ref.set({
+    [`${key}Hourly`]: { events: trimmed },
+  }, { merge: true });
+}
+
 function requireAdminSecret(req, res) {
   if (!ADMIN_TRIGGER_SECRET) {
     console.error("ADMIN_TRIGGER_SECRET not configured — manual endpoint refused");
@@ -2270,10 +2339,20 @@ exports.createPaymentIntent = onCall(
 
     const uid = request.auth.uid;
 
-    // Rate-Limit (Round 5, 2026-04-29): 50 createPaymentIntent calls/User/Tag.
-    // Heavy-Buyer real-world: ~10-20/Tag. 50 = 2-3x headroom. Schuetzt
-    // gegen Stripe-API-Quota-Burn + Firestore-Order-Doc-Spam.
-    await enforceRateLimit(uid, "createPaymentIntent", 50);
+    // Carding-Defense (Round 9 Red-Team-Audit reviewed 2026-04-29):
+    // Aelterer 50/Tag-Cap war zu generös. Industry-Best-Practice fuer
+    // Marketplaces: 5-10 PIs/Tag fuer neue Accounts, 20-30 fuer etablierte.
+    // Age-Based-Tier-Cap macht Mass-Account-Carding uneconomic:
+    //   - Frische Accounts (<7d): max 5 PIs/Tag → 5 Card-Tests/Account
+    //   - Mittel (7-30d):          max 15 PIs/Tag
+    //   - Etabliert (>30d):        max 25 PIs/Tag
+    // Real-Power-Buyer hits 25/Tag praktisch nie (das waeren 25 separate
+    // Order-Sessions). Carder muesste 7+ Tage warten + 100+ Accounts
+    // anlegen → uneconomic.
+    await enforceAgeBasedDailyCap(uid, "createPaymentIntent", 5, 15, 25);
+    // Hourly velocity ueber alle Tiers: max 5/h (war 10) — gibt Stripe-Radar
+    // Zeit fuer Pattern-Detection bei stolen-card-tests.
+    await enforceHourlyVelocity(uid, "createPaymentIntent", 5);
 
     const { listingId, quantity, items, shippingMethod, shippingAddress } = request.data;
 
@@ -2775,11 +2854,17 @@ exports.processMultiSellerCart = onCall(
     }
     const uid = request.auth.uid;
 
-    // Rate-Limit (Round 5, 2026-04-29): 30/User/Tag. Multi-Seller-Cart
-    // ist teurer als Single (N PIs in einer CF), niedrigeres Limit.
-    // Heavy-Buyer real-world: vielleicht 5-10/Tag (selten mehr als 3-5
-    // Multi-Seller-Carts pro Tag). 30 = 3x headroom.
-    await enforceRateLimit(uid, "processMultiSellerCart", 30);
+    // Carding-Defense (Round 9 reviewed 2026-04-29):
+    // Multi-Seller-Path war 30/Tag — Carder konnte das als Bypass des
+    // Single-Seller-Caps nutzen (5 carts × 5 sellers = 25 PIs/Tag extra).
+    // Age-Based-Cap analog zu createPaymentIntent, aber strikter (jede
+    // Multi-Cart-Submission = N PIs in einer Aktion):
+    //   - Fresh:    3/Tag (= max 3×5 = 15 PIs effektiv)
+    //   - Mid:      8/Tag
+    //   - Etabliert: 15/Tag
+    await enforceAgeBasedDailyCap(uid, "processMultiSellerCart", 3, 8, 15);
+    // Hourly: max 2/h gegen Burst-Carding via Multi-Cart-Path.
+    await enforceHourlyVelocity(uid, "processMultiSellerCart", 2);
 
     const {
       setupIntentId,
@@ -6523,6 +6608,7 @@ exports.updateCartReservation = onCall(
  * Race-Window kann Cap um +1-2 ueberschreiten, akzeptabel).
  */
 const LISTINGS_PER_DAY_CAP = 100;
+const LISTINGS_PER_HOUR_CAP = 20; // Round 9 Red-Team-Audit anti-burst
 
 exports.enforceListingSpamLimit = onDocumentCreated(
   {
@@ -6548,26 +6634,38 @@ exports.enforceListingSpamLimit = onDocumentCreated(
       const todayCount = entry.date === today ? (entry.count || 0) : 0;
       const newCount = todayCount + 1;
 
+      // Round 9 Red-Team-Audit: Hourly-Burst-Defense.
+      // 100/Tag erlaubt sonst 100 Listings in 5 Minuten.
+      const hourlyEntry = data.listingCreateHourly || {};
+      const hourlyEvents = Array.isArray(hourlyEntry.events) ? hourlyEntry.events : [];
+      const oneHourAgo = Date.now() - 60 * 60 * 1000;
+      const recentEvents = hourlyEvents.filter((ts) => ts >= oneHourAgo);
+      recentEvents.push(Date.now());
+      const trimmedEvents = recentEvents.slice(-Math.max(LISTINGS_PER_HOUR_CAP * 2, 50));
+
       await rateRef.set({
         listingCreate: { date: today, count: newCount },
+        listingCreateHourly: { events: trimmedEvents },
       }, { merge: true });
 
-      if (newCount > LISTINGS_PER_DAY_CAP) {
+      const exceedsHourly = recentEvents.length > LISTINGS_PER_HOUR_CAP;
+      if (newCount > LISTINGS_PER_DAY_CAP || exceedsHourly) {
         await snap.ref.update({
           status: "flagged_spam",
           flaggedReason: "rate_limit_exceeded",
           flaggedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
+        const reason = exceedsHourly
+          ? `hourly_burst (${recentEvents.length}/${LISTINGS_PER_HOUR_CAP})`
+          : `daily_cap (${newCount}/${LISTINGS_PER_DAY_CAP})`;
         console.warn(
-          `enforceListingSpamLimit: seller ${sellerId} exceeded ` +
-          `${LISTINGS_PER_DAY_CAP}/day (count=${newCount}), ` +
+          `enforceListingSpamLimit: seller ${sellerId} ${reason}, ` +
           `listing ${snap.id} marked flagged_spam`,
         );
         try {
           sendAdminAlert(
             "LISTING_SPAM",
-            `Seller ${sellerId} exceeded daily listing limit ` +
-            `(${newCount}/${LISTINGS_PER_DAY_CAP}). Listing ${snap.id} flagged.`,
+            `Seller ${sellerId} ${reason}. Listing ${snap.id} flagged.`,
           );
         } catch (alertErr) {
           console.error(`Admin-Alert send failed: ${alertErr.message}`);
