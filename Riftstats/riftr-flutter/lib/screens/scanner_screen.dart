@@ -8,6 +8,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:url_launcher/url_launcher.dart';
+import '../services/auth_service.dart';
 import '../models/card_model.dart';
 import '../models/card_fingerprint.dart';
 import '../services/ocr_service.dart';
@@ -19,18 +21,51 @@ import '../services/set_classifier_service.dart';
 import '../services/suffix_classifier_service.dart';
 import '../services/mana_classifier_service.dart';
 import '../services/card_present_classifier_service.dart';
+import '../services/card_name_classifier_service.dart';
 import '../services/training_frame_service.dart';
 import '../theme/app_theme.dart';
+import '../theme/app_components.dart';
 import '../widgets/card_image.dart';
+import '../widgets/riftr_drag_handle.dart';
 import 'scan_results_screen.dart';
 
 /// Scanned card entry with metadata.
 class ScannedCardEntry {
-  final RiftCard card;
-  final List<RiftCard> alternatives;
+  RiftCard card;
+  List<RiftCard> alternatives;
   int quantity;
+  bool isFoil;
 
-  ScannedCardEntry({required this.card, this.alternatives = const [], this.quantity = 1});
+  /// Whether foil is relevant for this card.
+  /// Normal runes (OGN/SFD/OGS) have no foil. Promo runes (OGNX/SFDX) are foil.
+  bool get hasFoil {
+    if (card.type?.toLowerCase() != 'rune') return true;
+    return card.isPromo; // promo runes are foil
+  }
+
+  /// Whether the user can toggle foil status.
+  /// Common/Uncommon + OGS: editable. Rare+: always foil, not editable.
+  /// Runes: no foil at all.
+  bool get isFoilEditable {
+    if (!hasFoil) return false;
+    if (card.setId == 'OGS') return true;
+    final r = card.rarity?.toLowerCase() ?? '';
+    return r == 'common' || r == 'uncommon';
+  }
+
+  ScannedCardEntry({
+    required this.card,
+    this.alternatives = const [],
+    this.quantity = 1,
+    bool? isFoil,
+  }) : isFoil = isFoil ?? _defaultFoil(card);
+
+  static bool _defaultFoil(RiftCard card) {
+    if (card.type?.toLowerCase() == 'rune') return card.isPromo; // promo runes = foil
+    if (card.setId == 'OGS') return false;
+    final r = card.rarity?.toLowerCase() ?? '';
+    return r != 'common' && r != 'uncommon';
+  }
 }
 
 /// OCR Grid anchor — a recognized text element with known Y-position on the card.
@@ -66,12 +101,38 @@ class ScannerScreen extends StatefulWidget {
 
 class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserver {
   // ── Debug mode (set false for production) ──
+  // Compile-time-Schalter — wenn true sind die Debug-Overlays ueberhaupt
+  // potenziell sichtbar. Der zweite Schalter `_isAdmin` (runtime) gated
+  // sie zusaetzlich auf den Riftr-Admin-Account, damit Beta-Tester die
+  // bunten OCR-Boxen, FPS-Counter, Trainingsframe-Buttons etc. NICHT sehen.
+  // Hardcode auf true lassen — die Admin-Check uebernimmt den User-Filter.
   static const _debugMode = true;
+
+  /// Async-evaluated Custom-Claim-Cache. Selber Pattern wie social_screen
+  /// (Phase 6.5 Admin-Disputes-UI). Default `false` — Beta-Tester sehen
+  /// kein Debug-Overlay ohne explizit-gesetzten Admin-Claim.
+  bool _isAdmin = false;
+
+  /// Anzahl konsekutiver Frames im `waiting`-State ohne Classifier-Pass.
+  /// Wenn die Schwelle erreicht ist, forcieren wir einen OCR-Versuch
+  /// auch wenn der Classifier negativ ist — Fallback fuer Devices wo
+  /// das Card-Present-Modell consistent zu niedrige prob zurueckgibt
+  /// (z.B. iPhone 13 mini mit anderer Sensor-/HDR-Charakteristik als
+  /// das Trainings-Set). Reset bei jedem state-change weg von waiting.
+  int _waitingStuckFrames = 0;
+  /// ~30 processed Frames bei 10fps = ~3s. Bei `_processedFrames % 3 == 0`
+  /// klassifizieren wir nur jedes 3. processed Frame, also ~10 Klassifizierungen
+  /// in 3s — genug Zeit fuer den Classifier sich zu zeigen, oder
+  /// fuer den Fallback einzugreifen.
+  static const _waitingStuckThreshold = 30;
 
   // ── Camera ──
   CameraController? _controller;
   bool _isInitialized = false;
   bool _torchOn = false;
+  /// Camera-init Fehler — null wenn alles ok. Differenziert nach Ursache so
+  /// die UI den richtigen Aktions-Button zeigen kann (Settings vs Retry).
+  _CameraInitError? _initError;
 
   // ── State machine ──
   ScanState _state = ScanState.waiting;
@@ -88,6 +149,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
   final _suffixClassifier = SuffixClassifierService.instance;
   final _manaClassifier = ManaClassifierService.instance;
   final _cardPresentClassifier = CardPresentClassifierService.instance;
+  final _cardNameClassifier = CardNameClassifierService.instance;
   final _trainingFrames = TrainingFrameService.instance;
   Uint8List? _lastYPlane;  // updated every frame (for motion detection)
   int _lastYWidth = 0;
@@ -155,14 +217,38 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     _suffixClassifier.load();
     _manaClassifier.load();
     _cardPresentClassifier.load();
+    _cardNameClassifier.load();
     OcrService.instance.debugMode = true; // ON for mana debug
     _initCamera();
+    _checkAdminClaim();
+  }
+
+  /// Liest den Custom-Claim `admin: true` aus dem Firebase-ID-Token und
+  /// setzt `_isAdmin`. Ohne diesen Claim bleibt `_isAdmin = false` und
+  /// keine Debug-UI wird gerendert. Mirror von `social_screen._checkAdminClaim`.
+  Future<void> _checkAdminClaim() async {
+    try {
+      final user = AuthService.instance.currentUser;
+      if (user == null) return;
+      final tokenResult = await user.getIdTokenResult();
+      final isAdmin = tokenResult.claims?['admin'] == true;
+      if (mounted && isAdmin != _isAdmin) {
+        setState(() => _isAdmin = isAdmin);
+      }
+    } catch (_) {
+      // Token-Read fail → assume non-admin (= sicherer Default).
+    }
   }
 
   Future<void> _initCamera() async {
+    // Reset Error-State waehrend Re-Init laeuft (zeigt Spinner statt Error-UI).
+    if (mounted) setState(() => _initError = null);
     try {
       final cameras = await availableCameras();
-      if (cameras.isEmpty) return;
+      if (cameras.isEmpty) {
+        if (mounted) setState(() => _initError = _CameraInitError.noCamera);
+        return;
+      }
 
       final back = cameras.firstWhere(
         (c) => c.lensDirection == CameraLensDirection.back,
@@ -181,9 +267,35 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
       await _controller!.setFocusMode(FocusMode.auto);
       await _controller!.setExposureMode(ExposureMode.auto);
       await _controller!.startImageStream(_onFrame);
-      setState(() => _isInitialized = true);
+      setState(() {
+        _isInitialized = true;
+        _initError = null;
+      });
     } catch (e) {
       debugPrint('Scanner: Camera error: $e');
+      if (!mounted) return;
+      // CameraException-Codes per camera-plugin docs:
+      //   'CameraAccessDenied'        — User hat Permission verweigert
+      //   'CameraAccessDeniedWithoutPrompt' — System hat es ohne Prompt geblockt (Restricted Mode)
+      //   'CameraAccessRestricted'    — z.B. unter Parental Controls / MDM
+      //   'AudioAccessDenied' / 'AudioAccessRestricted' — wenn audio:true (haben wir off)
+      _CameraInitError err;
+      if (e is CameraException) {
+        final code = e.code;
+        if (code.contains('AccessDenied') ||
+            code.contains('AccessRestricted') ||
+            code.toLowerCase().contains('permission')) {
+          err = _CameraInitError.permissionDenied;
+        } else {
+          err = _CameraInitError.other;
+        }
+      } else {
+        err = _CameraInitError.other;
+      }
+      setState(() {
+        _isInitialized = false;
+        _initError = err;
+      });
     }
   }
 
@@ -248,8 +360,16 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     // ── State transitions ──
     switch (_state) {
       case ScanState.waiting:
-        // Quick card-present check — skip OCR if no card visible
-        // Only check every 3rd frame to reduce CPU load
+        // Card-Present-Classifier als CPU-Optimierung (skip OCR auf leeren
+        // Frames). DREI Fallback-Pfade damit der Classifier nie zum
+        // Hard-Gate wird (Bug-Report iPhone 13 mini 2026-04-29 — Scanner
+        // löste nie aus weil Classifier auf der Sensor-Charakteristik des
+        // 13 mini consistent zu niedrige prob lieferte):
+        //
+        //   Fallback 1: Classifier !isReady → skip-the-gate (lasse OCR direkt)
+        //   Fallback 2: stuck-in-waiting > 3s → force OCR auch bei low-prob
+        //   Fallback 3: bei jedem forced-OCR loggen damit man im Xcode-Log sieht
+        //               warum's nicht klappt
         if (_processedFrames % 3 == 0 && _cardPresentClassifier.isReady && _lastYPlane != null) {
           final prob = _cardPresentClassifier.classify(
             _lastYPlane!, _lastYWidth, _lastYHeight, _lastYStride,
@@ -259,10 +379,42 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
             debugPrint('CardPresent: prob=${prob?.toStringAsFixed(3) ?? "null"}');
           }
         }
-        // Skip OCR if last card-present check was negative
-        if (_lastCardPresentProb < CardPresentClassifierService.cardPresentThreshold) {
+
+        final classifierReady = _cardPresentClassifier.isReady;
+        final classifierPassed = _lastCardPresentProb >=
+            CardPresentClassifierService.cardPresentThreshold;
+        _waitingStuckFrames++;
+
+        // Diagnose-Log alle 30 frames (~3s) — auch in Release-Build sichtbar
+        // in Xcode-Console damit User Bug-Reports einreichen kann.
+        if (_processedFrames % 30 == 0) {
+          // ignore: avoid_print
+          print('[Scanner] waiting: stuck=$_waitingStuckFrames '
+              'classifierReady=$classifierReady '
+              'lastProb=${_lastCardPresentProb.toStringAsFixed(3)}');
+        }
+
+        // Fallback-1: Classifier nie geladen → Gate ueberspringen.
+        // Fallback-2: zu lange im waiting ohne Classifier-Pass → forciere OCR-Versuch.
+        final shouldForceOcr = !classifierReady ||
+            _waitingStuckFrames >= _waitingStuckThreshold;
+
+        if (!classifierPassed && !shouldForceOcr) {
+          if (_debugMode && mounted) setState(() {}); // still update overlay
           return;
         }
+
+        if (!classifierPassed && shouldForceOcr) {
+          // ignore: avoid_print
+          print('[Scanner] FORCE OCR (classifierReady=$classifierReady, '
+              'stuck=$_waitingStuckFrames, prob=${_lastCardPresentProb.toStringAsFixed(3)}) — '
+              'classifier-Gate uebersprungen');
+        }
+
+        // Counter reset — wenn OCR scheitert und wir bleiben in waiting,
+        // baut sich der Counter wieder auf bis zum naechsten Force-Versuch.
+        _waitingStuckFrames = 0;
+
         // First scan attempt — try flip for upside-down cards
         _runOcr(image, tryFlip: true);
 
@@ -684,6 +836,15 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     final variantFps = _lookup.nameIndex[nameLower] ?? [];
     final allVariants = variantFps.map((fp) => fp.card).toList();
 
+    // Metal-Cards Exclusion (User-Request 2026-04-29):
+    // Niemand scannt Metal-Karten real-world (zu teuer/seltener Sammlerwert).
+    // Scanner darf nie auto-pick auf Metal switchen, auch nicht ueber
+    // pHash/Promo-CNN/CN-Suffix-Pfade. Metal BLEIBT in `allVariants` —
+    // wird aber unten in `resolvedAlts` (= Variant-Picker-Liste) vorhanden,
+    // sodass User manuell waehlen kann nach erfolgtem Scan.
+    final resolutionVariants = allVariants.where((c) => !c.metal).toList();
+    final resolutionVariantFps = variantFps.where((fp) => !fp.card.metal).toList();
+
     // Validate cumulative CN against matched card — pick the reading that
     // actually belongs to this card. Prefer readings WITH suffix (more specific).
     if (_cnReadings.isNotEmpty && variantFps.isNotEmpty) {
@@ -713,8 +874,9 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     }
 
     // CN-Suffix variant resolution — if suffix found, use directly (no pHash needed)
-    if (allVariants.length > 1 && _cumCNSuffix != null && _cumCN != null) {
-      for (final fp in variantFps) {
+    // Metal-Cards skipped via resolutionVariantFps (User-Request 2026-04-29)
+    if (resolutionVariants.length > 1 && _cumCNSuffix != null && _cumCN != null) {
+      for (final fp in resolutionVariantFps) {
         if (fp.cnSuffix == _cumCNSuffix && fp.collectorNumber == _cumCN) {
           resolvedCard = fp.card;
           if (_debugMode) {
@@ -729,8 +891,9 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     }
 
     // Badge OCR promo detection — if "PROMO" or "CHAMPION" was read, pick promo variant
-    if (allVariants.length > 1 && _cumPromoDetected) {
-      final promoVariant = allVariants.where((c) => c.isPromo).toList();
+    // Metal-Cards excluded from auto-pick (User-Request 2026-04-29)
+    if (resolutionVariants.length > 1 && _cumPromoDetected) {
+      final promoVariant = resolutionVariants.where((c) => c.isPromo).toList();
       if (promoVariant.isNotEmpty) {
         // If CHAMPION was detected and there's a champion edition, pick that one
         if (_cumChampionDetected) {
@@ -885,6 +1048,18 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     }
     // Training data now collected via manual POS/NEG buttons
 
+    // Silent Card Rect training data collection — copy Y-plane before async
+    if (cardRect != null && _lastYPlane != null) {
+      final yPlaneCopy = Uint8List.fromList(_lastYPlane!);
+      final yW = _lastYWidth;
+      final yH = _lastYHeight;
+      final yS = _lastYStride;
+      final rectCopy = List<int>.from(cardRect);
+      final name = match.card.name;
+      debugPrint('CardRect: saving sample (rect=${rectCopy[0]},${rectCopy[1]} ${rectCopy[2]}x${rectCopy[3]})');
+      _trainingFrames.saveCardRectSample(yPlaneCopy, yW, yH, yS, rectCopy, name);
+    }
+
     // ══════════════════════════════════════════════
     // ── TFLite CNN classifiers (ALWAYS run) ──
     // ══════════════════════════════════════════════
@@ -954,7 +1129,8 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     // (OCR might not have read "RUNE" in every scan session)
     final skipPromoCnn = _cumTypes.contains('rune') ||
         match.card.type?.toLowerCase() == 'rune';
-    final promoIds = allVariants.where((c) => c.isPromo).map((c) => c.id).toSet();
+    // Metal excluded (User-Request 2026-04-29) — never auto-pick metal as promo variant
+    final promoIds = resolutionVariants.where((c) => c.isPromo).map((c) => c.id).toSet();
     if (!skipPromoCnn && promoIds.isNotEmpty && computeResult?.debugFullPixels != null && _promoClassifier.isReady) {
       final prob = _promoClassifier.classify(
         computeResult!.debugFullPixels!,
@@ -967,10 +1143,11 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
           debugPrint('TFLite badge: prob=${prob.toStringAsFixed(3)} '
               '(thresh=${PromoClassifierService.promoThreshold} → ${isPromoBadge ? "PROMO" : "base"})');
         }
-        if (isPromoBadge && allVariants.length > 1) {
+        if (isPromoBadge && resolutionVariants.length > 1) {
           // Constrain promo selection to variants matching confirmed set+CN
           // (same logic as pHash constraint — prevents cross-set false matches)
-          var promoVariant = allVariants.where((c) => c.isPromo).toList();
+          // Metal excluded (User-Request 2026-04-29)
+          var promoVariant = resolutionVariants.where((c) => c.isPromo).toList();
           final badgeSet = _cumSetCode;
           final badgeCN = _cumCN?.toString();
           if (badgeSet != null && badgeCN != null && promoVariant.length > 1) {
@@ -1021,14 +1198,47 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
       }
     }
 
+    // ── TFLite Card Name Classifier (verification + debug) ──
+    if (computeResult?.debugFullPixels != null && _cardNameClassifier.isReady) {
+      final nameResult = _cardNameClassifier.classify(
+        computeResult!.debugFullPixels!,
+        computeResult.debugFullW,
+        computeResult.debugFullH,
+      );
+      if (_debugMode) {
+        if (nameResult != null) {
+          final agrees = nameResult.name.toLowerCase() == match.card.name.toLowerCase();
+          debugPrint('TFLite cardName: "${nameResult.name}" '
+              '(conf=${nameResult.confidence.toStringAsFixed(3)}) '
+              '${agrees ? "✓ agrees" : "✗ disagrees"} with OCR "${match.card.name}"');
+        } else {
+          debugPrint('TFLite cardName: below threshold');
+        }
+        // Top-5 for debugging
+        final top5 = _cardNameClassifier.classifyTopN(
+          computeResult!.debugFullPixels!,
+          computeResult.debugFullW,
+          computeResult.debugFullH,
+          n: 5,
+        );
+        if (top5.isNotEmpty) {
+          debugPrint('TFLite cardName top5: ${top5.map((r) => '${r.name}(${r.confidence.toStringAsFixed(3)})').join(', ')}');
+        }
+      }
+    }
+
     // ══════════════════════════════════════════════
     // ── pHash variant resolution (only for multi-variant cards) ──
     // ══════════════════════════════════════════════
-    if (allVariants.length > 1 && computeResult != null) {
+    // Uses resolutionVariants (= allVariants WITHOUT metal) — pHash darf nie
+    // auf Metal switchen (User-Request 2026-04-29). Metal hat anderen Foil-
+    // Finish + Gem-Layout, pHash-Score koennte zufaellig hoch sein → wuerde
+    // sonst Metal als Match liefern obwohl User nicht-Metal gescannt hat.
+    if (resolutionVariants.length > 1 && computeResult != null) {
       // Constrain pHash to variants matching the confirmed set+CN.
       final confirmedSet = _cumSetCode;
       final confirmedCN = _cumCN?.toString();
-      List<RiftCard> phashCandidates = allVariants;
+      List<RiftCard> phashCandidates = resolutionVariants;
       if (confirmedSet != null && confirmedCN != null) {
         final setFamily = <String>{confirmedSet};
         const promoMap = {'OGN': 'OGNX', 'SFD': 'SFDX', 'OGS': 'OGSX'};
@@ -1036,15 +1246,15 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
         if (promoMap.containsKey(confirmedSet)) setFamily.add(promoMap[confirmedSet]!);
         if (baseMap.containsKey(confirmedSet)) setFamily.add(baseMap[confirmedSet]!);
 
-        final filtered = allVariants.where((c) {
+        final filtered = resolutionVariants.where((c) {
           if (!setFamily.contains(c.setId)) return false;
           final cardCNNum = c.collectorNumber?.replaceAll(RegExp(r'[^0-9]'), '');
           return cardCNNum == confirmedCN;
         }).toList();
         if (filtered.isNotEmpty) {
           phashCandidates = filtered;
-          if (_debugMode && filtered.length < allVariants.length) {
-            debugPrint('pHash: constrained to ${filtered.length}/${allVariants.length} variants '
+          if (_debugMode && filtered.length < resolutionVariants.length) {
+            debugPrint('pHash: constrained to ${filtered.length}/${resolutionVariants.length} variants '
                 '(set=$confirmedSet cn=$confirmedCN)');
           }
         }
@@ -1854,22 +2064,164 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     image.dispose();
   }
 
-  /// Add card to scanned list or increment quantity.
+  /// Add card to scanned list — every scan gets its own entry.
+  /// Merging happens later in ScanResultsScreen.
   void _addCard(RiftCard card, List<RiftCard> alternatives) {
     _justScanned = true; // require higher motion threshold before next scan
-    final existingIndex = _scannedCards.indexWhere((e) => e.card.id == card.id);
-    if (existingIndex >= 0) {
-      setState(() => _scannedCards[existingIndex].quantity++);
-    } else {
-      setState(() {
-        _scannedCards.add(ScannedCardEntry(card: card, alternatives: alternatives));
-      });
+    setState(() {
+      _scannedCards.add(ScannedCardEntry(card: card, alternatives: alternatives));
+    });
+  }
+
+  /// Show bottom sheet to edit a scanned card entry (variant, foil, quantity).
+  void _showCardEditor(ScannedCardEntry entry) {
+    // Build stable list of ALL variants (deduplicated by ID) — doesn't change on switch
+    final seen = <String>{};
+    final allVariants = <RiftCard>[];
+    for (final c in [entry.card, ...entry.alternatives]) {
+      if (seen.add(c.id)) allVariants.add(c);
     }
+    // Pause scanning while editing
+    _controller?.stopImageStream();
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: AppColors.surface,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(AppRadius.xl)),
+      ),
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setSheetState) => DraggableScrollableSheet(
+          initialChildSize: 0.55,
+          minChildSize: 0.3,
+          maxChildSize: 0.85,
+          expand: false,
+          builder: (ctx, scrollController) => Padding(
+          padding: const EdgeInsets.all(AppSpacing.md),
+          child: ListView(
+            controller: scrollController,
+            children: [
+              // Drag handle (V2 sheet pattern)
+              const Padding(
+                padding: EdgeInsets.only(bottom: AppSpacing.md),
+                child: RiftrDragHandle(style: RiftrDragHandleStyle.sheet),
+              ),
+              // ── Header: card image + name + set info ──
+              Row(children: [
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(AppRadius.rounded),
+                  child: CardImage(
+                    imageUrl: entry.card.imageUrl,
+                    fallbackText: entry.card.name,
+                    width: 80, height: 112, fit: BoxFit.cover,
+                  ),
+                ),
+                const SizedBox(width: AppSpacing.md),
+                Expanded(child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(entry.card.displayName,
+                      style: AppTextStyles.bodyBold.copyWith(color: AppColors.textPrimary)),
+                    const SizedBox(height: 4),
+                    Text('${entry.card.setId ?? ''} #${entry.card.collectorNumber ?? ''} · ${entry.card.rarity ?? ''}',
+                      style: AppTextStyles.bodySmall.copyWith(color: AppColors.textMuted)),
+                  ],
+                )),
+              ]),
+
+              // ── Variant picker (only if alternatives exist) ──
+              if (allVariants.length > 1) ...[
+                const SizedBox(height: AppSpacing.md),
+                Text('Variant', style: AppTextStyles.bodyBold.copyWith(color: AppColors.textPrimary)),
+                const SizedBox(height: AppSpacing.sm),
+                ...allVariants.map((card) {
+                  final isSelected = card.id == entry.card.id;
+                  return ListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    leading: ClipRRect(
+                      borderRadius: BorderRadius.circular(AppRadius.minimal),
+                      child: CardImage(imageUrl: card.imageUrl, fallbackText: card.name,
+                        width: 36, height: 50, fit: BoxFit.cover),
+                    ),
+                    title: Text(card.displayName, style: AppTextStyles.bodySmall.copyWith(
+                      fontWeight: isSelected ? FontWeight.w800 : FontWeight.w500,
+                      color: AppColors.textPrimary,
+                    )),
+                    subtitle: Text('${card.setId} #${card.collectorNumber ?? ''} · ${card.rarity}',
+                      style: AppTextStyles.micro.copyWith(color: AppColors.textMuted)),
+                    trailing: isSelected ? Icon(Icons.check, color: AppColors.amber400, size: 20) : null,
+                    onTap: () {
+                      setState(() {
+                        entry.card = card;
+                        entry.alternatives = allVariants.where((c) => c.id != card.id).toList();
+                        entry.isFoil = ScannedCardEntry._defaultFoil(card);
+                      });
+                      setSheetState(() {});
+                    },
+                  );
+                }),
+              ],
+
+              // ── Foil toggle (hidden for runes — no foil variants) ──
+              if (entry.hasFoil) ...[
+                const SizedBox(height: AppSpacing.md),
+                Row(children: [
+                  Text('★', style: AppTextStyles.titleMedium.copyWith(color: AppColors.amber300)),
+                  const SizedBox(width: AppSpacing.sm),
+                  Text('Foil', style: AppTextStyles.bodyBold.copyWith(color: AppColors.textPrimary)),
+                  const Spacer(),
+                  if (entry.isFoilEditable)
+                    Switch.adaptive(
+                      value: entry.isFoil,
+                      activeThumbColor: AppColors.amber400,
+                      onChanged: (v) {
+                        setState(() => entry.isFoil = v);
+                        setSheetState(() {});
+                      },
+                    )
+                  else
+                    Text('Yes', style: AppTextStyles.bodySmall.copyWith(color: AppColors.amber400)),
+                ]),
+              ],
+
+              // ── Remove button ──
+              const SizedBox(height: AppSpacing.md),
+              RiftrButton(
+                label: 'Remove',
+                icon: Icons.delete_outline,
+                style: RiftrButtonStyle.danger,
+                onPressed: () {
+                  setState(() => _scannedCards.remove(entry));
+                  Navigator.pop(ctx);
+                },
+              ),
+
+              SizedBox(height: MediaQuery.of(ctx).padding.bottom + AppSpacing.sm),
+            ],
+          ),
+        )),  // Padding, DraggableScrollableSheet builder
+      ),  // StatefulBuilder
+    ).then((_) {
+      // Resume scanning when sheet closes
+      if (mounted && _controller != null) {
+        _prevLuminance = null; // reset so motion detection starts fresh
+        _lastCardPresentProb = 0.0;
+        _controller!.startImageStream(_onFrame);
+        _setState(ScanState.waiting);
+      }
+    });
   }
 
   void _setState(ScanState newState) {
     if (_state == newState) return;
     debugPrint('Scanner: $_state → $newState (motion: ${_motionPercent.toStringAsFixed(1)}%)');
+    // Counter reset wenn wir waiting verlassen — beim naechsten Re-Entry
+    // (nach motion → settling → scanning → match → zurueck zu waiting)
+    // bauen wir den Stuck-Counter wieder von 0 auf.
+    if (_state == ScanState.waiting && newState != ScanState.waiting) {
+      _waitingStuckFrames = 0;
+    }
     // Clear native rects and waiting match when motion starts (new card)
     if (newState == ScanState.motion) {
       _nativeRects.clear();
@@ -1921,13 +2273,15 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     setState(() {});
   }
 
-  void _finishScanning() {
+  void _finishScanning() async {
     if (_scannedCards.isEmpty) {
       Navigator.pop(context);
       return;
     }
     _controller?.stopImageStream();
-    Navigator.pushReplacement(
+
+    // Push ScanResults — it may return entries to continue scanning
+    final returnedEntries = await Navigator.push<List<ScannedCardEntry>>(
       context,
       MaterialPageRoute(
         builder: (_) => ScanResultsScreen(
@@ -1936,14 +2290,40 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
         ),
       ),
     );
+
+    if (!mounted) return;
+
+    if (returnedEntries != null) {
+      // User tapped "Scan+" — resume scanning with existing cards
+      setState(() {
+        _scannedCards.clear();
+        _scannedCards.addAll(returnedEntries);
+      });
+      _prevLuminance = null;
+      _lastCardPresentProb = 0.0;
+      _setState(ScanState.waiting);
+      _controller?.startImageStream(_onFrame);
+    } else {
+      // User finished or cancelled — close scanner
+      if (mounted) Navigator.pop(context);
+    }
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (_controller == null || !_controller!.value.isInitialized) return;
+    // ALT: `if (_controller == null || !_controller!.value.isInitialized) return;`
+    // Bug — wenn die initiale Camera-Init fehlschlug (z.B. Permission denied),
+    // war das Guard immer true und Re-Init nach Settings-Grant + Resume nie
+    // moeglich. User musste die App komplett neustarten.
     if (state == AppLifecycleState.inactive) {
-      _controller?.dispose();
+      // Nur disposen wenn aktiv — sonst war eh nix zu releasen.
+      if (_controller != null && _controller!.value.isInitialized) {
+        _controller?.dispose();
+      }
     } else if (state == AppLifecycleState.resumed) {
+      // Re-Init in zwei Faellen: (a) wir waren initialisiert und disposed
+      // wegen App in Background, (b) wir waren in Error-State und User
+      // koennte zwischenzeitlich Permission gewaehrt haben.
       _initCamera();
     }
   }
@@ -1963,7 +2343,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
   Color get _frameColor => switch (_state) {
     ScanState.waiting => Colors.white.withValues(alpha: 0.4),
     ScanState.stable => AppColors.win.withValues(alpha: 0.6),
-    ScanState.motion => AppColors.amber400.withValues(alpha: 0.6),
+    ScanState.motion => AppColors.amber400,
     ScanState.settling => Colors.blue.withValues(alpha: 0.6),
     ScanState.scanning => AppColors.amber400,
   };
@@ -1979,6 +2359,12 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     final screenW = MediaQuery.of(context).size.width;
     final cardW = screenW * 0.65;
     final cardH = cardW * 7 / 5;
+
+    // Error-State hat eigenen UI-Pfad ohne Stack-Overlays — kein Camera-
+    // Frame, kein Top-Bar, nur Error-Screen + Close-Button.
+    if (_initError != null) {
+      return _buildErrorScaffold();
+    }
 
     return Scaffold(
       backgroundColor: Colors.black,
@@ -2001,7 +2387,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
               ),
             )
           else
-            const Center(child: CircularProgressIndicator(color: AppColors.amber400)),
+            Center(child: CircularProgressIndicator(color: AppColors.amber400)),
 
           // Card frame guide
           if (_isInitialized)
@@ -2012,7 +2398,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
                   width: cardW, height: cardH,
                   decoration: BoxDecoration(
                     border: Border.all(color: _frameColor, width: _frameWidth),
-                    borderRadius: BorderRadius.circular(12),
+                    borderRadius: BorderRadius.circular(AppRadius.large),
                   ),
                 ),
               ),
@@ -2026,16 +2412,43 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
                   IconButton(
-                    onPressed: () => Navigator.pop(context),
-                    icon: const Icon(Icons.close, color: Colors.white, size: 28),
+                    onPressed: () {
+                      if (_scannedCards.isEmpty) {
+                        Navigator.pop(context);
+                        return;
+                      }
+                      showDialog(
+                        context: context,
+                        builder: (ctx) => AlertDialog(
+                          backgroundColor: AppColors.surface,
+                          title: Text('Discard scans?', style: AppTextStyles.bodyBold.copyWith(color: AppColors.textPrimary)),
+                          content: Text('${_scannedCards.length} scanned card${_scannedCards.length > 1 ? 's' : ''} will be lost.',
+                            style: AppTextStyles.bodySmall.copyWith(color: AppColors.textMuted)),
+                          actions: [
+                            TextButton(
+                              onPressed: () => Navigator.pop(ctx),
+                              child: Text('Cancel', style: TextStyle(color: AppColors.textMuted)),
+                            ),
+                            TextButton(
+                              onPressed: () {
+                                Navigator.pop(ctx);
+                                Navigator.pop(context);
+                              },
+                              child: Text('Discard', style: AppTextStyles.body.copyWith(color: AppColors.loss)),
+                            ),
+                          ],
+                        ),
+                      );
+                    },
+                    icon: Icon(Icons.close, color: AppColors.textPrimary, size: 28),
                   ),
                   Text('SCAN',
-                    style: AppTextStyles.bodyBold.copyWith(color: Colors.white, letterSpacing: 2)),
+                    style: AppTextStyles.bodyBold.copyWith(color: AppColors.textPrimary, letterSpacing: 2)),
                   IconButton(
                     onPressed: _toggleTorch,
                     icon: Icon(
                       _torchOn ? Icons.flash_on : Icons.flash_off,
-                      color: _torchOn ? AppColors.amber400 : Colors.white,
+                      color: _torchOn ? AppColors.amber400 : AppColors.textPrimary,
                       size: 28,
                     ),
                   ),
@@ -2055,8 +2468,8 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
               ),
             ),
 
-          // Training frame buttons (debug only)
-          if (_debugMode)
+          // Training frame buttons (debug only — admin)
+          if (_debugMode && _isAdmin)
             Positioned(
               bottom: MediaQuery.of(context).padding.bottom + 100,
               left: 16,
@@ -2075,22 +2488,22 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
                         return;
                       }
                       ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(content: Text('Exporting ${count.total} frames (${count.positive} pos, ${count.negative} neg)...')),
+                        SnackBar(content: Text('Exporting ${count.total} frames (${count.positive}pos ${count.negative}neg ${count.rects}rects)...')),
                       );
                       await _trainingFrames.exportFrames();
                     },
                     child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: 6),
                       decoration: BoxDecoration(
                         color: Colors.black54,
-                        borderRadius: BorderRadius.circular(8),
+                        borderRadius: BorderRadius.circular(AppRadius.rounded),
                       ),
-                      child: const Row(
+                      child: Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
                           Icon(Icons.file_upload_outlined, color: Colors.white70, size: 16),
-                          SizedBox(width: 4),
-                          Text('Frames', style: TextStyle(color: Colors.white70, fontSize: 11)),
+                          const SizedBox(width: 4),
+                          Text('Frames', style: AppTextStyles.labelSmall.copyWith(color: Colors.white70)),
                         ],
                       ),
                     ),
@@ -2106,17 +2519,17 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
                       );
                     },
                     child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: 6),
                       decoration: BoxDecoration(
                         color: Colors.orange.withValues(alpha: 0.6),
-                        borderRadius: BorderRadius.circular(8),
+                        borderRadius: BorderRadius.circular(AppRadius.rounded),
                       ),
-                      child: const Row(
+                      child: Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
                           Icon(Icons.delete_outline, color: Colors.white70, size: 16),
-                          SizedBox(width: 4),
-                          Text('CLR', style: TextStyle(color: Colors.white70, fontSize: 11)),
+                          const SizedBox(width: 4),
+                          Text('CLR', style: AppTextStyles.labelSmall.copyWith(color: Colors.white70)),
                         ],
                       ),
                     ),
@@ -2125,8 +2538,8 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
               ),
             ),
 
-          // Manual POS button (left side, centered vertically)
-          if (_debugMode)
+          // Manual POS button (left side, centered vertically — admin only)
+          if (_debugMode && _isAdmin)
             Positioned(
               left: 8,
               top: MediaQuery.of(context).size.height * 0.45,
@@ -2142,25 +2555,25 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
                   );
                 },
                 child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 20),
+                  padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.xl),
                   decoration: BoxDecoration(
                     color: Colors.green.withValues(alpha: 0.7),
-                    borderRadius: BorderRadius.circular(12),
+                    borderRadius: BorderRadius.circular(AppRadius.large),
                   ),
-                  child: const Column(
+                  child: Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       Icon(Icons.check_circle, color: Colors.white, size: 28),
-                      SizedBox(height: 4),
-                      Text('POS', style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold)),
+                      const SizedBox(height: 4),
+                      Text('POS', style: AppTextStyles.labelMedium.copyWith(color: Colors.white, fontWeight: FontWeight.bold)),
                     ],
                   ),
                 ),
               ),
             ),
 
-          // Manual NEG button (right side, centered vertically)
-          if (_debugMode)
+          // Manual NEG button (right side, centered vertically — admin only)
+          if (_debugMode && _isAdmin)
             Positioned(
               right: 8,
               top: MediaQuery.of(context).size.height * 0.45,
@@ -2176,25 +2589,25 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
                   );
                 },
                 child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 20),
+                  padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.xl),
                   decoration: BoxDecoration(
                     color: Colors.red.withValues(alpha: 0.7),
-                    borderRadius: BorderRadius.circular(12),
+                    borderRadius: BorderRadius.circular(AppRadius.large),
                   ),
-                  child: const Column(
+                  child: Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       Icon(Icons.cancel, color: Colors.white, size: 28),
-                      SizedBox(height: 4),
-                      Text('NEG', style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold)),
+                      const SizedBox(height: 4),
+                      Text('NEG', style: AppTextStyles.labelMedium.copyWith(color: Colors.white, fontWeight: FontWeight.bold)),
                     ],
                   ),
                 ),
               ),
             ),
 
-          // Debug overlay
-          if (_debugMode && _isInitialized)
+          // Debug overlay — admin only (Beta-Tester sehen es nicht)
+          if (_debugMode && _isAdmin && _isInitialized)
             Positioned(
               top: MediaQuery.of(context).padding.top + 50,
               left: AppSpacing.sm,
@@ -2203,7 +2616,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
                   padding: const EdgeInsets.all(8),
                   decoration: BoxDecoration(
                     color: Colors.black.withValues(alpha: 0.6),
-                    borderRadius: BorderRadius.circular(8),
+                    borderRadius: BorderRadius.circular(AppRadius.rounded),
                   ),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
@@ -2225,25 +2638,25 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
                         const SizedBox(width: 6),
                         Text(
                           '${_state.name.toUpperCase()}  Motion: ${_motionPercent.toStringAsFixed(1)}%',
-                          style: const TextStyle(color: Colors.white70, fontSize: 11, fontFamily: 'monospace'),
+                          style: AppTextStyles.labelSmall.copyWith(color: Colors.white70, fontFamily: "monospace"),
                         ),
                       ]),
                       const SizedBox(height: 2),
                       Text(
                         'OCR: $_debugOcr',
-                        style: const TextStyle(color: Colors.white70, fontSize: 11, fontFamily: 'monospace'),
+                        style: AppTextStyles.labelSmall.copyWith(color: Colors.white70, fontFamily: "monospace"),
                         maxLines: 1, overflow: TextOverflow.ellipsis,
                       ),
                       if (_debugScore > 0)
                         Text(
                           'Score: $_debugScore  F:$_debugScanFrame  $_debugBreakdown',
-                          style: const TextStyle(color: Colors.white70, fontSize: 11, fontFamily: 'monospace'),
+                          style: AppTextStyles.labelSmall.copyWith(color: Colors.white70, fontFamily: "monospace"),
                           maxLines: 1, overflow: TextOverflow.ellipsis,
                         ),
                       Text(
                         'Cards: ${_scannedCards.fold<int>(0, (t, e) => t + e.quantity)}  '
                         'FPS: ${_fps.toStringAsFixed(0)}',
-                        style: const TextStyle(color: Colors.white70, fontSize: 11, fontFamily: 'monospace'),
+                        style: AppTextStyles.labelSmall.copyWith(color: Colors.white70, fontFamily: "monospace"),
                       ),
                     ],
                   ),
@@ -2279,11 +2692,13 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
                         itemCount: _scannedCards.length,
                         itemBuilder: (context, index) {
                           final entry = _scannedCards[_scannedCards.length - 1 - index];
-                          return Padding(
+                          return GestureDetector(
+                            onTap: () => _showCardEditor(entry),
+                            child: Padding(
                             padding: const EdgeInsets.only(right: 6),
                             child: Stack(children: [
                               ClipRRect(
-                                borderRadius: BorderRadius.circular(6),
+                                borderRadius: BorderRadius.circular(AppRadius.rounded),
                                 child: entry.card.type?.toLowerCase() == 'battlefield'
                                     ? SizedBox(
                                         width: 48, height: 67,
@@ -2309,16 +2724,16 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
                                     padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
                                     decoration: BoxDecoration(
                                       color: AppColors.amber500,
-                                      borderRadius: BorderRadius.circular(8),
+                                      borderRadius: BorderRadius.circular(AppRadius.rounded),
                                     ),
                                     child: Text('×${entry.quantity}',
                                       style: AppTextStyles.micro.copyWith(
-                                        color: Colors.black, fontWeight: FontWeight.w800,
+                                        color: AppColors.textOnPrimary, fontWeight: FontWeight.w800,
                                       )),
                                   ),
                                 ),
                             ]),
-                          );
+                          ));
                         },
                       ),
                     ),
@@ -2332,20 +2747,24 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
                       ),
                       GestureDetector(
                         onTap: _finishScanning,
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
-                          decoration: BoxDecoration(
-                            color: AppColors.amber500,
-                            borderRadius: BorderRadius.circular(AppRadius.pill),
+                        child: SizedBox(
+                          height: 48, // M3 button minimum
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
+                            alignment: Alignment.center,
+                            decoration: BoxDecoration(
+                              color: AppColors.amber500,
+                              borderRadius: BorderRadius.circular(AppRadius.pill),
+                            ),
+                            child: Row(mainAxisSize: MainAxisSize.min, children: [
+                              Text(_scannedCards.isEmpty ? 'Close' : 'Overview',
+                                style: AppTextStyles.bodyBold.copyWith(color: AppColors.background)),
+                              if (_scannedCards.isNotEmpty) ...[
+                                const SizedBox(width: 6),
+                                Icon(Icons.arrow_forward, size: 18, color: AppColors.background),
+                              ],
+                            ]),
                           ),
-                          child: Row(mainAxisSize: MainAxisSize.min, children: [
-                            Text(_scannedCards.isEmpty ? 'Close' : 'Done',
-                              style: AppTextStyles.bodyBold.copyWith(color: AppColors.background)),
-                            if (_scannedCards.isNotEmpty) ...[
-                              const SizedBox(width: 6),
-                              Icon(Icons.arrow_forward, size: 18, color: AppColors.background),
-                            ],
-                          ]),
                         ),
                       ),
                     ],
@@ -2364,4 +2783,152 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     if (elapsed <= 0) return 0;
     return _processedFrames / (elapsed / 1000);
   }
+
+  // ══════════════════════════════════════════════
+  // ── Error UI ──
+  // ══════════════════════════════════════════════
+
+  /// Error-Screen wenn Camera-Init fehlschlug. 3 Pfade:
+  ///   1. permissionDenied → grosser Hinweis + „App-Einstellungen" Button.
+  ///      Wenn der User dort die Permission gewaehrt und zur App zurueck-
+  ///      kehrt, triggert `didChangeAppLifecycleState(resumed)` automatisch
+  ///      einen Re-Init.
+  ///   2. noCamera → Geraet hat gar keine Kamera (sehr selten, vermutlich
+  ///      Simulator). Nur Close-Button.
+  ///   3. other → unbekannter Fehler. Retry-Button bietet manuellen Re-Init.
+  Widget _buildErrorScaffold() {
+    final err = _initError!;
+    final isPermission = err == _CameraInitError.permissionDenied;
+    final title = switch (err) {
+      _CameraInitError.permissionDenied => 'Camera access required',
+      _CameraInitError.noCamera => 'No camera detected',
+      _CameraInitError.other => 'Camera unavailable',
+    };
+    final body = switch (err) {
+      _CameraInitError.permissionDenied =>
+          'Riftr needs camera access to scan cards. '
+              'Tap below to open Settings, enable Camera, then come back.',
+      _CameraInitError.noCamera =>
+          'This device doesn\'t expose a camera the scanner can use.',
+      _CameraInitError.other =>
+          'Something went wrong starting the camera. '
+              'Try again or restart the app.',
+    };
+
+    return Scaffold(
+      backgroundColor: AppColors.background,
+      body: SafeArea(
+        child: Stack(
+          children: [
+            // Close button — top-left, mirrors the in-scanner top-bar Close.
+            Positioned(
+              top: AppSpacing.sm,
+              left: AppSpacing.sm,
+              child: IconButton(
+                icon: Icon(Icons.close, color: AppColors.textPrimary, size: 28),
+                onPressed: () => Navigator.of(context).pop(),
+              ),
+            ),
+            Center(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: AppSpacing.xl),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      width: 96,
+                      height: 96,
+                      decoration: BoxDecoration(
+                        color: AppColors.amberMuted,
+                        shape: BoxShape.circle,
+                        border: Border.all(color: AppColors.amberBorderMuted),
+                      ),
+                      child: Icon(
+                        isPermission
+                            ? Icons.no_photography_outlined
+                            : Icons.camera_alt_outlined,
+                        color: AppColors.amber400,
+                        size: 48,
+                      ),
+                    ),
+                    const SizedBox(height: AppSpacing.lg),
+                    Text(
+                      title,
+                      textAlign: TextAlign.center,
+                      style: AppTextStyles.titleMedium.copyWith(
+                        color: AppColors.textPrimary,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: AppSpacing.sm),
+                    Text(
+                      body,
+                      textAlign: TextAlign.center,
+                      style: AppTextStyles.body
+                          .copyWith(color: AppColors.textMuted),
+                    ),
+                    const SizedBox(height: AppSpacing.xl),
+                    if (isPermission)
+                      RiftrButton(
+                        label: 'Open Settings',
+                        onPressed: _openAppSettings,
+                        fullWidth: false,
+                      ),
+                    if (err != _CameraInitError.noCamera) ...[
+                      if (isPermission) const SizedBox(height: AppSpacing.sm),
+                      RiftrButton(
+                        label: 'Try again',
+                        style: isPermission
+                            ? RiftrButtonStyle.secondary
+                            : RiftrButtonStyle.primary,
+                        onPressed: _initCamera,
+                        fullWidth: false,
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Oeffnet die OS-Einstellungs-Seite fuer diese App. iOS: `app-settings:`
+  /// landet direkt auf der Riftr-App-Settings (mit Camera-Toggle). Android:
+  /// `package:` URI mit externalApplication mode oeffnet Apps-Settings (etwas
+  /// indirekter — User muss dort „Permissions" antippen).
+  Future<void> _openAppSettings() async {
+    HapticFeedback.lightImpact();
+    Uri? uri;
+    if (Platform.isIOS) {
+      uri = Uri.parse('app-settings:');
+    } else if (Platform.isAndroid) {
+      // Use package URI; the launcher resolves it to the app's settings page.
+      // Need package id — read from somewhere. Default fallback.
+      // url_launcher accepts the generic intent for opening app settings.
+      uri = Uri.parse('package:com.riftr.app');
+    }
+    if (uri == null) return;
+    if (await canLaunchUrl(uri)) {
+      await launchUrl(uri, mode: LaunchMode.externalApplication);
+    }
+  }
+}
+
+/// Differenzierte Camera-Init-Fehler. Steuert welche Buttons + Texts der
+/// Error-Screen zeigt.
+enum _CameraInitError {
+  /// User hat Camera-Zugriff verweigert (oder MDM-/Restricted-Mode).
+  /// → "Open Settings"-Button ist sinnvoll.
+  permissionDenied,
+
+  /// `availableCameras()` lieferte leere Liste (Simulator, ungewoehnliche Devices).
+  /// → Kein Action-Button, nur Hinweis.
+  noCamera,
+
+  /// Anderer CameraException oder unbekannter Fehler.
+  /// → Retry-Button.
+  other,
 }

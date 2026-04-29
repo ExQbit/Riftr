@@ -438,6 +438,19 @@ class CardLookupService {
 
     if (candidateMap.isEmpty) return [];
 
+    // Metal-Cards Exclusion (User-Request 2026-04-29):
+    // PLATED_LEGEND (Metal) sind extrem teure Sammlerkarten — niemand
+    // scannt sie real-world. Scanner soll sie nie als Primary-Match
+    // ausgeben. Sie bleiben in `_nameIndex` (fuer den Variant-Picker
+    // post-scan via _acceptMatch.allVariants), werden aber HIER vor
+    // dem Scoring rausgefiltert, sodass sie nie Top-1 sein koennen.
+    final metalCount = candidateMap.values.where((fp) => fp.card.metal).length;
+    if (metalCount > 0) {
+      candidateMap.removeWhere((_, fp) => fp.card.metal);
+      debugPrint('Scanner: filtered $metalCount metal candidate(s) from scoring');
+    }
+    if (candidateMap.isEmpty) return [];
+
     debugPrint('Scanner: ${candidateMap.length} candidates for scoring');
 
     // ── Phase 2: Score in isolate (off main thread) ──
