@@ -6403,6 +6403,88 @@ exports.updateCartReservation = onCall(
 );
 
 /**
+ * Firestore-Trigger: enforce daily listing-creation rate limit.
+ *
+ * Hintergrund (Security-Audit Round 7 / Pen-Test, 2026-04-29):
+ * Listings werden direct via Flutter `.add()` geschrieben (kein CF-wrapper)
+ * → existierender CF-side `enforceRateLimit`-Helper greift NICHT.
+ * Mass-Listing-Spam-Vektor (OWASP API #4 Unrestricted Resource Consumption
+ * + API #6 Sensitive Business Flow): authenticated User koennte 10000
+ * Listings/h erstellen → Marketplace-Pollution + Firestore-Quota-Burn.
+ *
+ * Reactive-Defense: dieser Trigger zaehlt Listings/User/Tag in
+ * `rateLimits/{uid}.listingCreate`. Bei Ueberschreitung des Daily-Cap
+ * wird das Listing nicht geblockt (Firestore-Rule liess es schon durch),
+ * aber `status: 'flagged_spam'` gesetzt — Marketplace-Queries filtern
+ * auf `status == 'active'`, also wird Spam unsichtbar.
+ *
+ * Threshold: 100 Listings/Tag/User. Real-world Power-Seller bulk-importiert
+ * vielleicht 200-500 auf einmal — die ersten 100 gehen durch, der Rest
+ * landet flagged. Admin kann unflaggen via direct Firestore-Edit.
+ *
+ * Idempotent — Counter ist statistisch eventually-consistent (paralleler
+ * Race-Window kann Cap um +1-2 ueberschreiten, akzeptabel).
+ */
+const LISTINGS_PER_DAY_CAP = 100;
+
+exports.enforceListingSpamLimit = onDocumentCreated(
+  {
+    document: `artifacts/${APP_ID}/listings/{listingId}`,
+    region: "europe-west1",
+    timeoutSeconds: 15,
+  },
+  async (event) => {
+    const snap = event.data;
+    if (!snap) return;
+    const listing = snap.data();
+    const sellerId = listing.sellerId;
+    if (!sellerId) return;
+
+    const today = new Date().toISOString().slice(0, 10);
+    const rateRef = db.collection("artifacts").doc(APP_ID)
+      .collection("rateLimits").doc(sellerId);
+
+    try {
+      const rateSnap = await rateRef.get();
+      const data = rateSnap.exists ? rateSnap.data() : {};
+      const entry = data.listingCreate || {};
+      const todayCount = entry.date === today ? (entry.count || 0) : 0;
+      const newCount = todayCount + 1;
+
+      await rateRef.set({
+        listingCreate: { date: today, count: newCount },
+      }, { merge: true });
+
+      if (newCount > LISTINGS_PER_DAY_CAP) {
+        await snap.ref.update({
+          status: "flagged_spam",
+          flaggedReason: "rate_limit_exceeded",
+          flaggedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        console.warn(
+          `enforceListingSpamLimit: seller ${sellerId} exceeded ` +
+          `${LISTINGS_PER_DAY_CAP}/day (count=${newCount}), ` +
+          `listing ${snap.id} marked flagged_spam`,
+        );
+        try {
+          sendAdminAlert(
+            "LISTING_SPAM",
+            `Seller ${sellerId} exceeded daily listing limit ` +
+            `(${newCount}/${LISTINGS_PER_DAY_CAP}). Listing ${snap.id} flagged.`,
+          );
+        } catch (alertErr) {
+          console.error(`Admin-Alert send failed: ${alertErr.message}`);
+        }
+      }
+    } catch (err) {
+      console.error(
+        `enforceListingSpamLimit: ${snap.id} failed: ${err.message}`,
+      );
+    }
+  },
+);
+
+/**
  * Firestore-Trigger: populiert sellerRating + sellerSales auf jedem neuen
  * Listing aus dem `sellerProfile`-Doc (server-trusted source).
  *
