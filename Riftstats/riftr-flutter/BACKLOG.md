@@ -481,13 +481,30 @@ Test-Suite: `functions/test-scenarios/phase8_e2e_tests.js` — 46/46 Checks grue
     - **Externer Auditor Quote:** *"The 21+ findings the PR author documented have all been verified as properly addressed. No additional high-confidence vulnerabilities identified."*
     - **Deployed.** Beides keine Security-Findings — Money-State + State-Integrity-Bugs.
 
-115. ⚠️ **avatarUrl Tracking-Pixel-Hardening (deferred 2026-04-29)** — Round-6-Audit. User koennen aktuell beliebige URLs als avatarUrl setzen (`social_screen.dart` Z. 1230 — Text-Controller, kein Validation). Wenn andere User das Profil ansehen → Device fetched die URL → Attacker-Server logged IP, User-Agent, Timestamp. = Tracking-Pixel.
-    - **Fix-Vorschlag:** Domain-Whitelist in Firestore-Rule + profile_service:
-      - Allowed Prefixes: `https://firebasestorage.googleapis.com/`, `https://lh3.googleusercontent.com/` (Google Sign-In Avatare), evtl. `https://i.imgur.com/`.
-      - Rule: `request.resource.data.avatarUrl == null || (avatarUrl matches whitelist regex)`.
-      - Migration: bestehende User-Avatars die nicht whitelist-conformig sind muessten auf null reset werden (~5-10 betroffene Beta-User).
-    - **Aufwand:** ~1h Code + Migration-Script + UI-Polish (file-upload statt URL-paste fuer Beta-Phase).
-    - **Defer-Begruendung:** Beta-User sind Friends, malicious-actor-Risk niedrig. Pre-Public-Launch zwingend (DSGVO + Tracker-Defense).
+115. ✅ **avatarUrl Whitelist Phase A — Server-Side Enforcement (2026-04-29)** — Schuetzt vor Tracking-Pixel-Attacken. User koennten sonst beliebige URLs setzen ("https://attacker.com/track.gif?uid=victim") → andere User laden's beim Profile-View → Attacker logged IP/User-Agent.
+    - **Architektur-Vision (User-Request 2026-04-29):**
+      1. Player → Picker mit kuratierten Legend-Crops (Phase B UI)
+      2. Player → optionale weitere Card-Crops (Phase B UI)
+      3. Shops → eigenes Logo via Upload (Phase B UI)
+      4. Default Google Sign-In → automatisches Avatar (immer erlaubt)
+    - **Phase A (jetzt):** Firestore-Rules enforcen URL-Whitelist:
+      - `null` / leer (kein Avatar)
+      - `^https://lh3.googleusercontent.com/.*` (Google Sign-In)
+      - `^https://firebasestorage.googleapis.com/v0/b/riftr-10527.appspot.com/o/avatars(%2F|/).*` (Firebase Storage avatars/-Pfad — stuetzt Phase B's curated + shop-logos)
+    - **Helpers in firestore.rules:**
+      - `isValidAvatarUrl(url)` — 3 Pattern-Matches
+      - `avatarUrlOk(req, res)` fuer Updates (skippt wenn avatarUrl nicht in affectedKeys)
+      - `avatarUrlOkCreate(req)` fuer Creates
+    - **Applied auf:** `playerProfiles/{uid}` + `users/{uid}/data/profile`
+    - **Phase B (Pre-Public-Launch):** UI-Picker bauen — kuratierte Legend-Crops in Firebase Storage hochladen, Picker-Widget in Profile-Edit + Shop-Logo-Upload-Flow.
+    - **Deployed.** Migration-Hinweis: wenn existing User custom-URL avatars haben, schlaegt naechstes Profile-Update fehl bis sie auf null/Google/Firebase-Storage wechseln.
+
+102. ✅ **SSRF-Hardening Tournament-Scraper (2026-04-29)** — Defense-in-Depth gegen SSRF. `fetchWithRetries` validiert jetzt URL-Hostname gegen Whitelist BEVOR der Fetch passiert.
+    - **Threat-Model:** wenn Riot/Mobalytics jemals kompromittiert werden + bösartige Slugs in Tournament-Pages auftauchen → unser Scraper koennte sonst auf metadata.google.internal o.ae. fetchen.
+    - **Whitelist:** riftbound.leagueoflegends.com, lolesports.com, mobalytics.gg, api.riftcodex.com, downloads.s3.cardmarket.com (+ www.-Varianten).
+    - **Plus:** Protocol-Check (nur http/https erlaubt).
+    - **Slug-Regex** existiert schon (`[a-z0-9-]+` only) — Hostname-Whitelist ist defense-in-depth.
+    - **Deployed.**
 
 114. ⚠️ **stripe_events-TTL-Policy + rateLimits-TTL (deferred 2026-04-29)** — Round 6 added `enforceRateLimit`-Helper schreibt in `artifacts/{appId}/rateLimits/{uid}` mit `{cfName: {date, count}}`-Sub-Objects. Wachsen forever (1 Doc/User, mit ~5-10 Sub-Objects). Pro User 5kb max, ueber Zeit OK aber nicht aufgeraeumt.
     - **Fix:** Firebase Console TTL-Policy auf `artifacts/{appId}/rateLimits/{uid}` mit Field `lastTouchedAt` (muss noch in CF gesetzt werden) + 90-Tage-TTL. Inactive-User-Counter wird automatisch entsorgt.
