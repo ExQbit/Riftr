@@ -6473,6 +6473,181 @@ exports.migratePlayerProfiles = onRequest(
 );
 
 // ═══════════════════════════════════════════
+// ─── Beta Marketplace Cleanup (One-shot, Bearer-protected) ───
+// ═══════════════════════════════════════════
+//
+// Use-Case: vor Public-Beta-Opening allen Marketplace-State wipen damit
+// Tester nicht ueber alte Test-Listings/Test-Orders stolpern. Wipe-Scope
+// ist marketplace-only — User-Daten (Profile, Collection, Decks, Friends,
+// Match-History) bleiben unangetastet.
+//
+// Trigger: bearer-protected, manuell via curl. Reverse-engineering nicht
+// moeglich (ADMIN_TRIGGER_SECRET ist Firebase-Secret, nicht im App-Bundle).
+//
+// USAGE:
+//   curl -X POST -H "Authorization: Bearer $ADMIN_TRIGGER_SECRET" \
+//     https://us-central1-riftr-10527.cloudfunctions.net/cleanupBetaMarketplace
+//
+// Returns JSON-Summary mit gelöschten Counts pro Collection.
+// Idempotent — kann mehrfach ausgefuehrt werden.
+
+exports.cleanupBetaMarketplace = onRequest(
+  {
+    timeoutSeconds: 540,
+    memory: "1GiB",
+    region: "us-central1",
+    secrets: ["ADMIN_TRIGGER_SECRET"],
+  },
+  async (req, res) => {
+    if (!requireAdminSecret(req, res)) return;
+
+    const summary = {
+      listings_deleted: 0,
+      orders_deleted: 0,
+      cartReservations_deleted: 0,
+      reviews_deleted: 0,
+      walletTransactions_deleted: 0,
+      walletDocs_deleted: 0,
+      costBasis_deleted: 0,
+      portfolioHistory_deleted: 0,
+      buyerSellerPairs_deleted: 0,
+      rateLimits_deleted: 0,
+      stripe_events_deleted: 0,
+      sellerProfiles_reset: 0,
+      errors: [],
+    };
+
+    // Helper: batched delete eines Snapshot
+    async function batchDelete(snap, label) {
+      let deleted = 0;
+      const docs = snap.docs;
+      // Firestore batch limit = 500
+      for (let i = 0; i < docs.length; i += 400) {
+        const batch = db.batch();
+        const slice = docs.slice(i, i + 400);
+        for (const d of slice) batch.delete(d.ref);
+        await batch.commit();
+        deleted += slice.length;
+      }
+      console.log(`cleanupBetaMarketplace: deleted ${deleted} ${label}`);
+      return deleted;
+    }
+
+    try {
+      // ── 1. Listings ──
+      const listingsSnap = await db.collection("artifacts").doc(APP_ID)
+        .collection("listings").get();
+      summary.listings_deleted = await batchDelete(listingsSnap, "listings");
+
+      // ── 2. Orders ──
+      const ordersSnap = await db.collection("artifacts").doc(APP_ID)
+        .collection("orders").get();
+      summary.orders_deleted = await batchDelete(ordersSnap, "orders");
+
+      // ── 3. CartReservations (collectionGroup über alle users) ──
+      const cartResSnap = await db.collectionGroup("cartReservations").get();
+      summary.cartReservations_deleted = await batchDelete(cartResSnap, "cartReservations");
+
+      // ── 4. Reviews (collectionGroup) ──
+      const reviewsSnap = await db.collectionGroup("reviews").get();
+      summary.reviews_deleted = await batchDelete(reviewsSnap, "reviews");
+
+      // ── 5. WalletTransactions (collectionGroup) ──
+      const walletTxSnap = await db.collectionGroup("walletTransactions").get();
+      summary.walletTransactions_deleted = await batchDelete(walletTxSnap, "walletTransactions");
+
+      // ── 6. Wallet docs (collectionGroup) ──
+      const walletSnap = await db.collectionGroup("wallet").get();
+      summary.walletDocs_deleted = await batchDelete(walletSnap, "wallet docs");
+
+      // ── 7. cost_basis + portfolio_history docs ──
+      // Diese liegen unter users/{uid}/data/cost_basis (single doc per user)
+      const usersRef = db.collection("artifacts").doc(APP_ID).collection("users");
+      const userDocs = await usersRef.listDocuments();
+      let costBasisDeleted = 0;
+      let portfolioDeleted = 0;
+      let sellerProfilesReset = 0;
+      for (const userDoc of userDocs) {
+        try {
+          const cbRef = userDoc.collection("data").doc("cost_basis");
+          const cbDoc = await cbRef.get();
+          if (cbDoc.exists) {
+            await cbRef.delete();
+            costBasisDeleted++;
+          }
+        } catch (_) {}
+        try {
+          const phRef = userDoc.collection("data").doc("portfolio_history");
+          const phDoc = await phRef.get();
+          if (phDoc.exists) {
+            await phRef.delete();
+            portfolioDeleted++;
+          }
+        } catch (_) {}
+        // ── 8. SellerProfile-Stats reset (NICHT komplett loeschen!) ──
+        // Wir behalten displayName, email, country, address, isCommercialSeller,
+        // stripeAccountId, etc. Nur die Stats die aus Test-Orders kamen werden
+        // genullt damit der Beta-Start-State sauber ist.
+        try {
+          const spRef = userDoc.collection("data").doc("sellerProfile");
+          const spDoc = await spRef.get();
+          if (spDoc.exists) {
+            await spRef.update({
+              rating: 0,
+              reviewCount: 0,
+              totalSales: 0,
+              totalRevenue: 0,
+              completedSalesCount: 0,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+            sellerProfilesReset++;
+          }
+        } catch (_) {}
+      }
+      summary.costBasis_deleted = costBasisDeleted;
+      summary.portfolioHistory_deleted = portfolioDeleted;
+      summary.sellerProfiles_reset = sellerProfilesReset;
+
+      // ── 9. Admin-Tracking-Collections (buyerSellerPairs, rateLimits, stripe_events) ──
+      const pairsSnap = await db.collection("artifacts").doc(APP_ID)
+        .collection("buyerSellerPairs").get();
+      summary.buyerSellerPairs_deleted = await batchDelete(pairsSnap, "buyerSellerPairs");
+
+      const rateLimitsSnap = await db.collection("artifacts").doc(APP_ID)
+        .collection("rateLimits").get();
+      summary.rateLimits_deleted = await batchDelete(rateLimitsSnap, "rateLimits");
+
+      const stripeEventsSnap = await db.collection("artifacts").doc(APP_ID)
+        .collection("stripe_events").get();
+      summary.stripe_events_deleted = await batchDelete(stripeEventsSnap, "stripe_events");
+
+      // ── 10. PlayerProfiles Mirror Re-Sync triggern ──
+      // Stats-Reset auf sellerProfile bedeutet die Mirror sind out-of-date.
+      // Naechster syncPlayerProfile-Call (bei submitReview/confirmDelivery)
+      // wird den Mirror updaten. Fuer einen sofortigen sync alle User
+      // durchlaufen lassen:
+      let mirrorsSynced = 0;
+      for (const userDoc of userDocs) {
+        try {
+          await syncPlayerProfile(userDoc.id);
+          mirrorsSynced++;
+        } catch (_) {}
+      }
+      summary.playerProfiles_synced = mirrorsSynced;
+
+      console.log(
+        `cleanupBetaMarketplace COMPLETE: ${JSON.stringify(summary)}`,
+      );
+      res.json({ success: true, ...summary });
+    } catch (err) {
+      console.error("cleanupBetaMarketplace failed:", err);
+      summary.errors.push(err.message);
+      res.status(500).json({ success: false, error: err.message, ...summary });
+    }
+  },
+);
+
+// ═══════════════════════════════════════════
 // ─── One-time Migration: createdAt from Firebase Auth ───
 // ═══════════════════════════════════════════
 
