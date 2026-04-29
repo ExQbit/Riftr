@@ -43,6 +43,14 @@ service cloud.firestore {
 
       // ── Global Collections ──
 
+      // Sock-Puppet/Wash-Trading-Detection-Records (Round 10, 2026-04-29).
+      // Verfolgt Buyer-Seller-Pair-Velocity in 30d-Window. CF-only Admin-SDK
+      // schreibt; weder Buyer noch Seller darf das einsehen (sonst wuerden
+      // Fraudster die Threshold-Werte reverse-engineeren).
+      match /buyerSellerPairs/{pairId} {
+        allow read, write: if false;
+      }
+
       // Stripe-Event-Dedup-Records (Round 4, 2026-04-29).
       // CF-only writes via Admin-SDK. Clients haben keinen Zugriff —
       // weder Read noch Write. Wird durch root-deny abgedeckt, hier

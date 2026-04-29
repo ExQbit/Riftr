@@ -143,6 +143,100 @@ async function enforceAgeBasedDailyCap(uid, key, freshCap, midCap, matureCap) {
   await enforceRateLimit(uid, key, dailyLimit);
 }
 
+// ─── Sock-Puppet / Wash-Trading Detection (Round 10, 2026-04-29) ───
+// Buyer-Seller-Pair-Velocity-Tracking. Wash-Trading-Pattern:
+//   - Seller A + Friends (B, C, D) koordinieren
+//   - Friends kaufen ~5-50× kleine Listings von A
+//   - Friends leaven 5-Sterne-Reviews
+//   - A erreicht Trusted-Tier ohne echte Verkaeufe
+//
+// Detection-Threshold:
+//   - 5+ Transaktionen zwischen gleichem Buyer-Seller-Pair in 30 Tagen
+//     UND average-amount < €15 (Wash-Trades nutzen typisch billige Listings)
+//   - 10+ Transaktionen in 30 Tagen (egal welcher Betrag) — auch organisiert
+//
+// Bei Threshold-Hit: Admin-Alert. Kein Auto-Block (legit-Power-Buyer-Pairs
+// existieren — Buyer der jede Woche bei Lieblings-Seller kauft = legit).
+// Admin investigiert + entscheidet ob Suspension noetig.
+const SOCK_PUPPET_TXN_THRESHOLD = 5;          // Transaktionen
+const SOCK_PUPPET_AVG_AMOUNT_CAP = 15.0;      // EUR — unter dem = Wash-Pattern
+const SOCK_PUPPET_HARD_THRESHOLD = 10;        // egal welcher Betrag
+
+async function trackBuyerSellerPair(buyerId, sellerId, amountEur) {
+  if (!buyerId || !sellerId) return;
+  if (buyerId === sellerId) return; // self-buy already blocked Round 5
+  // Doc-Path: pair-key kombiniert beide UIDs sortiert (deterministisch)
+  // Tatsaechlich: behalten wir buyerId_sellerId-order weil wir die
+  // Direction tracken wollen (B kauft von S, nicht umgekehrt).
+  const pairKey = `${buyerId}_${sellerId}`;
+  const pairRef = db.collection("artifacts").doc(APP_ID)
+    .collection("buyerSellerPairs").doc(pairKey);
+
+  const pairSnap = await pairRef.get();
+  const data = pairSnap.exists ? pairSnap.data() : {};
+  const events = Array.isArray(data.events) ? data.events : [];
+
+  // 30-Tage-Window
+  const thirtyDaysAgo = Date.now() - 30 * 24 * 60 * 60 * 1000;
+  const recent = events.filter((e) => (e.ts || 0) >= thirtyDaysAgo);
+  recent.push({ ts: Date.now(), amount: amountEur });
+
+  // Memory-bound: max 50 Events pro Pair (vermutlich nie ueberschritten)
+  const trimmed = recent.slice(-50);
+
+  // Compute stats
+  const txnCount = recent.length;
+  const totalAmount = recent.reduce((s, e) => s + (e.amount || 0), 0);
+  const avgAmount = txnCount > 0 ? totalAmount / txnCount : 0;
+
+  // Already-flagged check (avoid spam-alerts)
+  const alreadyFlagged = data.flaggedAt != null;
+
+  let shouldFlag = false;
+  let reason = null;
+  if (!alreadyFlagged) {
+    if (txnCount >= SOCK_PUPPET_HARD_THRESHOLD) {
+      shouldFlag = true;
+      reason = `${txnCount} txns in 30d (any amount)`;
+    } else if (
+      txnCount >= SOCK_PUPPET_TXN_THRESHOLD &&
+      avgAmount < SOCK_PUPPET_AVG_AMOUNT_CAP
+    ) {
+      shouldFlag = true;
+      reason = `${txnCount} txns in 30d, avg €${avgAmount.toFixed(2)} (low-value pattern)`;
+    }
+  }
+
+  const updatePayload = {
+    buyerId,
+    sellerId,
+    events: trimmed,
+    lastTransactionAt: admin.firestore.FieldValue.serverTimestamp(),
+    txnCount30d: txnCount,
+    totalAmount30d: totalAmount,
+    avgAmount30d: avgAmount,
+  };
+
+  if (shouldFlag) {
+    updatePayload.flaggedAt = admin.firestore.FieldValue.serverTimestamp();
+    updatePayload.flaggedReason = reason;
+    console.warn(
+      `🚨 SOCK_PUPPET_SUSPECT: buyer=${buyerId} seller=${sellerId} ${reason}`,
+    );
+    try {
+      sendAdminAlert(
+        "SOCK_PUPPET_SUSPECT",
+        `Buyer ${buyerId} <-> Seller ${sellerId}: ${reason}. ` +
+        `Manual review recommended.`,
+      );
+    } catch (alertErr) {
+      console.error(`Sock-Puppet Alert dispatch failed: ${alertErr.message}`);
+    }
+  }
+
+  await pairRef.set(updatePayload, { merge: true });
+}
+
 // ─── Hourly Velocity Rate-Limit (Round 9 Red-Team-Audit, 2026-04-29) ─
 // Schaerfere Velocity-Defense gegen Burst-Attacks:
 // "100/day" erlaubt theoretisch 100 in 5 Minuten = Burst-Spam.
@@ -3671,6 +3765,18 @@ exports.confirmDelivery = onCall(
       // muss aktualisiert werden damit Listings/Social-Tab den neuen
       // Wert sehen. (Security: PII bleibt im sellerProfile, nicht im Mirror.)
       await syncPlayerProfile(order.sellerId);
+
+      // Sock-Puppet / Wash-Trading Detection (Round 10 Insider-Audit, 2026-04-29):
+      // Strategie 1 — Seller A nutzt Friends mit eigenen Accounts um sich Reviews
+      // zu erschummeln. Cost: €1-Listing × 50 Wash-Trades = €54 → Trusted-Tier.
+      // Defense: track Buyer-Seller-Pair-Velocity. Echter Power-Buyer kauft selten
+      // 5+ mal beim gleichen Seller in 30 Tagen — Wash-Trading-Pattern stark
+      // korreliert mit "many small txns same pair".
+      try {
+        await trackBuyerSellerPair(order.buyerId, order.sellerId, order.totalPaid || 0);
+      } catch (pairErr) {
+        console.error(`trackBuyerSellerPair failed for order ${orderId}:`, pairErr.message);
+      }
     } catch (postErr) {
       console.error(`confirmDelivery post-status error for ${orderId}:`, postErr);
       // Don't throw — order IS delivered, buyer should see success
@@ -4369,6 +4475,15 @@ exports.autoReleaseOrders = onSchedule(
 
       // Notify buyer about auto-completion
       sendNotification(order.buyerId, "Order auto-completed", "Your order was automatically completed.", { type: "order", orderId: doc.id });
+
+      // Sock-Puppet-Detection (Round 10) auch hier — Wash-Traders koennten
+      // bewusst auto-release laufen lassen um confirmDelivery zu skippen
+      // (wenig wahrscheinlich, weil sie Reviews wollen — aber Sicher ist sicher).
+      try {
+        await trackBuyerSellerPair(order.buyerId, order.sellerId, order.totalPaid || 0);
+      } catch (pairErr) {
+        console.error(`trackBuyerSellerPair (auto-release) failed:`, pairErr.message);
+      }
     }
 
     console.log(`autoReleaseOrders: completed ${snap.size} orders`);
@@ -6649,22 +6764,68 @@ exports.enforceListingSpamLimit = onDocumentCreated(
       }, { merge: true });
 
       const exceedsHourly = recentEvents.length > LISTINGS_PER_HOUR_CAP;
-      if (newCount > LISTINGS_PER_DAY_CAP || exceedsHourly) {
+
+      // Pre-Release-Cap (Round 10 Insider-Fraudster-Audit, 2026-04-29):
+      // Strategie 3 — Pre-Release-Mass-Scam. Neuer Seller kann 100×
+      // Pre-Release-Karten listen, alle Buyer pre-ordern lassen, beim
+      // Release-Day capture × 100 → vanish bevor delay_days-Auszahlung.
+      // = €5000+ Beute pro Set-Release.
+      // Defense: account-age-based Pre-Release-Limit.
+      let exceedsPreRelease = false;
+      let preReleaseReason = null;
+      if (listing.preReleaseDate) {
+        const ageDays = await getAccountAgeDays(sellerId);
+        // Daily Pre-Release-Listing-Cap nach Account-Age:
+        //   <7d  : max 5 Pre-Release-Listings/Tag
+        //   7-30d: max 25 Pre-Release-Listings/Tag
+        //   >30d : max 100 (= regular daily cap)
+        let preReleaseCap;
+        if (ageDays < 7) preReleaseCap = 5;
+        else if (ageDays < 30) preReleaseCap = 25;
+        else preReleaseCap = 100;
+
+        // Count today's pre-release-listings for this seller
+        const preReleaseEntry = data.preReleaseListingCreate || {};
+        const preReleaseTodayCount = preReleaseEntry.date === today
+          ? (preReleaseEntry.count || 0)
+          : 0;
+        const preReleaseNewCount = preReleaseTodayCount + 1;
+
+        await rateRef.set({
+          preReleaseListingCreate: {
+            date: today,
+            count: preReleaseNewCount,
+          },
+        }, { merge: true });
+
+        if (preReleaseNewCount > preReleaseCap) {
+          exceedsPreRelease = true;
+          preReleaseReason =
+            `pre_release_cap age=${ageDays}d ` +
+            `(${preReleaseNewCount}/${preReleaseCap})`;
+        }
+      }
+
+      if (newCount > LISTINGS_PER_DAY_CAP || exceedsHourly || exceedsPreRelease) {
         await snap.ref.update({
           status: "flagged_spam",
-          flaggedReason: "rate_limit_exceeded",
+          flaggedReason: exceedsPreRelease
+            ? "pre_release_cap_exceeded"
+            : "rate_limit_exceeded",
           flaggedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
-        const reason = exceedsHourly
-          ? `hourly_burst (${recentEvents.length}/${LISTINGS_PER_HOUR_CAP})`
-          : `daily_cap (${newCount}/${LISTINGS_PER_DAY_CAP})`;
+        const reason = exceedsPreRelease
+          ? preReleaseReason
+          : (exceedsHourly
+              ? `hourly_burst (${recentEvents.length}/${LISTINGS_PER_HOUR_CAP})`
+              : `daily_cap (${newCount}/${LISTINGS_PER_DAY_CAP})`);
         console.warn(
           `enforceListingSpamLimit: seller ${sellerId} ${reason}, ` +
           `listing ${snap.id} marked flagged_spam`,
         );
         try {
           sendAdminAlert(
-            "LISTING_SPAM",
+            exceedsPreRelease ? "PRE_RELEASE_SCAM" : "LISTING_SPAM",
             `Seller ${sellerId} ${reason}. Listing ${snap.id} flagged.`,
           );
         } catch (alertErr) {
