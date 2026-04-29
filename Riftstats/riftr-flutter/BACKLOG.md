@@ -313,6 +313,50 @@ Test-Suite: `functions/test-scenarios/phase8_e2e_tests.js` — 46/46 Checks grue
     - **CF-Args-Audit**: alle 220 auth-checks ueberprueft, alle nutzen `request.auth.uid` (server-trusted), keine User-controlled User-IDs aus den Args. Resource-IDs (orderId, listingId) werden serverside gegen Owner geprüft.
     - Deploy: Rules + CFs (submitReview, confirmDelivery, migratePlayerProfiles) live. **Pre-Launch-Blocker geschlossen.**
 
+137. ⚠️ **Powerseller-Cap (deferred 2026-04-29)** — Round 11 Recherche: Cardmarket limitiert Powersellers global auf EXAKT 100, mit yearly-review-process. Anti-Fraud durch Knappheit der highest-trust-accounts.
+    - **Adoption-Frage:** unsere Power-Seller-Tier ist algorithmisch (200+ Verkaeufe, 4.95★) ohne Hard-Cap. Cardmarket-Pattern wuerde es zu manueller Selection machen.
+    - **Defer-Begruendung:** operational + business decision, nicht Code-Defense. Pre-Public-Launch evaluieren wenn Power-Seller-Volume relevant wird.
+
+136. ⚠️ **3-Monate Postal-Investigation Window (deferred 2026-04-29)** — Round 11 Cardmarket-Pattern: Bei Lost-Order zahlt Cardmarket Buyer sofort zurueck, Postal-Investigation laeuft bis 3 Monate parallel, Seller kann Compensation beantragen. Setzt eigenes Capital-Pool voraus (vor-finanzierter Refund).
+    - **Defer-Begruendung:** Stripe Connect Direct Charges = wir haben kein Plattform-Capital-Pool (BaFin-Reason). Wuerde eigene Wallet-Architektur erfordern. Post-MVP-Feature wenn UG ein Backstop-Konto hat.
+
+135. ⚠️ **IP-Tracking fuer Multi-Account-Detection (deferred 2026-04-29)** — Round 11 Cardmarket sammelt Name+Email+IP fuer Multi-Account-Cluster-Detection. Wir machen das nicht (DSGVO-careful).
+    - **Adoption-Frage:** wuerde Strategie 6 (Account-Reset-Loop) deutlich abschwaechen.
+    - **Defer-Begruendung:** Privacy-Policy + DSGVO-Datenverarbeitungsvertrag-Update noetig. Pre-Public-Launch + Anwalt-Track.
+    - **Alternative:** Stripe macht IBAN-Cross-Reference-Detection bereits Stripe-Account-side.
+
+134. ⚠️ **Loss Prevention Team (deferred 2026-04-29)** — Round 11 TCGplayer hat dedicated team von Menschen fuer Manual-Review fraudulenter Aktivitaeten.
+    - **Adoption:** post-launch hire wenn Volume rechtfertigt. Aktuell sendAdminAlert + manueller Email-Check ausreichend fuer Beta-Volume.
+
+133. ⚠️ **Photo-Listing-Policy fuer High-Value-Items (deferred 2026-04-29)** — Round 11 TCGplayer-Pattern: Photo verpflichtend fuer Cards > $X. Reduziert Bait-and-Switch (Strategie 4) drastisch — Buyer hat Foto-Beweis vor Versand.
+    - **Defer-Begruendung:** UI-Feature mit Camera-Integration in Listing-Create-Flow + Image-Storage-Backend. Pre-Public-Launch.
+
+132. ⚠️ **Mandatory Tracked-Shipping above Threshold (deferred 2026-04-29)** — Round 11: sowohl Cardmarket (>€25) als auch TCGplayer (>$20) machen Tracking obligatorisch fuer hoehere Order-Werte. Schuetzt Seller bei Lost-Order-Disputes.
+    - **Aktueller Stand:** shippingMethod ist buyer-choice (letter/tracked/insured), kein Threshold-Enforcement.
+    - **Adoption:** in createPaymentIntent + processMultiSellerCart bei totalCents > 2500 (€25): force shippingMethod="tracked" oder "insured".
+    - **Defer-Begruendung:** UI-Feature noetig (Shipping-Picker muss tracked/insured highlighten + niedrige Tier disablen). Pre-Public-Launch.
+
+131. ⚠️ **Multi-Source-Verification: Phone + Email + Stripe-IBAN (deferred 2026-04-29)** — Round 11 Recherche: Cardmarket sammelt fuer Fraud-Prevention Multi-Source-Daten. Wir haben Email + Stripe-Connect-Verified-ID — kein Phone.
+    - **Adoption:** Phone-Verification beim Seller-Onboarding (zusaetzliche Hurde fuer Fraudster).
+    - **Defer-Begruendung:** SMS-Cost + DSGVO-Verarbeitungsvertrag mit SMS-Provider. Pre-Public-Launch evaluieren.
+
+130. ✅ **30-Day Dispute-Window after Delivery (Round 11 TCGplayer-Pattern, 2026-04-29)** — Cardmarket+TCGplayer beide haben extended Dispute-Windows nach Lieferung.
+    - **TCGplayer Safeguard:** 30 Tage refund-window von estimated-delivery
+    - **Riftr-Stand vor Round 11:** openDispute nur in `shipped`-Status. Nach confirmDelivery oder auto-release konnte Buyer NICHT mehr nachtraeglich disputen — z.B. wenn Karte 10 Tage spaeter als counterfeit erkennbar wird.
+    - **Fix:**
+      - `confirmDelivery` + `autoReleaseOrders` setzen `disputeWindowEndsAt = deliveredAt + 30d`
+      - `openDispute` erlaubt jetzt Disputes auch in `delivered`/`auto_completed`-Status SOLANGE `now < disputeWindowEndsAt`
+      - Klare Error-Message bei abgelaufenem Window
+    - **Stripe-Side:** Refunds funktionieren bis 180 Tage nach Charge. `reverse_transfer: true` zieht Geld auch von ausgezahltem Connect-Account zurueck (negative-balance Stripe-managed).
+    - **Deployed.**
+
+138. ✅ **First-5-Sales Extra-Buyer-Protection-Window (Round 11 Cardmarket-Pattern, 2026-04-29)** — Cardmarket macht Trustee Service mandatory fuer first-5-sales jedes neuen Sellers.
+    - **Riftr-Stand vor Round 11:** autoReleaseAt = 7 Tage fuer alle Sellers. Stripe delay_days = Account-Level-Tier (7d fuer neu, 5d/3d/1d fuer hoehere Tier).
+    - **Fix:** in markShipped → pruefe sellerProfile.completedSalesCount. Wenn < 5: autoReleaseAt = 14 Tage (statt 7). Order-Doc bekommt firstFiveSalesExtraHold + firstFiveSalesIndex Felder fuer Audit.
+    - **Effect:** Buyer hat verdoppelte Dispute-Window fuer first-5-sales jedes neuen Sellers. Bei dispute Tag 8-14: refund-flow + reverse_transfer zieht Geld zurueck (auch nach Stripe-Auszahlung).
+    - **Stripe delay_days bleibt unveraendert** (Account-Level, 7d). Unser Window ist jetzt LAENGER als Stripe-Auszahlung — = wir koennen Buyer-Protection geben auch wenn Geld schon Seller-Bank erreicht hat (Stripe-side reversal).
+    - **Deployed.**
+
 129. ⚠️ **Account-Reset-Loop Defense (deferred 2026-04-29)** — Round 10 Insider-Threat: Strategie 6. Nach Account-Suspend erstellt Fraudster neuen Account mit anderer Email + Stripe-Connect mit Geschwister-Ausweis + neuer Bank → continued operations.
     - **Fix erforderlich:** Device-Fingerprinting (IP, User-Agent, hardware-id) + Email-Domain-Clustering + Stripe-IBAN-Cross-Reference.
     - **Defer-Begruendung:** signifikanter Engineering-Aufwand, DSGVO-relevant (PII-Storage muss DSGVO-konform sein, Privacy-Policy-Update noetig). Stripe macht Teil dieser Detection bereits selbst (Multiple Connect-Accounts zur gleichen Bank-IBAN werden geflagged). Pre-Public-Launch-Track.
