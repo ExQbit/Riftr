@@ -16,6 +16,16 @@ Riftr ist eine **mobile Companion-App + P2P-Marktplatz für Riftbound TCG** (das
 - Marktplatz wo Privatpersonen + (geplant) gewerbliche Händler Karten kaufen + verkaufen
 - Smart-Cart (algorithmische Optimierung über mehrere Verkäufer)
 
+**Wichtig — App-only Distribution:**
+
+Riftr-Marketplace-Funktionen laufen **ausschließlich in der mobilen App** (iOS App Store + Google Play Store). Die Website [www.getriftr.app](https://www.getriftr.app) ist eine **reine Marketing-Landing-Page** mit App-Store-Links und enthält keinerlei Marketplace-, Checkout- oder Account-Funktionalität.
+
+Konsequenzen für AGB + Compliance:
+- AGB werden nur In-App präsentiert (vor Account-Erstellung + bei Bestellung)
+- Widerrufsbelehrung läuft im App-Checkout-Flow
+- Impressum-Pflicht (TMG §5) gilt für die Marketing-Website separat — anderer Inhalt als Marketplace-Impressum
+- Apple App Store / Google Play In-App-Purchase-Provision: gilt nicht für physische Sammelkarten (Apple-Regel 3.1.5(a) / Google In-App-Billing-Policy für „physical goods" Ausnahme), wir nutzen Stripe Connect direkt
+
 **Geschäftsmodell:**
 - Service-Gebühr (Käufer): €0,49 — €1,99 pro Bestellung, gestaffelt nach Bestellwert
 - Provision (Verkäufer): 5,0 % — 6,5 % vom Karten-Wert, gestaffelt nach Bestellwert
