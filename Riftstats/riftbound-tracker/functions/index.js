@@ -2754,7 +2754,7 @@ exports.createPaymentIntent = onCall(
       sellerAddress,
       shippingMethod: effectiveMethod,
       stripePaymentIntentId: paymentIntent.id,
-      paymentMethod: "stripe", // Phase-2 Pfad — Direct Charges + transfer_data
+      paymentMethod: "stripe", // Phase-2 Pfad — Destination Charges (transfer_data + application_fee_amount)
       status: "pending_payment",
       sellerName: listingData[0].sellerName || null,
       buyerName,
@@ -4862,7 +4862,7 @@ exports.submitReview = onCall(
 // be mirrored in the Flutter UI (cart summary, seller dashboard) and
 // the AGB fee section. See riftr-flutter/BACKLOG.md → "Payment-Track".
 //
-// Architecture: Stripe Connect Direct Charges with `transfer_data` +
+// Architecture: Stripe Connect Destination Charges with `transfer_data` +
 // `application_fee_amount`. NO platform-held funds. NO wallet logic
 // (anti-pattern, BaFin risk — see CLAUDE.md "Anti-Patterns").
 
