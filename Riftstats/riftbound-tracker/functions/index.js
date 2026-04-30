@@ -4694,8 +4694,13 @@ exports._runStaleShipmentsResolver = _runStaleShipmentsResolver;
 exports._runSellerSilenceResolver = _runSellerSilenceResolver;
 
 async function _runStaleShipmentsResolver() {
-    const fourteenDaysAgo = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000)
-      .toISOString();
+    // paidAt ist Firestore Timestamp (set via FieldValue.serverTimestamp()
+    // beim Bezahl-Webhook). Query muss Date-Object uebergeben — Firestore
+    // SDK konvertiert das zu Timestamp fuer den Vergleich. ISO-String wuerde
+    // gegen Timestamp-Field NICHT matchen (silent fail). Live-Test 2026-04-30
+    // hat den Bug aufgedeckt: Queries gaben candidates=0 obwohl seeded Orders
+    // mit paidAt 15d in past existierten.
+    const fourteenDaysAgo = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000);
     const ordersRef = db.collection("artifacts").doc(APP_ID).collection("orders");
 
     const snap = await ordersRef
@@ -4871,8 +4876,9 @@ exports.autoResolveStaleShipments = onSchedule(
  * Test-Trigger `devTriggerSellerSilence` (admin-only HTTP) aufgerufen.
  */
 async function _runSellerSilenceResolver() {
-    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
-      .toISOString();
+    // disputedAt ist Firestore Timestamp (siehe _runStaleShipmentsResolver-
+    // Kommentar zum gleichen Bug-Pattern). Date-Object statt ISO-String.
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
     const ordersRef = db.collection("artifacts").doc(APP_ID).collection("orders");
 
     // Disputed Orders mit disputeStatus "open" (= Verkaeufer hat noch nicht
@@ -6230,8 +6236,10 @@ exports.adminAccountSanction = onCall(
 async function _evaluateDisputePatternSanction(sellerId, currentOrderId) {
   if (!sellerId) return null;
 
-  const sixMonthsAgoMs = Date.now() - 6 * 30 * 24 * 60 * 60 * 1000;
-  const sixMonthsAgoIso = new Date(sixMonthsAgoMs).toISOString();
+  // disputedAt ist Firestore Timestamp (set via FieldValue.serverTimestamp()
+  // in openDispute) — Date-Object statt ISO-String fuer Query (siehe
+  // _runStaleShipmentsResolver-Kommentar zum gleichen Bug-Pattern).
+  const sixMonthsAgo = new Date(Date.now() - 6 * 30 * 24 * 60 * 60 * 1000);
 
   // Disputes des Verkaeufers in den letzten 6 Monaten zaehlen.
   // disputedAt wird in openDispute auf serverTimestamp gesetzt — nur Orders
@@ -6239,7 +6247,7 @@ async function _evaluateDisputePatternSanction(sellerId, currentOrderId) {
   const ordersRef = db.collection("artifacts").doc(APP_ID).collection("orders");
   const recentDisputesSnap = await ordersRef
     .where("sellerId", "==", sellerId)
-    .where("disputedAt", ">=", sixMonthsAgoIso)
+    .where("disputedAt", ">=", sixMonthsAgo)
     .get();
 
   const disputeCount = recentDisputesSnap.size;
