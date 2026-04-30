@@ -4687,7 +4687,7 @@ exports.autoReleaseOrders = onSchedule(
 /**
  * Internal helper for stale-shipment auto-resolve. Wird sowohl vom
  * `autoResolveStaleShipments`-Cron (Production-Schedule) als auch vom
- * Test-Trigger `_devTriggerStaleShipments` (admin-only HTTP) aufgerufen.
+ * Test-Trigger `devTriggerStaleShipments` (admin-only HTTP) aufgerufen.
  * Dadurch reproduzierbare E2E-Tests ohne auf den Cron warten zu muessen.
  */
 async function _runStaleShipmentsResolver() {
@@ -4865,7 +4865,7 @@ exports.autoResolveStaleShipments = onSchedule(
 /**
  * Internal helper for seller-silence auto-refund. Wird sowohl vom
  * `autoResolveSellerSilence`-Cron (Production-Schedule) als auch vom
- * Test-Trigger `_devTriggerSellerSilence` (admin-only HTTP) aufgerufen.
+ * Test-Trigger `devTriggerSellerSilence` (admin-only HTTP) aufgerufen.
  */
 async function _runSellerSilenceResolver() {
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
@@ -5067,7 +5067,7 @@ exports.autoResolveSellerSilence = onSchedule(
 );
 
 /**
- * _devTriggerStaleShipments — Test-only HTTP-Trigger fuer
+ * devTriggerStaleShipments — Test-only HTTP-Trigger fuer
  * `_runStaleShipmentsResolver`. Admin-only. Erlaubt reproduzierbare E2E-Tests
  * ohne auf den Production-Cron (04:30 Berlin) warten zu muessen.
  *
@@ -5078,7 +5078,7 @@ exports.autoResolveSellerSilence = onSchedule(
  * brauchen, muss eine separate UI-Function gebaut werden mit eigenem Audit-
  * Logging (diese hier hat keinen).
  */
-exports._devTriggerStaleShipments = onCall(
+exports.devTriggerStaleShipments = onCall(
   {
     region: "europe-west1",
     timeoutSeconds: 300,
@@ -5091,17 +5091,17 @@ exports._devTriggerStaleShipments = onCall(
     if (request.auth.token?.admin !== true) {
       throw new HttpsError("permission-denied", "Admin only (dev-trigger)");
     }
-    console.log(`_devTriggerStaleShipments invoked by admin=${request.auth.uid}`);
+    console.log(`devTriggerStaleShipments invoked by admin=${request.auth.uid}`);
     const result = await _runStaleShipmentsResolver();
     return { success: true, ...result };
   },
 );
 
 /**
- * _devTriggerSellerSilence — Test-only HTTP-Trigger fuer
- * `_runSellerSilenceResolver`. Siehe `_devTriggerStaleShipments`-Doc.
+ * devTriggerSellerSilence — Test-only HTTP-Trigger fuer
+ * `_runSellerSilenceResolver`. Siehe `devTriggerStaleShipments`-Doc.
  */
-exports._devTriggerSellerSilence = onCall(
+exports.devTriggerSellerSilence = onCall(
   {
     region: "europe-west1",
     timeoutSeconds: 300,
@@ -5114,7 +5114,7 @@ exports._devTriggerSellerSilence = onCall(
     if (request.auth.token?.admin !== true) {
       throw new HttpsError("permission-denied", "Admin only (dev-trigger)");
     }
-    console.log(`_devTriggerSellerSilence invoked by admin=${request.auth.uid}`);
+    console.log(`devTriggerSellerSilence invoked by admin=${request.auth.uid}`);
     const result = await _runSellerSilenceResolver();
     return { success: true, ...result };
   },
