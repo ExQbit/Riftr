@@ -4618,6 +4618,181 @@ exports.autoReleaseOrders = onSchedule(
   }
 );
 
+/**
+ * autoResolveStaleShipments — Cron, Discogs-Modell-Komponente.
+ *
+ * **Zweck (2026-04-30, ZAG-Compliance):**
+ * Wenn ein Verkaeufer 14 Tage nach Bezahlung nicht versendet (kein
+ * markShipped), wird die Order **objektiv-regelbasiert** automatisch
+ * storniert. Das ist KEIN Plattform-Schiedsspruch, sondern eine vorab in
+ * AGB definierte messbare Folge — analog zu Stripe `delay_days` oder
+ * `autoReleaseAt`. Damit ist die Geld-Aktion ZAG-unproblematisch (kein
+ * Wertentscheid am Geld, sondern abstrakte AGB-Folge).
+ *
+ * Mechanik:
+ * - Bei status `paid` ist der PaymentIntent mit `capture_method: "manual"`
+ *   nur autorisiert, NICHT captured (markShipped capturet erst). Geld liegt
+ *   in der Stripe-Auth-Hold auf der Kaeufer-Karte, nicht auf dem Connected
+ *   Account des Verkaeufers.
+ * - Wir rufen `paymentIntents.cancel(piId)` — gibt die Auth zurueck. Falls
+ *   die Auth schon abgelaufen ist (Stripe-Auth-Hold typischerweise 7 Tage,
+ *   ist also bei 14 Tagen meist schon expired), gibt Stripe Fehler — den
+ *   ignorieren wir (Order kommt trotzdem auf cancelled).
+ * - Listing-Reservations werden freigegeben.
+ * - Verkaeufer bekommt Strike (klare Pflichtverletzung).
+ * - Beide Parteien bekommen Notifications.
+ *
+ * Kein refunds.create / reverse_transfer noetig, weil das Geld nie auf den
+ * Connected Account des Verkaeufers gelangt ist.
+ *
+ * Schedule: 04:30 Berlin (eine halbe Stunde nach autoReleaseOrders, damit
+ * sich die beiden Crons nicht ueberlappen). Der bestehende Day-5-Reminder
+ * in autoReleaseOrders nudget den Verkaeufer rechtzeitig.
+ */
+exports.autoResolveStaleShipments = onSchedule(
+  {
+    schedule: "30 4 * * *",
+    timeZone: "Europe/Berlin",
+    timeoutSeconds: 300,
+    region: "europe-west1",
+    secrets: ["STRIPE_SECRET_KEY"],
+  },
+  async () => {
+    const fourteenDaysAgo = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000)
+      .toISOString();
+    const ordersRef = db.collection("artifacts").doc(APP_ID).collection("orders");
+
+    const snap = await ordersRef
+      .where("status", "==", "paid")
+      .where("paidAt", "<=", fourteenDaysAgo)
+      .get();
+
+    if (snap.empty) {
+      console.log("autoResolveStaleShipments: no stale orders");
+      return;
+    }
+
+    const stripe = getStripe();
+    let cancelled = 0;
+    let skipped = 0;
+
+    for (const doc of snap.docs) {
+      // Race-Protection: Verkaeufer koennte in dem Moment markShipped triggern.
+      // Atomarer State-Flip in TX vor dem Stripe-Call.
+      let order;
+      try {
+        order = await db.runTransaction(async (tx) => {
+          const fresh = await tx.get(doc.ref);
+          if (!fresh.exists) return null;
+          const data = fresh.data();
+          if (data.status !== "paid") return null;
+          // Doppelt-Sicher: paidAt-Alter nochmal pruefen (Doc-Snapshot
+          // koennte stale sein nach langer Cron-Iteration).
+          const paidAtRaw = data.paidAt;
+          let paidAtMs = 0;
+          if (paidAtRaw && typeof paidAtRaw.toMillis === "function") {
+            paidAtMs = paidAtRaw.toMillis();
+          } else if (paidAtRaw) {
+            paidAtMs = new Date(paidAtRaw).getTime();
+          }
+          if (!paidAtMs ||
+              (Date.now() - paidAtMs) < 14 * 24 * 60 * 60 * 1000) {
+            return null;
+          }
+          tx.update(doc.ref, {
+            status: "cancelled",
+            cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
+            cancelReason: "auto_stale_shipment_14d",
+            autoResolvedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+          return data;
+        });
+      } catch (txErr) {
+        console.error(
+          `autoResolveStaleShipments ${doc.id} TX-flip failed: ${txErr.message}`,
+        );
+        continue;
+      }
+      if (!order) {
+        skipped++;
+        continue;
+      }
+
+      // Stripe PI cancel — try/catch weil Auth eventuell schon abgelaufen
+      // (Stripe-Auth-Hold ~7 Tage, bei 14 Tagen meist expired = harmlos).
+      if (order.stripePaymentIntentId) {
+        try {
+          await stripe.paymentIntents.cancel(order.stripePaymentIntentId);
+          console.log(
+            `autoResolveStaleShipments: cancelled PI ${order.stripePaymentIntentId} for order ${doc.id}`,
+          );
+        } catch (e) {
+          // PI ist evtl. bereits in einem Terminal-State (canceled, expired) —
+          // log + continue. Order wurde bereits in TX auf cancelled gesetzt.
+          console.warn(
+            `autoResolveStaleShipments: PI ${order.stripePaymentIntentId} cancel skipped (${e.message})`,
+          );
+        }
+      }
+
+      // Listing-Reservations freigeben (Mirror der cancelPendingOrder-Logik)
+      for (const item of (order.items || [])) {
+        if (!item.listingId) continue;
+        const listingRef = db.collection("artifacts").doc(APP_ID)
+          .collection("listings").doc(item.listingId);
+        const listingDoc = await listingRef.get();
+        if (!listingDoc.exists) continue;
+        const listing = listingDoc.data();
+        const newReserved = Math.max(
+          0,
+          (listing.reservedQty || 0) - (item.quantity || 1),
+        );
+        const updateData = { reservedQty: newReserved };
+        if (listing.status === "reserved") updateData.status = "active";
+        await listingRef.update(updateData);
+      }
+
+      // Strike fuer Verkaeufer — klare Pflichtverletzung. Mehrere Strikes
+      // koennen durch Pattern-Detection (Schritt 7) zur Account-Sperre fuehren.
+      if (order.sellerId) {
+        try {
+          await addStrike(
+            order.sellerId,
+            `Auto-cancelled order ${doc.id} after 14d no shipment`,
+          );
+        } catch (e) {
+          console.error(
+            `autoResolveStaleShipments: addStrike failed for ${order.sellerId}: ${e.message}`,
+          );
+        }
+      }
+
+      // Notifications: ehrlich, factual — keine Schuldzuweisung,
+      // aber klare Konsequenz fuer den Verkaeufer
+      sendNotification(
+        order.buyerId,
+        "Order auto-cancelled",
+        "The seller didn't ship within 14 days. Your payment authorization has been released — please order from a different seller.",
+        { type: "order", orderId: doc.id },
+      );
+      if (order.sellerId) {
+        sendNotification(
+          order.sellerId,
+          "Order auto-cancelled (no shipment)",
+          "An order was automatically cancelled because you didn't mark it as shipped within 14 days. Repeated occurrences may lead to listing pauses or account sanctions.",
+          { type: "order", orderId: doc.id },
+        );
+      }
+
+      cancelled++;
+    }
+
+    console.log(
+      `autoResolveStaleShipments: cancelled=${cancelled} skipped=${skipped} of ${snap.size} candidates`,
+    );
+  },
+);
+
 // ── Request Cancel (Buyer) ──
 exports.requestCancelOrder = onCall(
   { region: "europe-west1" },
