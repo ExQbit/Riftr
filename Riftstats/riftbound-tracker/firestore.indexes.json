@@ -48,6 +48,23 @@
         { "fieldPath": "buyerRating", "order": "ASCENDING" },
         { "fieldPath": "buyerRatingTimestamp", "order": "DESCENDING" }
       ]
+    },
+    {
+      "collectionGroup": "orders",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "sellerId", "order": "ASCENDING" },
+        { "fieldPath": "disputedAt", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "orders",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "disputeStatus", "order": "ASCENDING" },
+        { "fieldPath": "disputedAt", "order": "ASCENDING" }
+      ]
     }
     ,{
       "collectionGroup": "walletTransactions",

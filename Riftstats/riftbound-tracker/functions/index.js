@@ -4071,6 +4071,17 @@ exports.openDispute = onCall(
     const dispSummary = orderItemsSummary(order.items);
     sendNotification(order.sellerId, "Dispute opened", `${dispSummary}: ${reason}`, { type: "order", orderId: orderId });
 
+    // Pattern-Detection: bei ≥3 / ≥5 Disputes in 6 Monaten Auto-Sanktion.
+    // Try/catch damit der Hauptpfad nicht blockt — der Dispute ist bereits
+    // erfolgreich geoeffnet, Pattern-Detection ist nice-to-have.
+    try {
+      await _evaluateDisputePatternSanction(order.sellerId, orderId);
+    } catch (patternErr) {
+      console.error(
+        `openDispute: pattern-detection failed for seller=${order.sellerId} order=${orderId}: ${patternErr.message}`,
+      );
+    }
+
     return { success: true };
   }
 );
@@ -5889,6 +5900,165 @@ exports.adminResolveDispute = onCall(
  *
  * Audit-Log: `artifacts/{APP_ID}/users/{targetUid}/data/sanctionAudit/{auto}`
  */
+/**
+ * _applyAccountSanction — Internal helper, callable von HTTP-Wrappern UND
+ * von internen Pattern-Detection-Pfaden (siehe `_evaluateDisputePatternSanction`).
+ *
+ * Macht die eigentliche Sanktions-Arbeit: Listings-Status-Flip, trustLevel-
+ * Update, Audit-Log, Notification. Ist sich der Aufrufer-Identitaet bewusst
+ * (`adminUid` Parameter — bei Pattern-Detection ist das `"system_pattern_detection"`),
+ * damit der Audit-Log nachvollziehbar bleibt.
+ *
+ * Args:
+ *   - targetUid (string, required)
+ *   - actionType ("pauseListings" | "ban" | "lift", required)
+ *   - reason (string, ≥5 chars, required)
+ *   - adminUid (string, required) — UID des Admins ODER "system_*"-Marker
+ *     fuer automatische Sanktionen
+ *   - durationDays (number, optional) — nur fuer pauseListings, default 30,
+ *     clamp 1-365
+ *   - actionLabel (string, optional) — Audit-Log-Marker, default
+ *     "adminAccountSanction" (HTTP-Caller). Pattern-Detection setzt
+ *     "auto_pattern_sanction".
+ *
+ * Wirft Error wenn `actionType` ungueltig — Validation der HTTP-Inputs ist
+ * Aufgabe des Wrappers, dieser Helper validiert nur das Notwendigste.
+ */
+async function _applyAccountSanction({
+  targetUid,
+  actionType,
+  reason,
+  adminUid,
+  durationDays,
+  actionLabel = "adminAccountSanction",
+}) {
+  const VALID_ACTIONS = ["pauseListings", "ban", "lift"];
+  if (!VALID_ACTIONS.includes(actionType)) {
+    throw new Error(`actionType must be one of: ${VALID_ACTIONS.join(", ")}`);
+  }
+
+  let pausedUntilIso = null;
+  if (actionType === "pauseListings") {
+    const days = Number.isFinite(durationDays)
+      ? Math.max(1, Math.min(365, Math.round(durationDays)))
+      : 30;
+    pausedUntilIso = new Date(Date.now() + days * 24 * 60 * 60 * 1000)
+      .toISOString();
+  }
+
+  const trustRef = db.doc(`artifacts/${APP_ID}/users/${targetUid}/data/trustLevel`);
+  const trustSnap = await trustRef.get();
+  const previousLevel = trustSnap.exists
+    ? (trustSnap.data().level || "new")
+    : "new";
+
+  const auditRef = db.collection("artifacts").doc(APP_ID)
+    .collection("users").doc(targetUid)
+    .collection("data").doc("sanctionAudit").collection("entries").doc();
+  const auditEntry = {
+    timestamp: admin.firestore.FieldValue.serverTimestamp(),
+    adminUid,
+    action: actionLabel,
+    actionType,
+    reason: reason.substring(0, 500),
+    previousLevel,
+    ...(pausedUntilIso ? { pausedUntil: pausedUntilIso } : {}),
+  };
+
+  const listingsRef = db.collection("artifacts").doc(APP_ID).collection("listings");
+  let listingsAffected = 0;
+
+  if (actionType === "pauseListings" || actionType === "ban") {
+    const activeSnap = await listingsRef
+      .where("sellerId", "==", targetUid)
+      .where("status", "==", "active")
+      .get();
+    for (const doc of activeSnap.docs) {
+      await doc.ref.update({
+        status: "paused",
+        pausedAt: admin.firestore.FieldValue.serverTimestamp(),
+        pausedReason: actionType === "ban" ? "account_banned" : "admin_sanction",
+        ...(pausedUntilIso ? { pausedUntil: pausedUntilIso } : {}),
+      });
+      listingsAffected++;
+    }
+  } else if (actionType === "lift") {
+    const pausedSnap = await listingsRef
+      .where("sellerId", "==", targetUid)
+      .where("status", "==", "paused")
+      .where("pausedReason", "in", ["admin_sanction", "account_banned"])
+      .get();
+    for (const doc of pausedSnap.docs) {
+      await doc.ref.update({
+        status: "active",
+        pausedAt: admin.firestore.FieldValue.delete(),
+        pausedReason: admin.firestore.FieldValue.delete(),
+        pausedUntil: admin.firestore.FieldValue.delete(),
+      });
+      listingsAffected++;
+    }
+  }
+
+  let newLevel;
+  let newFlags;
+  if (actionType === "pauseListings") {
+    newLevel = "suspended";
+    newFlags = admin.firestore.FieldValue.arrayUnion("listings_paused");
+  } else if (actionType === "ban") {
+    newLevel = "banned";
+    newFlags = admin.firestore.FieldValue.arrayUnion("account_banned");
+  } else if (actionType === "lift") {
+    const completedSales = trustSnap.exists
+      ? (trustSnap.data().completedSales || 0)
+      : 0;
+    newLevel = completedSales >= 10 ? "established" : "new";
+    newFlags = admin.firestore.FieldValue.arrayRemove(
+      "listings_paused",
+      "account_banned",
+    );
+  }
+
+  await trustRef.set({
+    level: newLevel,
+    flags: newFlags,
+    lastSanctionAt: admin.firestore.FieldValue.serverTimestamp(),
+    lastSanctionReason: reason.substring(0, 500),
+    lastSanctionType: actionType,
+    ...(pausedUntilIso ? { sanctionPausedUntil: pausedUntilIso } : {}),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  }, { merge: true });
+
+  await auditRef.set({
+    ...auditEntry,
+    newLevel,
+    listingsAffected,
+  });
+
+  const notifTitle = actionType === "pauseListings"
+    ? "Listings pausiert"
+    : actionType === "ban"
+      ? "Account gesperrt"
+      : "Sperre aufgehoben";
+  const notifBody = actionType === "lift"
+    ? `Deine Account-Sperre wurde aufgehoben. Listings reaktiviert.`
+    : `${listingsAffected} Listings wurden ${actionType === "ban" ? "gesperrt" : "pausiert"}. Begruendung: ${reason.substring(0, 100)}`;
+  sendNotification(targetUid, notifTitle, notifBody, { type: "account" });
+
+  console.log(
+    `_applyAccountSanction: target=${targetUid} action=${actionType} ` +
+    `listingsAffected=${listingsAffected} newLevel=${newLevel} ` +
+    `by=${adminUid} (${actionLabel})`,
+  );
+
+  return {
+    actionType,
+    previousLevel,
+    newLevel,
+    listingsAffected,
+    ...(pausedUntilIso ? { pausedUntil: pausedUntilIso } : {}),
+  };
+}
+
 exports.adminAccountSanction = onCall(
   { region: "europe-west1", timeoutSeconds: 30 },
   async (request) => {
@@ -5904,11 +6074,10 @@ exports.adminAccountSanction = onCall(
     if (!targetUid || typeof targetUid !== "string") {
       throw new HttpsError("invalid-argument", "targetUid required");
     }
-    const VALID_ACTIONS = ["pauseListings", "ban", "lift"];
-    if (!VALID_ACTIONS.includes(actionType)) {
+    if (!["pauseListings", "ban", "lift"].includes(actionType)) {
       throw new HttpsError(
         "invalid-argument",
-        `actionType must be one of: ${VALID_ACTIONS.join(", ")}`,
+        "actionType must be one of: pauseListings, ban, lift",
       );
     }
     if (!reason || typeof reason !== "string" || reason.length < 5) {
@@ -5917,18 +6086,6 @@ exports.adminAccountSanction = onCall(
         "reason (≥5 chars) required for audit",
       );
     }
-
-    // durationDays nur fuer pauseListings; default 30, clamp 1-365
-    let pausedUntilIso = null;
-    if (actionType === "pauseListings") {
-      const days = Number.isFinite(durationDays)
-        ? Math.max(1, Math.min(365, Math.round(durationDays)))
-        : 30;
-      pausedUntilIso = new Date(Date.now() + days * 24 * 60 * 60 * 1000)
-        .toISOString();
-    }
-
-    // Self-sanction blockieren (Admin koennte sich aus Versehen selbst sperren)
     if (targetUid === request.auth.uid && actionType !== "lift") {
       throw new HttpsError(
         "failed-precondition",
@@ -5936,134 +6093,133 @@ exports.adminAccountSanction = onCall(
       );
     }
 
-    const trustRef = db.doc(`artifacts/${APP_ID}/users/${targetUid}/data/trustLevel`);
-    const trustSnap = await trustRef.get();
-    const previousLevel = trustSnap.exists
-      ? (trustSnap.data().level || "new")
-      : "new";
-
-    // Audit-Log immer (auch bei Fehlern in den nachfolgenden Schritten)
-    const auditRef = db.collection("artifacts").doc(APP_ID)
-      .collection("users").doc(targetUid)
-      .collection("data").doc("sanctionAudit").collection("entries").doc();
-    const auditEntry = {
-      timestamp: admin.firestore.FieldValue.serverTimestamp(),
-      adminUid: request.auth.uid,
-      action: "adminAccountSanction",
+    const result = await _applyAccountSanction({
+      targetUid,
       actionType,
-      reason: reason.substring(0, 500),
-      previousLevel,
-      ...(pausedUntilIso ? { pausedUntil: pausedUntilIso } : {}),
-    };
-
-    // Listings-Update je nach Action
-    const listingsRef = db.collection("artifacts").doc(APP_ID).collection("listings");
-    let listingsAffected = 0;
-
-    if (actionType === "pauseListings" || actionType === "ban") {
-      // Aktive + reservierte Listings des Users pausieren.
-      // Reservierte Listings bleiben reserviert (laufende Orders muessen
-      // fortgefuehrt oder explizit storniert werden — die Pause greift erst
-      // wenn die Reservation aufgeloest ist).
-      const activeSnap = await listingsRef
-        .where("sellerId", "==", targetUid)
-        .where("status", "==", "active")
-        .get();
-      for (const doc of activeSnap.docs) {
-        await doc.ref.update({
-          status: "paused",
-          pausedAt: admin.firestore.FieldValue.serverTimestamp(),
-          pausedReason: actionType === "ban" ? "account_banned" : "admin_sanction",
-          ...(pausedUntilIso ? { pausedUntil: pausedUntilIso } : {}),
-        });
-        listingsAffected++;
-      }
-    } else if (actionType === "lift") {
-      // Pausierte Listings reaktivieren — aber nur die, die durch
-      // adminAccountSanction pausiert wurden (pausedReason in den von uns
-      // gesetzten Werten). Andere Pause-Quellen (z.B. Pre-Release-Cap)
-      // bleiben unberuehrt.
-      const pausedSnap = await listingsRef
-        .where("sellerId", "==", targetUid)
-        .where("status", "==", "paused")
-        .where("pausedReason", "in", ["admin_sanction", "account_banned"])
-        .get();
-      for (const doc of pausedSnap.docs) {
-        await doc.ref.update({
-          status: "active",
-          pausedAt: admin.firestore.FieldValue.delete(),
-          pausedReason: admin.firestore.FieldValue.delete(),
-          pausedUntil: admin.firestore.FieldValue.delete(),
-        });
-        listingsAffected++;
-      }
-    }
-
-    // trustLevel-Update
-    let newLevel;
-    let newFlags;
-    if (actionType === "pauseListings") {
-      newLevel = "suspended";
-      newFlags = admin.firestore.FieldValue.arrayUnion("listings_paused");
-    } else if (actionType === "ban") {
-      newLevel = "banned";
-      newFlags = admin.firestore.FieldValue.arrayUnion("account_banned");
-    } else if (actionType === "lift") {
-      // Auf established/new zurueck — abhaengig von completedSales
-      const completedSales = trustSnap.exists
-        ? (trustSnap.data().completedSales || 0)
-        : 0;
-      newLevel = completedSales >= 10 ? "established" : "new";
-      newFlags = admin.firestore.FieldValue.arrayRemove(
-        "listings_paused",
-        "account_banned",
-      );
-    }
-
-    await trustRef.set({
-      level: newLevel,
-      flags: newFlags,
-      lastSanctionAt: admin.firestore.FieldValue.serverTimestamp(),
-      lastSanctionReason: reason.substring(0, 500),
-      lastSanctionType: actionType,
-      ...(pausedUntilIso ? { sanctionPausedUntil: pausedUntilIso } : {}),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    }, { merge: true });
-
-    // Audit-Log finalisieren
-    await auditRef.set({
-      ...auditEntry,
-      newLevel,
-      listingsAffected,
+      reason,
+      adminUid: request.auth.uid,
+      durationDays,
+      actionLabel: "adminAccountSanction",
     });
 
-    // Notification
-    const notifTitle = actionType === "pauseListings"
-      ? "Listings pausiert"
-      : actionType === "ban"
-        ? "Account gesperrt"
-        : "Sperre aufgehoben";
-    const notifBody = actionType === "lift"
-      ? `Deine Account-Sperre wurde aufgehoben. Listings reaktiviert.`
-      : `${listingsAffected} Listings wurden ${actionType === "ban" ? "gesperrt" : "pausiert"}. Begruendung: ${reason.substring(0, 100)}`;
-    sendNotification(targetUid, notifTitle, notifBody, { type: "account" });
-
-    console.log(
-      `adminAccountSanction: target=${targetUid} action=${actionType} ` +
-      `listingsAffected=${listingsAffected} newLevel=${newLevel} ` +
-      `by=${request.auth.uid}`,
-    );
-
-    return {
-      success: true,
-      actionType,
-      previousLevel,
-      newLevel,
-      listingsAffected,
-      ...(pausedUntilIso ? { pausedUntil: pausedUntilIso } : {}),
-    };
+    return { success: true, ...result };
   },
 );
+
+/**
+ * _evaluateDisputePatternSanction — Pattern-Detection bei Verkaeufer-Disputes.
+ *
+ * **Discogs-Modell-Komponente (2026-04-30):**
+ * Zaehlt die Disputes der letzten 6 Monate gegen einen Verkaeufer und
+ * triggert automatische Sanktionen ohne Geldbewegung (Hausrecht):
+ *   - ≥3 Disputes/6 Monate → 30 Tage Listings-Pause
+ *   - ≥5 Disputes/6 Monate → permanenter Account-Ban
+ *
+ * Wird von `openDispute` nach erfolgreichem Status-Update aufgerufen
+ * (try/catch um den Aufruf, damit Pattern-Detection den openDispute-
+ * Hauptpfad nicht blocken kann).
+ *
+ * Idempotenz: wenn der Verkaeufer schon `banned` ist, wird nicht erneut
+ * sanktioniert. Bei `suspended` (= bereits Listings-Pause aktiv) UND
+ * Eskalation auf ≥5 → Eskalation zu Ban (lift gefolgt von ban).
+ *
+ * @returns {object|null} Sanktion-Ergebnis oder null wenn keine Aktion
+ */
+async function _evaluateDisputePatternSanction(sellerId, currentOrderId) {
+  if (!sellerId) return null;
+
+  const sixMonthsAgoMs = Date.now() - 6 * 30 * 24 * 60 * 60 * 1000;
+  const sixMonthsAgoIso = new Date(sixMonthsAgoMs).toISOString();
+
+  // Disputes des Verkaeufers in den letzten 6 Monaten zaehlen.
+  // disputedAt wird in openDispute auf serverTimestamp gesetzt — nur Orders
+  // mit disputedAt sind „echte" Disputes.
+  const ordersRef = db.collection("artifacts").doc(APP_ID).collection("orders");
+  const recentDisputesSnap = await ordersRef
+    .where("sellerId", "==", sellerId)
+    .where("disputedAt", ">=", sixMonthsAgoIso)
+    .get();
+
+  const disputeCount = recentDisputesSnap.size;
+  console.log(
+    `_evaluateDisputePatternSanction: seller=${sellerId} ` +
+    `recent_disputes_6mo=${disputeCount} (current order ${currentOrderId})`,
+  );
+
+  if (disputeCount < 3) return null;
+
+  // Aktuellen trustLevel pruefen — falls schon banned, nichts mehr tun.
+  const trustSnap = await db.doc(
+    `artifacts/${APP_ID}/users/${sellerId}/data/trustLevel`,
+  ).get();
+  const currentLevel = trustSnap.exists
+    ? (trustSnap.data().level || "new")
+    : "new";
+
+  if (currentLevel === "banned") {
+    console.log(
+      `_evaluateDisputePatternSanction: seller=${sellerId} already banned — skip`,
+    );
+    return null;
+  }
+
+  // Sanktions-Stufe waehlen
+  let actionType;
+  let reason;
+  if (disputeCount >= 5) {
+    actionType = "ban";
+    reason = `Auto-sanction: ${disputeCount} disputes in last 6 months (≥5 threshold = ban). Triggered by order ${currentOrderId}.`;
+  } else {
+    actionType = "pauseListings";
+    reason = `Auto-sanction: ${disputeCount} disputes in last 6 months (≥3 threshold = 30d listings-pause). Triggered by order ${currentOrderId}.`;
+  }
+
+  // Wenn schon "suspended" (= Listings-Pause aktiv) und neue Schwelle ist
+  // ≥5: erst lift (clean state), dann ban. Sonst direkter Sanktions-Apply.
+  if (currentLevel === "suspended" && actionType === "ban") {
+    try {
+      await _applyAccountSanction({
+        targetUid: sellerId,
+        actionType: "lift",
+        reason: "Lifting prior suspension before escalation to ban",
+        adminUid: "system_pattern_detection",
+        actionLabel: "auto_pattern_sanction",
+      });
+    } catch (e) {
+      console.error(
+        `_evaluateDisputePatternSanction lift-before-ban failed: ${e.message}`,
+      );
+      // Trotzdem versuchen direkt zu bannen — pause bleibt sonst aktiv,
+      // aber level wird neu gesetzt
+    }
+  }
+
+  // Bei 30-Tage-Pause: nur ausfuehren wenn nicht schon suspended (Idempotenz).
+  // Bei ban: ausfuehren auch wenn suspended (Eskalation).
+  if (actionType === "pauseListings" && currentLevel === "suspended") {
+    console.log(
+      `_evaluateDisputePatternSanction: seller=${sellerId} already suspended ` +
+      `with ${disputeCount} disputes (still <5) — no escalation yet`,
+    );
+    return null;
+  }
+
+  const result = await _applyAccountSanction({
+    targetUid: sellerId,
+    actionType,
+    reason,
+    adminUid: "system_pattern_detection",
+    durationDays: actionType === "pauseListings" ? 30 : undefined,
+    actionLabel: "auto_pattern_sanction",
+  });
+
+  console.log(
+    `_evaluateDisputePatternSanction: APPLIED ${actionType} on seller=${sellerId} ` +
+    `(${disputeCount} disputes/6mo, prev_level=${currentLevel})`,
+  );
+
+  return { ...result, disputeCount, triggerOrderId: currentOrderId };
+}
 
 /**
  * recalculateAllSellerTiers — Daily-Cron als Fallback.
