@@ -187,6 +187,10 @@ Test-Suite: `functions/test-scenarios/phase8_e2e_tests.js` — 46/46 Checks grue
 > - `/Users/exqbitmac/Riftstats/Riftr_Anwalt_Briefing.md` — Anwalts-Briefing
 > - `/Users/exqbitmac/Riftstats/Riftr_ZAG_Gutachten.md` — Eigen-Compliance-Gutachten (14 Seiten, mit BaFin-Originalzitat)
 > - `/Users/exqbitmac/Riftstats/Riftr_BaFin_Merkblatt_ZAG.md` — Frozen-Backup BaFin-Merkblatt (Zeile 572 = Persilschein-Satz)
+> - `/Users/exqbitmac/Riftstats/Riftr_AGB_Klauseln_Discogs_Modell.md` — Drop-In-AGB-Entwuerfe fuer Anwalts-Review
+> - `/Users/exqbitmac/Riftstats/Riftr_Anwalt_Email_Entwurf.md` — Annerton-Erstberatungs-Email-Entwurf
+> - `/Users/exqbitmac/Riftstats/Riftr_Discogs_Deploy_Anleitung.md` — Deploy + Smoke-Test-Walkthrough
+> - `/Users/exqbitmac/Riftstats/Riftr_Admin_Disputes_Handbuch.md` — Tag-zu-Tag-Referenz fuer Admin-Disputes-Workflow (Discogs-Modell-Erklaerung, 3 Aktionen, Auto-Crons, Pattern-Detection, Notfall-Szenarien)
 > - `/Users/exqbitmac/Riftstats/Cardmarket_Reference/` — Cardmarket-AGB/Seller-Guide/Privacy/Widerruf als Vorlagenmaterial (lokal gesichert via Wayback Machine, 30.04.2026)
 >
 > Status-Snapshot fuer Cross-Session-Kontinuitaet — wenn der Context resetted, hier ist der aktuelle Stand.
