@@ -83,6 +83,13 @@ void main() {
 
     test('Keine doppelten Set+CollectorNumber+Rarity Kombinationen', () {
       // Metal cards share Col# with standard promos — differentiated by rarity
+      // (Showcase-Metal vs Common-Promo). alternate_art=true Variants (z.B.
+      // Champion-Versionen wie "Edge of Night (SFDX Champion)") teilen Set+
+      // Col+Rarity bewusst mit dem Regular-Promo — sie sind verschiedene
+      // Druckungen derselben Karte. Daher: alternate_art-Karten von der
+      // Uniqueness-Pruefung ausnehmen (2026-04-30, korrigiert nach physischer
+      // Pruefung der Champion-Variants durch User — die sind Rare wie der
+      // regulaere Promo, nicht Showcase).
       final seen = <String>{};
       final dupes = <String>[];
       for (final c in cards) {
@@ -90,6 +97,8 @@ void main() {
         final col = (c['collector_number'] ?? '').toString();
         final rarity = (c['classification'] as Map?)?['rarity'] as String? ?? '';
         if (col.isEmpty || col == 'null') continue;
+        final meta = c['metadata'] as Map<String, dynamic>? ?? {};
+        if (meta['alternate_art'] == true) continue;
         final key = '$setId|$col|$rarity';
         if (!seen.add(key)) {
           dupes.add('${c['name']} $key');
@@ -243,15 +252,9 @@ void main() {
         // Showcase on a promo is OK if the card is genuinely Showcase (special promo art)
         // Only flag if Showcase but base card isn't Showcase and it's clearly wrong
         if (expected != null && expected != 'Showcase' && rarity == 'Showcase' && rarity != expected) {
-          // Allow known Showcase promos (GG EZ Teemo, Project K, Champion-Variants, etc.)
+          // Allow known Showcase promos (GG EZ Teemo, Project K, etc.)
           final col = (c['collector_number'] ?? '').toString();
-          final displayName = (c['display_name'] ?? '').toString();
-          // 2026-04-30: "(... Champion)"-Suffix kennzeichnet Champion-Showcase-Variants
-          // (z.B. "Edge of Night (SFDX Champion)") — legitime Showcase-Variants,
-          // nicht falsche Daten. Vorher schlug der Test hier auf.
-          final isKnownShowcasePromo = col == 'FND196' ||
-              displayName.contains('GG EZ') ||
-              displayName.contains('Champion)');
+          final isKnownShowcasePromo = col == 'FND196' || (c['display_name'] ?? '').toString().contains('GG EZ');
           if (!isKnownShowcasePromo) {
             bad.add('$name ($setId) rarity=$rarity expected=$expected');
           }
