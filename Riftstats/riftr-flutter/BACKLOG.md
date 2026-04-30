@@ -154,6 +154,306 @@ Test-Suite: `functions/test-scenarios/phase8_e2e_tests.js` — 46/46 Checks grue
 
 ---
 
+## 🚀 PRE-LAUNCH LEGAL TRACK (Stand: 30.04.2026)
+
+### 📊 KOMPAKT-OVERVIEW (TLDR fuer Cross-Session-Wiedereinstieg)
+
+**ZAG-Position:** Nicht erlaubnispflichtig nach BaFin-Merkblatt. Eigen-Gutachten + Frozen-Merkblatt liegen vor. Anwaltliche Erstberatung (€300-500) als Versicherung geplant.
+
+**Dispute-Modell:** Discogs-Modell entschieden (Industriestandard, durch Cardmarket-Recherche bestaetigt). Riftr vermittelt nur, entscheidet KEINE Refunds einseitig. Externe Wege bei Streitfall (Stripe-Chargeback, Schlichtung, Polizei).
+
+**Critical-Path zum Launch:**
+1. ✅ **Code-Refactor abgeschlossen (30.04.2026):** Discogs-Modell-Implementation in 7 Commits (a361a09, 6a131e5, ffca37a, 1e54a0f, d0ff665, 9645bbe, 1932f64) plus 21b7da9 (preexisting Test-Fixes). Details siehe „ARCHITEKTUR-REFACTOR" Sektion unten — alle Punkte abgehakt.
+2. **AGB-Klauseln**: § Streitbeilegung + § Refund-Policy auf Discogs-Modell umschreiben (Cardmarket-Wording als Inspiration)
+3. **Anwaltliche Erstberatung**: 1-2h-Termin bei PayTech-Spezialist, Eigen-Gutachten + Architektur vorlegen, Aktennotiz holen
+4. **UG gruenden + Haendlerbund + Steuerberater + IT-Haftpflicht** parallel
+5. **Stripe Live-Mode** beantragen sobald UG-KYC durch
+
+**Realistisches Setup-Budget:** €3.000-4.200 (Lean Path)
+
+**Konsolidiert verworfen** (war Theater oder unwartbar):
+- Foto-Beleg-Pflicht beim Versand
+- Auspack-Video-Pflicht
+- Strafanzeige-Helper-PDF (30 Laender unmoeglich)
+- Insured-Pflicht ab harter Schwelle (Cardmarket macht das auch nicht)
+- 3-Kanzlei-Vergleichsverfahren (Solo-Founder-Overkill)
+- Qualifiziertes ZAG-Memo €3-5k (BaFin-Merkblatt deckt die Position selbst)
+
+---
+
+
+> **Single Source of Truth fuer alles Anwalts-/AGB-/Compliance-Relevante vor Launch.**
+> Begleit-Dokumente:
+> - `/Users/exqbitmac/Riftstats/Riftr_Anwalt_Briefing.md` — Anwalts-Briefing
+> - `/Users/exqbitmac/Riftstats/Riftr_ZAG_Gutachten.md` — Eigen-Compliance-Gutachten (14 Seiten, mit BaFin-Originalzitat)
+> - `/Users/exqbitmac/Riftstats/Riftr_BaFin_Merkblatt_ZAG.md` — Frozen-Backup BaFin-Merkblatt (Zeile 572 = Persilschein-Satz)
+> - `/Users/exqbitmac/Riftstats/Cardmarket_Reference/` — Cardmarket-AGB/Seller-Guide/Privacy/Widerruf als Vorlagenmaterial (lokal gesichert via Wayback Machine, 30.04.2026)
+>
+> Status-Snapshot fuer Cross-Session-Kontinuitaet — wenn der Context resetted, hier ist der aktuelle Stand.
+
+### 📍 Aktueller Punkt im Prozess
+
+**Strategie-Updates (30.04.2026 nach Refund-Engine-Audit + Cardmarket-Vergleich):**
+
+1. **ZAG-Memo:** „qualifiziertes Memo €3-5k" → **anwaltliche Erstberatung €300-500**. Begruendung: BaFin-Merkblatt zum ZAG (Stand 31.03.2026) bestaetigt unsere Konstellation explizit als nicht erlaubnispflichtig (siehe `Riftr_BaFin_Merkblatt_ZAG.md` Zeile 572 + `Riftr_ZAG_Gutachten.md` Sektion D.7.0).
+
+2. **Dispute-Modell: Discogs-Modell statt eigenes Schiedsverfahren**. Begruendung:
+   - Cardmarket-Recherche bestaetigt: Discogs-Modell ist Industriestandard auch fuer P2P-Sammler-Marktplaetze (`Cardmarket_Reference/cm_help_SellerGuide.md` belegt: Refunds zwischen Parteien manuell, Plattform vermittelt nur)
+   - User-Kernerkenntnis (Polizist-Perspektive): Plattform kann bei widersprechenden Aussagen ohne objektive Beweise nicht entscheiden — also auch nicht so tun
+   - **Konsequenz:** Aktuelles `adminResolveDispute` mit `refundPercent > 0` muss vor Launch entfernt werden — das ist „Einwirkungsmoeglichkeit auf den Zahlungsfluss" und kippt die ZAG-Befreiungs-Position
+
+3. **Verworfen aus frueheren Vorschlaegen** (Theater statt echtem Schutz):
+   - Foto-Beleg-Pflicht beim Versand → Verkaeufer kann Foto machen + leeren Brief schicken
+   - Auspack-Video-Pflicht → Kaeufer kann Karte vorher rausholen + dann „leeren" Brief filmen
+   - Strafanzeige-Helper-PDF → bei 30 Laendern unwartbar; Adress-Daten sind ueber Order-Detail-View ohnehin verfuegbar
+   - Insured-Pflicht ab harter Schwelle → Cardmarket macht das auch nicht; Verkaeufer-Eigenverantwortung reicht
+
+**Schubladen-Dokumente liegen bereit:**
+- `Riftr_ZAG_Gutachten.md` — 14-Seiten-Eigen-Gutachten mit BaFin-Originalzitat
+- `Riftr_BaFin_Merkblatt_ZAG.md` + `.html` — lokal gesicherte BaFin-Quelle
+- `Cardmarket_Reference/cm_AGB_Magic.md` — Cardmarket-AGB als Wording-Vorlage (40k chars)
+- `Cardmarket_Reference/cm_Widerruf_Magic.md` — Cardmarket-Widerrufsbelehrung als Vorlage
+- `Cardmarket_Reference/cm_Privacy_Magic.md` — Cardmarket-Privacy-Policy als Vorlage (71k chars)
+- `Cardmarket_Reference/cm_help_SellerGuide.md` — Cardmarket-Seller-Guide (14k chars, Originalsprache englisch)
+
+**AGB-Status:**
+- KI-Anwalt hat **5 Drop-In-Klauseln** finalisiert: § Vermittlerstellung, § Zahlungsabwicklung, § Service-Gebuehr/Provision, § Streitbeilegung, § Refund-Policy
+- Plus separate **§ X Verkaeufer-Status, Schwellenwerte und Re-Deklaration** Klausel (DAC7-aligned, BGB-fest)
+- **§ Streitbeilegung + § Refund-Policy MUESSEN auf Discogs-Modell umgeschrieben werden** (siehe Architektur-Refactor unten)
+
+**Naechster Schritt:**
+1. Code-Refactor Discogs-Modell (siehe Backend-Track)
+2. AGB-Klauseln § Streitbeilegung + § Refund-Policy anpassen (Cardmarket-Wording als Vorlage nutzen)
+3. **EINE** anwaltliche Erstberatung bei PayTech-Spezialist (~1-2h, €300-500) — Gutachten + Merkblatt + Architektur-Plan vorlegen, muendliche Bestaetigung + Aktennotiz holen
+
+### 🟦 ANWALT-TRACK (vereinfacht — Lean Path)
+- [ ] **EINE** PayTech-Kanzlei auswaehlen (Empfehlung: Annerton — staerkste Reputation im PayTech-Bereich)
+- [ ] Email-Adresse selbst verifizieren ueber Kanzlei-Website:
+      - **Annerton:** [annerton.com](https://annerton.com) Kontaktformular oder LinkedIn (PayTech-Partner: Lutz Auffenberg / Frank Mueller / Alireza Siadat)
+      - Backup falls Annerton ablehnt: PayTechLaw/Aderhold (Susanne Grohé) oder Winheller
+- [ ] Kurze Email mit 6 Bullet Points senden:
+      - UG i.G., Sitz NRW, geplant Q2 2026
+      - Mobile App (App-only), Vermittlung von Sammelkarten-Kaeufen
+      - Geo-Scope EU/EWR (kein UK/CH)
+      - **Stripe Connect Standard** mit Destination Charges + application_fee_amount
+      - B2C + P2P (privat + gewerblich) ab Tag 1
+      - Bitte um **Erstberatung 1-2h (€300-500)** zur Bestaetigung, dass kein ZAG-Erlaubnistatbestand erfuellt ist; eigenes Gutachten + BaFin-Merkblatt-Auszug liegen vor
+- [ ] Beim Termin **mitbringen / vorab senden**:
+      - `Riftr_ZAG_Gutachten.md` als PDF
+      - `Riftr_BaFin_Merkblatt_ZAG.md` (Zeile 572 markiert)
+      - Architektur-Skizze (1 Seite, Stripe Connect Standard Flow)
+- [ ] Im Termin holen: **muendliche Bestaetigung + 1-Seiten-Aktennotiz** auf Kanzlei-Briefkopf
+- [ ] Visitenkarte des Anwalts in Schublade fuer Notfall (BaFin-Auskunftsersuchen, Stripe Live-Review-Frage etc.)
+- [ ] **Volles ZAG-Memo (€3-5k) erst Phase 2 wenn:** Stripe Live-Review explizit verlangt, Funding-Runde geplant, Volumen >€50k/Monat erreicht
+
+### 🟦 AGB-TRACK
+**Bereits finalisiert (warten auf Anwalts-Gegenzeichnung):**
+- [x] § Vermittlerstellung (mit App-only-Korrektur — KI-Anwalt hat Korrektur in finaler Version drin: "mobile Anwendung" statt "[www.getriftr.app] und mobile Anwendung")
+- [x] § Zahlungsabwicklung (ZAG-Befreiungs-Argumentation, Destination Charges + application_fee_amount, "keine Verfuegungsmacht")
+- [x] § Service-Gebuehr (Kaeufer) und Provision (Verkaeufer) — inkl. Refund-Policy-Cases (a-d)
+- [⚠️] § Streitbeilegung und Schlichtungs-Service — **MUSS umgeschrieben werden auf Discogs-Modell** (alte Version: „interner Schlichtungs-Service mit Loesungsvorschlag" ist nicht mehr passend, weil wir adminResolveDispute mit Geld-Routing entfernen). Neue Version: Riftr ist kein Schiedsgericht, verweist auf 1) Stripe-Chargeback, 2) Verbraucherschlichtung, 3) Zivilrechtsweg. Verkaeufer-Verantwortung-Klausel aus Cardmarket-AGB als Vorlage.
+- [⚠️] § Refund-Policy und Rueckabwicklung — **MUSS angepasst werden auf Discogs-Modell**. Refunds nur via: a) Konsens (mutual respondToRefund), b) objektive Trigger (Tracking-not-shipped 14d, Verkaeufer-Schweigen 7d). KEINE einseitige Plattform-Refund-Entscheidung mehr.
+- [x] § X Verkaeufer-Status, Schwellenwerte und Re-Deklaration (finalisiert nach Korrekturen):
+      - Soft-Schwelle: 20 Tx ODER €1.200/Jahr
+      - Hard-Schwelle: 30 Tx ODER €1.800/Jahr (DAC7-aligned, § 4 Abs. 5 Satz 1 Nr. 4 PStTG, mit Sicherheitsabstand zur €2.000-Bagatellgrenze)
+      - Counter-Reset: 1. Januar 00:00 UTC pro Kalenderjahr
+      - Definition "abgeschlossener Verkauf" = Zahlung + Stripe-Gutschrift + keine Rueckabwicklung im delay_days-Zeitraum; Rechtsgeschaeftsabschluss zaehlt, nicht Artikelzahl
+      - Bei Schwellen-Erreichen: 14 Tage Re-Deklaration → sonst Listing-Suspension fuer NEUE Listings (Bestand bleibt)
+      - **Keine** stille Re-Klassifizierung durch Riftr (§ 308 Nr. 4 BGB-fest)
+      - Schwellen sind keine Freigrenzen
+      - § 14 BGB ohne Gewinnerzielungsabsicht (Anfaenger-Fehler korrigiert)
+
+**Noch zu liefern (offen beim KI-Anwalt / spaeter Aufsichtsrechtler):**
+- [ ] § Streitbeilegung — Neuversion auf Discogs-Modell (siehe Architektur-Refactor unten)
+- [ ] § Refund-Policy — Neuversion mit Konsens + objektive Trigger
+- [ ] § Verkaeufer-Verantwortung — Wording aus Cardmarket-AGB als Inspiration: „As the seller, you have to pay all costs related to any mistake you make regarding the order"
+- [ ] DSA-Beschwerdeklauseln (Art. 16 Notice-and-Action, Art. 17 Begruendungspflicht, Art. 20 Beschwerdeweg)
+- [ ] Widerrufsbelehrung als Anhang (nur fuer Kaeufe von gewerblichen Verkaeufern, §§ 312g, 355 BGB) — Cardmarket-Widerruf als Vorlage in `Cardmarket_Reference/cm_Widerruf_Magic.md`
+- [ ] Wash-Trading- / Sock-Puppet-Verbot
+- [ ] DAC7-Hinweis im Verkaeufer-Onboarding
+- [ ] Multi-Seller-Cart-Klausel (Rangverhaeltnis bei mehreren Verkaeufern)
+- [ ] Account-Sperrung mit Begruendungspflicht (Art. 17 DSA)
+- [ ] Impressum (TMG § 5 / DDG § 5) — separat fuer App und Marketing-Site
+- [ ] Datenschutzerklaerung (DSGVO-konform mit Daten-Inventar) — Cardmarket-Privacy als Vorlage in `Cardmarket_Reference/cm_Privacy_Magic.md`
+- [ ] Cookie-Hinweis fuer getriftr.app Marketing-Site
+
+### 🟦 ARCHITEKTUR-REFACTOR: Dispute-System auf Discogs-Modell — ✅ ABGESCHLOSSEN (30.04.2026)
+
+**Hintergrund:** Aktuelles `adminResolveDispute` mit `refundPercent > 0` kann einseitig Geld vom Verkaeufer-Connected-Account zurueckholen (`stripe.refunds.create` mit `reverse_transfer: true`). Das ist „Einwirkungsmoeglichkeit auf den Zahlungsfluss" laut BaFin-Merkblatt → kippt die ZAG-Befreiungs-Position. Cardmarket selbst macht das auch nicht — sie vermitteln nur, Refunds laufen zwischen Parteien.
+
+**Commit-Historie (30.04.2026):**
+- `a361a09` — Refactor adminResolveDispute auf Seller-Win-only
+- `6a131e5` — adminAccountSanction CF + Frontend Discogs-Modell-Refactor
+- `ffca37a` — autoResolveStaleShipments cron (14d paid+unshipped)
+- `1e54a0f` — autoResolveSellerSilence cron (7d silent dispute)
+- `d0ff665` — Pattern-Detection (3 Disputes/6mo → 30d Pause, 5 → Ban)
+- `9645bbe` — €300 insured-shipping requirement
+- `1932f64` — Buyer escalation UI on dispute detail
+- `21b7da9` — Fix 2 preexisting test failures (serviceFee empty plan + Champion-Showcase)
+
+**Behalten (aktuell ZAG-konform):**
+- [x] `cancelOrder` (pre-ship) — kein echtes Refund-Issue, Geld noch nicht final
+- [x] `respondToRefund` (mutual consent) — Verkaeufer schlaegt vor, Kaeufer akzeptiert, Riftr fuehrt aus = 2-Parteien-Konsens
+- [x] First-5-Sales-Extra-Hold (Trustee-Pattern fuer neue Verkaeufer) ✅ existiert
+- [x] delay_days Tier-System (Account-Setting, kein Per-Order-Eingriff) ✅ existiert
+- [x] `capture_method: "manual"` mit Capture-on-Ship (verhindert Pre-Order-Vanish) ✅ existiert
+- [x] Sock-Puppet-Detection / Wash-Trading (Buyer-Seller-Pair-Velocity) ✅ existiert
+
+**Neu hinzufuegt:**
+- [x] **`autoResolveStaleShipments` Cron** (`ffca37a`)
+      - 04:30 Berlin daily, status=paid + paidAt≤14d → paymentIntents.cancel + Order cancelled + Strike + Notifications
+      - Kein refunds.create noetig (PI ist authorized aber nicht captured)
+- [x] **`autoResolveSellerSilence` Cron** (`1e54a0f`)
+      - 05:00 Berlin daily, disputed + disputeStatus=open + disputedAt≤7d → 100% Refund inkl. application_fee + Strike
+      - Idempotency-Key + State-Lock (auto_resolving) + Stripe-Error-Recovery
+- [x] **Buyer-Eskalations-Card** (`1932f64`) in `dispute_detail_screen.dart`
+      - 3 Pfade: Stripe-Chargeback (mit Order-Daten-Copy) / Schlichtungsstelle / Zivilrecht
+      - Visibility-Gate: nur fuer Buyer + disputed + ≥14d offen
+      - Disclaimer „Riftr ist kein Schiedsgericht — wir koennen bei widersprechenden Aussagen nicht entscheiden"
+- [x] **High-Value-Insured-Pflicht ab €300** (`9645bbe`, vom User von €1000 → €300 angepasst)
+      - Backend: createPaymentIntent + processMultiSellerCart erzwingen insured ab €300
+      - Frontend: ShippingRates.requiresInsured + quoteForBundle ehrt bundleValue, 8 Aufrufer-Updates
+- [x] **Pattern-Detection** (`d0ff665`) bei openDispute
+      - ≥3 Disputes/6 Monate → 30 Tage Listings-Pause
+      - ≥5 → permanenter Account-Ban
+      - Idempotent: bereits banned → skip; suspended + Eskalation auf ≥5 → lift+ban
+
+**Entfernt oder eingedampft:**
+- [x] **`adminResolveDispute` mit `refundPercent > 0`** (`a361a09`) — ENTFERNT
+      - Kein einseitiger Refund-Trigger durch Riftr-Admin mehr
+      - Geldbewegung bleibt komplett bei Stripe + Parteien
+- [x] **`adminResolveDispute` mit `refundPercent === 0`** (Verkaeufer-Win) → BEHALTEN als Order-State-Reset ohne Geldbewegung
+- [x] **`adminAccountSanction` CF** (`6a131e5`) — pauseListings/ban/lift, reines Hausrecht
+- [x] **Frontend `admin_disputes_screen.dart`** (`6a131e5`) — Quick-Action-Buttons komplett umgebaut:
+      - 0/25/50/75/100% Buttons → 3 neue (Reject Seller-Win / Pause 30d / Ban)
+      - Discogs-Modell-Hinweis-Banner ueber den Aktionen
+- [x] **Auto-Sperre via Pattern-Detection** (`d0ff665`) — siehe oben
+
+**Firestore Indexes (`d0ff665`):**
+- [x] `(orders.sellerId, disputedAt)` fuer Pattern-Detection-Query
+- [x] `(orders.status, disputeStatus, disputedAt)` fuer autoResolveSellerSilence-Cron
+
+**AGB-Anpassungen begleitend (NOCH OFFEN):**
+- [ ] § Streitbeilegung umschreiben: Riftr ist explizit kein Schiedsgericht, verweist auf externe Wege
+- [ ] § Refund-Policy umschreiben: nur Konsens + objektive Trigger (Cron-Auto-Refunds), externe Eskalation
+- [ ] Cardmarket-Vorlagen-Wording aus `Cardmarket_Reference/cm_AGB_Magic.md` und `cm_help_SellerGuide.md` als Inspirationsquelle nutzen (sinngemaess: „As the seller, you have to pay all costs related to any mistake you make regarding the order")
+- [ ] Insured-Pflicht ab €300 in AGB-Versand-Klausel + Listing-Form-Hint dokumentieren
+
+**Verifikation (30.04.2026, vor Launch):**
+- [x] node --check functions/index.js → clean
+- [x] flutter analyze lib/ → 0 neue Issues durch Refactor (178 preexisting in OCR/Service/Widgets)
+- [x] flutter test → 145/145 passed (vorher 143/145, +2 durch Test-Fixes in 21b7da9)
+- [ ] Sandbox-End-to-End-Test mit allen drei Cron-Pfaden + Pattern-Detection (manuell, mit Test-Orders)
+- [ ] Production-Deploy mit `firebase deploy --only firestore:indexes,functions` (Index-Build vor erstem Cron-Run)
+
+### 🟦 BACKEND/APP-TRACK (vor Launch zwingend erforderlich)
+
+**Ticket 1 — Pflicht-Username + Verkaeufer-Status-Onboarding** (haengt zusammen)
+- [ ] Pflicht-Username-Schritt nach Email-Registrierung (Bestandsaltlast: Listings zeigen "Unknown", Orders "Buyer")
+- [ ] Status-Wahl bei Erstanmeldung als Verkaeufer: **privat** (Verbraucher § 13 BGB) oder **gewerblich** (Unternehmer § 14 BGB)
+- [ ] Bei "gewerblich": Pflichtfelder Steuer-IdNr (11-stellig DE Format-Check), USt-IdNr (Format-Check + optional VIES-API gegen EU-Datenbank), Adress-Plausibilitaet, Pflicht-Hinweis-Checkbox zu Gewerbe-/USt-/Buchfuehrungspflichten
+
+**Ticket 2 — Verkaeufer-Status-UI**
+- [ ] Privat/Gewerblich-Badge auf:
+      - Listing-Tile (in Listen-Views)
+      - Listing-Detail (Card Detail View Market Tab)
+      - Seller-Profile-Page
+- [ ] Bei gewerblichen Verkaeufern: § 5 DDG / Art. 30 DSA-Pflichtinfos anzeigen (Firmierung, Adresse, USt-IdNr, etc.)
+
+**Ticket 3 — Privat-Limit-Backend**
+- [ ] Counter pro Kalenderjahr, Reset 1.1. 00:00 UTC
+- [ ] **Counter zaehlt Brutto-Vergueting** (Listing-Preis × Menge, vor Plattform-Gebuehren) — NICHT Netto-Auszahlung
+      - Begruendung: PStTG zaehlt "gezahlte/gutgeschriebene Verguetung" = Brutto vom Kaeufer
+      - Implementation-Note: Verkaeufer kriegt €1.692 ausgezahlt, Counter steht aber bei €1.800 — das ist die rechtlich saubere Logik
+- [ ] Tracker fuer (a) Anzahl abgeschlossener Verkaeufe, (b) kumulierter Brutto-Umsatz
+- [ ] Trigger Soft-Schwelle (20 Tx oder €1.200): Notification only (Push + Email)
+- [ ] Trigger Hard-Schwelle (30 Tx oder €1.800): Notification + 14-Tage-Countdown + Listing-Suspension nach Frist
+- [ ] **Suspension-Flag persistiert UNABHAENGIG vom Counter-Reset** — sonst hebt der 1.1.-Reset versehentlich die Suspension auf. Edge-Case: Verkaeufer reisst Schwelle 31.12., reagiert nicht, am 1.1. resettet Counter aber Suspension bleibt bis Re-Deklaration.
+- [ ] Definition "abgeschlossener Verkauf": Zahlung + Stripe-Gutschrift + keine Rueckabwicklung im delay_days-Zeitraum; bei nachtraeglicher Rueckabwicklung Counter dekrementieren; Multi-Item-Bestellung = 1 Verkauf (nicht n Verkaeufe)
+- [ ] Trigger-Audit-Log (DSA Art. 17 Begruendungspflicht — beim Suspendieren genau dokumentieren welche Schwelle wann gerissen)
+- [ ] Re-Deklarations-Endpoint: setzt Counter zurueck und schaltet auf gewerblich um (mit Daten-Erhebung Art. 30 DSA + DAC7)
+- [ ] Abuse-Schutz: Limits-Reset nicht durch Account-Loeschung + Wiederanlage — Stripe-Connected-Account-Bindung als Identifier
+
+**Ticket 4 — Self-Reclassification-Flow (privat → gewerblich)**
+- [ ] UI fuer "ich bin doch gewerblich"-Umstellung
+- [ ] Validierung Steuer-IdNr (11-stellig DE Format-Check)
+- [ ] Validierung USt-IdNr (Format-Check + VIES-API)
+- [ ] Adress-Plausibilitaet
+- [ ] Stripe-Connected-Account-Update (Account-Type-Wechsel "individual" → "company" via Stripe API)
+- [ ] Pflicht-Hinweis-Checkbox: "Mit Umstellung auf gewerblich gelten zusaetzliche Pflichten (Gewerbeanmeldung, USt-Voranmeldung, Buchfuehrung). Sie sind eigenverantwortlich fuer die ordnungsgemaesze steuerliche und gewerberechtliche Anmeldung."
+- [ ] Email-Bestaetigung an Verkaeufer mit Zusammenfassung der Aenderungen
+
+**Ticket 5 — Infrastruktur**
+- [ ] `support@getriftr.app` Email einrichten (in § Streitbeilegung referenziert; Forwarding aufs normale Postfach reicht initial)
+- [ ] `complaints@getriftr.app` fuer DSA-Beschwerden (kann gleicher Inbox sein)
+
+### 🟦 COMPLIANCE-TRACK (parallel laufend)
+- [ ] **UG (haftungsbeschraenkt)** Gruendung Q2 2026, Sitz NRW — Stammkapital €1.000-5.000, Notar + HR-Eintrag (€1.500-2.000)
+- [ ] **Haendlerbund-Mitgliedschaft** (~€300/Jahr) — abmahnsichere Plattform-AGB + DSE + Impressum + Cookie + Updates inklusive (ersetzt das vorher geplante IT-Recht-Kanzlei-Paket €790-1.500)
+- [ ] **Anwaltliche Erstberatung ZAG (1-2h, ~€300-500)** — siehe ANWALT-TRACK; eigenes Gutachten + BaFin-Merkblatt liegen vor, Anwalt bestaetigt nur muendlich + Aktennotiz
+- [ ] **Steuerberater** fuer DAC7 / OSS / Setup (€500-800)
+- [ ] **IT-Haftpflicht-Versicherung** Jahr 1 (€400-600) — Cyber + D&O erst Phase 2
+- [ ] **Stripe Live-Mode Application** (sobald UG existiert und KYC durch ist) — falls Stripe explizit nach schriftlicher Anwaltsmeinung fragt: dann Kurzgutachten in Auftrag geben, nicht prophylaktisch
+
+**Realistisches Setup-Budget Phase 1 (Lean Path): €3.000-4.200**
+
+| Posten | Lean Path |
+|---|---|
+| UG + Notar | €1.500-2.000 |
+| Haendlerbund AGB Y1 | €300 |
+| Anwaltliche Erstberatung ZAG (1-2h) | €300-500 |
+| Steuerberater Setup | €500-800 |
+| IT-Haftpflicht Y1 | €400-600 |
+| **Summe** | **€3.000-4.200** |
+
+**Was Phase 2 ggf. nachzieht (bei realem Bedarf):**
+- Volles ZAG-Memo (€3.000-5.000) wenn Stripe Live-Review/Investor-DD/Volumen-Schwelle es verlangt
+- Cyber- + D&O-Versicherung
+- Premium-Markenrechts-Bewertung Riot Games (nur bei Riot-Reaktion)
+
+### 🟦 STRATEGISCHE ENTSCHEIDUNGEN (festgelegt)
+- ✅ **Geo-Scope Phase 1: EU-27 + EWR (NO/IS/LI)** — KEIN UK, KEIN Schweiz (auf Phase 2 verschoben)
+      - Begruendung: UK/CH bringen 5-10% Mehraufwand pro Land bei wenig Buyer-Pool-Zuwachs (Brexit-Zoll, CH klein)
+      - EWR ist mit OSS abgedeckt, DSGVO einheitlich, kein UK-GDPR/revDSG-Doppelpack
+- ✅ **Verkaeufer-Modell: B2C + P2P von Tag 1** (privat + gewerblich) — schon gebaut, kein Rueckbau auf P2P-only
+- ✅ **Stripe Connect Standard** (NICHT Express) — staerkste ZAG-Befreiungs-Position weil maximale Distanz Plattform↔Geld
+- ✅ **App-only Distribution** — getriftr.app ist reine Marketing-Landing-Page, kein Web-Checkout
+- ✅ **Stripe-Architektur**: Destination Charges mit `transfer_data[destination]` + `application_fee_amount` (NICHT Direct Charges, NICHT Treuhand)
+- ✅ **Dispute-Modell: Discogs-Modell** (entschieden 30.04.2026 nach Cardmarket-Recherche)
+      - Plattform vermittelt nur, entscheidet KEINE Refunds einseitig
+      - Refunds: Konsens + objektive Trigger (Auto-Tracking, Auto-Seller-Silence)
+      - Externe Wege: Stripe-Chargeback / Schlichtungsstelle / Zivilrechtsweg
+      - Cardmarket macht im Kern dasselbe (`Cardmarket_Reference/cm_help_SellerGuide.md`)
+- ✅ **ZAG-Compliance-Tiefe: Lean Path** (entschieden 30.04.2026)
+      - Anwaltliche Erstberatung (€300-500) statt qualifiziertem Memo (€3-5k)
+      - BaFin-Merkblatt Stand 31.03.2026 deckt unsere Architektur explizit
+      - Schubladen-Dokumente: Eigen-Gutachten + Frozen-BaFin-Merkblatt
+- ✅ **Anti-Fraud-Theater raus** (entschieden 30.04.2026, User-Polizist-Perspektive)
+      - Foto-Beleg, Auspack-Video, Strafanzeige-Helper-PDF: alles faelschbar oder unwartbar
+      - Stattdessen: Pattern-Detection + Account-Age-Gates + Versandtier (alles statistisch wirksam)
+
+### 🟦 LANGFRISTIG / PHASE 2+
+- [ ] UK + Schweiz erschliessen (eigenstaendiger Anwalts-Auftrag)
+- [ ] Premium-Markenrechts-Bewertung Riot Games (erst wenn Riot reagiert; eigener Riot-Outreach via Email kostenlos vorab)
+- [ ] D&O- + Cyber-Versicherung
+- [ ] DSB falls erforderlich (ab bestimmter Mitarbeiter-/Datenmenge)
+
+### 🟦 IMPLEMENTATION-NOTES (kritisch fuer Backend, NICHT in AGB)
+1. **Verguetung in Privat-Limits = brutto** (PStTG-Logik, siehe Ticket 3)
+2. **Suspension-Flag persistiert ueber Counter-Reset** (siehe Ticket 3)
+3. **delay_days + reverse_transfer Konfigurations-Check**: Wenn Riftr irgendwo manuell Refunds ausloesen oder application_fee nachtraeglich anpassen kann, muss das im ZAG-Memo ehrlich gesagt werden — sonst kippt die "keine Verfuegungsmacht"-Argumentation. Liste fuer Anwalt vorbereiten was technisch alles ausloesbar ist.
+4. **Apple/Google In-App-Purchase greift NICHT** fuer physische Sammelkarten (Apple-Regel 3.1.5(a) + Google IAB-Policy-Ausnahme) — im Briefing erwaehnen
+5. **Apple Pay / Google Pay im Test-Mode versteckt** via `Stripe.publishableKey.startsWith('pk_test_')` (bereits implementiert in `checkout_sheet.dart`)
+
+### 🟦 OFFENE FRAGEN (fuer Aufsichtsrechtler im Klaerungs-Call)
+1. Reicht ZAG-Memo allein oder noch separates KWG-Memo (§ 32 KWG Eigengeschaeft) noetig?
+2. Wie gehen wir mit BaFin um — proaktive Anfrage oder Memo "in der Schublade"? (Empfehlung bisher: Schublade)
+3. PSD3-Auswirkungen auf Stripe-Connect-Architektur in 2-3 Jahren?
+4. Konkrete Praxis-Frage: Wenn Riftr per Schlichtungs-Service einen Refund-Recommendation an die Parteien gibt — ist das schon "Verfuegungsmacht-Indiz" oder neutral?
+5. Wie strikt muss "Privater Anbieter"-Badge sein — UI-prominent oder reicht Listing-Detail?
+
+---
+
 ## KRITISCH (Marktplatz-Kernfunktionalität)
 
 ### Chart / Portfolio
