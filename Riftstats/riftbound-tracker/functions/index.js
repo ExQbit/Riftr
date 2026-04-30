@@ -4684,15 +4684,13 @@ exports.autoReleaseOrders = onSchedule(
  * sich die beiden Crons nicht ueberlappen). Der bestehende Day-5-Reminder
  * in autoReleaseOrders nudget den Verkaeufer rechtzeitig.
  */
-exports.autoResolveStaleShipments = onSchedule(
-  {
-    schedule: "30 4 * * *",
-    timeZone: "Europe/Berlin",
-    timeoutSeconds: 300,
-    region: "europe-west1",
-    secrets: ["STRIPE_SECRET_KEY"],
-  },
-  async () => {
+/**
+ * Internal helper for stale-shipment auto-resolve. Wird sowohl vom
+ * `autoResolveStaleShipments`-Cron (Production-Schedule) als auch vom
+ * Test-Trigger `_devTriggerStaleShipments` (admin-only HTTP) aufgerufen.
+ * Dadurch reproduzierbare E2E-Tests ohne auf den Cron warten zu muessen.
+ */
+async function _runStaleShipmentsResolver() {
     const fourteenDaysAgo = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000)
       .toISOString();
     const ordersRef = db.collection("artifacts").doc(APP_ID).collection("orders");
@@ -4704,7 +4702,7 @@ exports.autoResolveStaleShipments = onSchedule(
 
     if (snap.empty) {
       console.log("autoResolveStaleShipments: no stale orders");
-      return;
+      return { cancelled: 0, skipped: 0, candidates: 0 };
     }
 
     const stripe = getStripe();
@@ -4825,6 +4823,19 @@ exports.autoResolveStaleShipments = onSchedule(
     console.log(
       `autoResolveStaleShipments: cancelled=${cancelled} skipped=${skipped} of ${snap.size} candidates`,
     );
+    return { cancelled, skipped, candidates: snap.size };
+}
+
+exports.autoResolveStaleShipments = onSchedule(
+  {
+    schedule: "30 4 * * *",
+    timeZone: "Europe/Berlin",
+    timeoutSeconds: 300,
+    region: "europe-west1",
+    secrets: ["STRIPE_SECRET_KEY"],
+  },
+  async () => {
+    await _runStaleShipmentsResolver();
   },
 );
 
@@ -4851,15 +4862,12 @@ exports.autoResolveStaleShipments = onSchedule(
  *
  * Schedule: 05:00 Berlin (30 Min nach autoResolveStaleShipments).
  */
-exports.autoResolveSellerSilence = onSchedule(
-  {
-    schedule: "0 5 * * *",
-    timeZone: "Europe/Berlin",
-    timeoutSeconds: 300,
-    region: "europe-west1",
-    secrets: ["STRIPE_SECRET_KEY"],
-  },
-  async () => {
+/**
+ * Internal helper for seller-silence auto-refund. Wird sowohl vom
+ * `autoResolveSellerSilence`-Cron (Production-Schedule) als auch vom
+ * Test-Trigger `_devTriggerSellerSilence` (admin-only HTTP) aufgerufen.
+ */
+async function _runSellerSilenceResolver() {
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
       .toISOString();
     const ordersRef = db.collection("artifacts").doc(APP_ID).collection("orders");
@@ -4874,7 +4882,7 @@ exports.autoResolveSellerSilence = onSchedule(
 
     if (snap.empty) {
       console.log("autoResolveSellerSilence: no silent disputes");
-      return;
+      return { refunded: 0, skipped: 0, errors: 0, candidates: 0 };
     }
 
     const stripe = getStripe();
@@ -5042,6 +5050,73 @@ exports.autoResolveSellerSilence = onSchedule(
     console.log(
       `autoResolveSellerSilence: refunded=${refunded} skipped=${skipped} errors=${errors} of ${snap.size} candidates`,
     );
+    return { refunded, skipped, errors, candidates: snap.size };
+}
+
+exports.autoResolveSellerSilence = onSchedule(
+  {
+    schedule: "0 5 * * *",
+    timeZone: "Europe/Berlin",
+    timeoutSeconds: 300,
+    region: "europe-west1",
+    secrets: ["STRIPE_SECRET_KEY"],
+  },
+  async () => {
+    await _runSellerSilenceResolver();
+  },
+);
+
+/**
+ * _devTriggerStaleShipments — Test-only HTTP-Trigger fuer
+ * `_runStaleShipmentsResolver`. Admin-only. Erlaubt reproduzierbare E2E-Tests
+ * ohne auf den Production-Cron (04:30 Berlin) warten zu muessen.
+ *
+ * Use case: Phase9-Discogs-E2E-Tests (test-scenarios/phase9_discogs_e2e.js).
+ *
+ * **NICHT** in Production-UI exposed — nur via Admin-CLI / E2E-Test-Script
+ * aufrufbar. Falls bei Phase 10 entschieden, dass Admins manuelle Resolves
+ * brauchen, muss eine separate UI-Function gebaut werden mit eigenem Audit-
+ * Logging (diese hier hat keinen).
+ */
+exports._devTriggerStaleShipments = onCall(
+  {
+    region: "europe-west1",
+    timeoutSeconds: 300,
+    secrets: ["STRIPE_SECRET_KEY"],
+  },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Login required");
+    }
+    if (request.auth.token?.admin !== true) {
+      throw new HttpsError("permission-denied", "Admin only (dev-trigger)");
+    }
+    console.log(`_devTriggerStaleShipments invoked by admin=${request.auth.uid}`);
+    const result = await _runStaleShipmentsResolver();
+    return { success: true, ...result };
+  },
+);
+
+/**
+ * _devTriggerSellerSilence — Test-only HTTP-Trigger fuer
+ * `_runSellerSilenceResolver`. Siehe `_devTriggerStaleShipments`-Doc.
+ */
+exports._devTriggerSellerSilence = onCall(
+  {
+    region: "europe-west1",
+    timeoutSeconds: 300,
+    secrets: ["STRIPE_SECRET_KEY"],
+  },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Login required");
+    }
+    if (request.auth.token?.admin !== true) {
+      throw new HttpsError("permission-denied", "Admin only (dev-trigger)");
+    }
+    console.log(`_devTriggerSellerSilence invoked by admin=${request.auth.uid}`);
+    const result = await _runSellerSilenceResolver();
+    return { success: true, ...result };
   },
 );
 
