@@ -5346,22 +5346,39 @@ exports.adminListDisputes = onCall(
 );
 
 /**
- * adminResolveDispute — Admin-only Tie-Breaker.
+ * adminResolveDispute — Admin-only Seller-Win Tie-Breaker (KEIN Geld-Routing).
  *
- * Loest einen festgefahrenen Dispute durch Admin-Entscheidung. Greift wenn
- * Buyer + Seller sich nicht einigen koennen ueber `proposeRefund` /
- * `respondToRefund`. Admin entscheidet:
- *   - refundPercent (0-100): 0 = kein Refund (Verkaeufer recht), 100 = voll
- *   - reason: text (= adminNote, wird im Audit-Log gespeichert)
- *   - applyServiceFeePolicy: true = Policy-Engine entscheidet (Default),
- *     false = Service-Fee bleibt IMMER bei Plattform unabhaengig vom Outcome
+ * **Discogs-Modell-Refactor (2026-04-30, ZAG-Compliance):**
+ * Vorher konnte Admin einseitig Refunds mit `refundPercent > 0` ausloesen
+ * (`stripe.refunds.create` + `reverse_transfer: true`). Das war
+ * „Einwirkungsmoeglichkeit auf den Zahlungsfluss" laut BaFin-Merkblatt zum
+ * ZAG (Stand 31.03.2026, Zeile 572 lokale Kopie) und kippte die
+ * ZAG-Befreiungs-Position. Industriestandard (Discogs, Cardmarket) ist:
+ * Plattform vermittelt nur, Refunds laufen via Konsens (`respondToRefund`)
+ * oder objektive Trigger (`autoResolve*`-Crons) oder externe Wege
+ * (Stripe-Chargeback, Schlichtung, Zivilrechtsweg).
  *
- * Bei refundPercent > 0: nutzt Policy-Engine (resolveRefundPolicy) und cleant
- * up wie respondToRefund. Bei 0: dispute resolved zu Verkaeufer-Gunsten,
- * Order auf shipped zurueck mit neuem auto-release-Timer.
+ * Diese Funktion ist seit dem Refactor ausschliesslich der **Verkaeufer-Win**-
+ * Tie-Breaker: Wenn Admin nach Pruefung zum Ergebnis kommt, dass die
+ * Verkaeufer-Position richtig ist, kann er den Dispute schliessen — **ohne
+ * Geldbewegung**. Order geht zurueck auf `shipped`, neuer 7-Tage-Auto-Release-
+ * Timer startet. Buyer hat nach wie vor das 30-Tage-Dispute-Window und kann
+ * spaeter erneut disputen falls neue Beweise auftauchen, oder direkt
+ * Stripe-Chargeback bei seiner Bank ansetzen.
+ *
+ * Fuer Account-Sanktionen ohne Geldbewegung (Listings-Pause, Account-Sperre
+ * bei Pattern-Verstossen): siehe `adminAccountSanction`.
+ *
+ * Input:
+ *   - orderId: string
+ *   - reason: string (>=5 chars, fuer Audit-Log + Notification)
+ *
+ * Hinweis: `refundPercent` Parameter bleibt nominell akzeptiert fuer
+ * Backwards-Compat des Frontend-Callers, MUSS aber 0 sein. Andere Werte
+ * werden mit klarem Migrations-Hinweis abgelehnt.
  */
 exports.adminResolveDispute = onCall(
-  { region: "europe-west1", timeoutSeconds: 30, secrets: ["STRIPE_SECRET_KEY"] },
+  { region: "europe-west1", timeoutSeconds: 15 },
   async (request) => {
     if (!request.auth) {
       throw new HttpsError("unauthenticated", "Login required");
@@ -5370,18 +5387,20 @@ exports.adminResolveDispute = onCall(
       throw new HttpsError("permission-denied", "Admin only");
     }
 
-    const { orderId, refundPercent, reason, applyServiceFeePolicy = true } = request.data;
+    const { orderId, refundPercent, reason } = request.data;
     if (!orderId) {
       throw new HttpsError("invalid-argument", "orderId required");
     }
-    if (
-      typeof refundPercent !== "number" ||
-      refundPercent < 0 ||
-      refundPercent > 100
-    ) {
+    // Discogs-Modell: nur Seller-Win-Pfad (refundPercent === 0) zulaessig.
+    // Refund-Auslösungen via Plattform-Entscheid sind raus (ZAG-Compliance).
+    if (refundPercent != null && refundPercent !== 0) {
       throw new HttpsError(
-        "invalid-argument",
-        "refundPercent must be 0-100",
+        "failed-precondition",
+        "Admin-issued refunds were removed (Discogs-Modell, ZAG-Compliance, " +
+        "2026-04-30). For refunds use: 1) respondToRefund (mutual consent), " +
+        "2) autoResolveStaleShipments / autoResolveSellerSilence (objective " +
+        "triggers), or 3) advise buyer to use Stripe-Chargeback. " +
+        "adminResolveDispute can only resolve in seller's favor (state-only).",
       );
     }
     if (!reason || typeof reason !== "string" || reason.length < 5) {
@@ -5404,21 +5423,8 @@ exports.adminResolveDispute = onCall(
         `Order status is ${order.status}, expected disputed`,
       );
     }
-    if (order.paymentMethod === "balance") {
-      throw new HttpsError(
-        "failed-precondition",
-        "Legacy balance order — manual handling required.",
-      );
-    }
-    const piId = order.stripePaymentIntentId;
-    if (!piId && refundPercent > 0) {
-      throw new HttpsError(
-        "failed-precondition",
-        "No PaymentIntent — cannot refund.",
-      );
-    }
 
-    // Admin-Audit-Log immer
+    // Admin-Audit-Log
     const auditRef = db.collection("artifacts").doc(APP_ID)
       .collection("orders").doc(orderId)
       .collection("disputeAudit").doc();
@@ -5426,167 +5432,39 @@ exports.adminResolveDispute = onCall(
       timestamp: admin.firestore.FieldValue.serverTimestamp(),
       adminUid: request.auth.uid,
       action: "adminResolveDispute",
-      refundPercent,
+      refundPercent: 0,
       reason: reason.substring(0, 500),
-      applyServiceFeePolicy,
       previousDisputeStatus: order.disputeStatus,
     };
 
-    if (refundPercent === 0) {
-      // Pro Verkaeufer entschieden: Order zurueck zu shipped, neuer Auto-
-      // Release in 7 Tagen, dispute resolved.
-      const newAutoRelease = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-      await orderRef.update({
-        status: "shipped",
-        disputeStatus: "resolved",
-        adminResolvedAt: admin.firestore.FieldValue.serverTimestamp(),
-        adminResolvedBy: request.auth.uid,
-        adminResolutionNote: reason.substring(0, 500),
-        autoReleaseAt: newAutoRelease.toISOString(),
-        // Admin-resolved disputes counter (fuer Anti-Abuse-Tracking spaeter)
-      });
-      await auditRef.set({ ...auditEntry, outcome: "rejected_no_refund" });
-
-      sendNotification(
-        order.buyerId,
-        "Dispute resolved",
-        `Admin entschied gegen den Refund. Begruendung: ${reason.substring(0, 100)}`,
-        { type: "order", orderId },
-      );
-      sendNotification(
-        order.sellerId,
-        "Dispute resolved",
-        "Admin entschied zu deinen Gunsten. Order setzt fort.",
-        { type: "order", orderId },
-      );
-
-      console.log(`adminResolveDispute: order ${orderId} resolved 0% (seller win) by ${request.auth.uid}`);
-      return { success: true, outcome: "rejected_no_refund" };
-    }
-
-    // refundPercent > 0: tatsaechlicher Refund. Nutzt Policy-Engine wenn
-    // `applyServiceFeePolicy: true` (Default), sonst forciert Service-Fee
-    // bei Plattform.
-    const stripe = getStripe();
-    let policy;
-    if (applyServiceFeePolicy) {
-      policy = resolveRefundPolicy(
-        order,
-        order.disputeReasonCode || null,
-        refundPercent,
-      );
-    } else {
-      // Admin-Override: Service-Fee bleibt IMMER bei Plattform.
-      const totalCents = Math.round((order.totalPaid || 0) * 100);
-      const serviceFeeCents =
-        order.serviceFeeCents != null
-          ? order.serviceFeeCents
-          : Math.round((order.buyerServiceFee || 0) * 100);
-      const proportional = Math.round((totalCents * refundPercent) / 100);
-      const finalAmount = Math.min(proportional, totalCents - serviceFeeCents);
-      policy = {
-        amount: finalAmount,
-        refundApplicationFee: false,
-        reverseTransfer: true,
-        serviceFeeStaysWithPlatform: true,
-        refundedAmountEur: finalAmount / 100,
-      };
-    }
-
-    const refundParams = {
-      payment_intent: piId,
-      reverse_transfer: policy.reverseTransfer,
-      refund_application_fee: policy.refundApplicationFee,
-    };
-    if (policy.amount != null) {
-      refundParams.amount = policy.amount;
-    }
-
-    // Idempotency-Key (Security-Audit Round 2, 2026-04-29): bei
-    // Admin-Tap-Spam oder Network-Retry sonst Doppel-Refund-Risiko.
-    // Key inkludiert Admin-UID damit zwei Admins parallel nicht kollidieren
-    // (sehr unwahrscheinlich aber sauber): unterschiedliche Admin-UIDs
-    // sollen tatsaechlich beide Refunds nicht ausloesen — Order-State
-    // schuetzt aber bereits davor (status=disputed Check oben).
-    const refund = await stripe.refunds.create(refundParams, {
-      idempotencyKey: `refund-admin-${orderId}-${refundPercent}`,
-    });
-    console.log(
-      `adminResolveDispute: refund ${refund.id} created for order ${orderId} ` +
-      `(percent=${refundPercent}, amount=${policy.refundedAmountEur.toFixed(2)}, ` +
-      `serviceFeeStays=${policy.serviceFeeStaysWithPlatform})`,
-    );
-
+    // Pro Verkaeufer entschieden: Order zurueck zu shipped, neuer Auto-
+    // Release in 7 Tagen, dispute resolved. KEINE Geldbewegung.
+    const newAutoRelease = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
     await orderRef.update({
-      status: "refunded",
+      status: "shipped",
       disputeStatus: "resolved",
-      resolvedAt: admin.firestore.FieldValue.serverTimestamp(),
       adminResolvedAt: admin.firestore.FieldValue.serverTimestamp(),
       adminResolvedBy: request.auth.uid,
       adminResolutionNote: reason.substring(0, 500),
-      refundedAmount: policy.refundedAmountEur,
-      refundServiceFeeStaysWithPlatform: policy.serviceFeeStaysWithPlatform,
-      stripeRefundId: refund.id,
+      autoReleaseAt: newAutoRelease.toISOString(),
     });
-    await auditRef.set({
-      ...auditEntry,
-      outcome: "refund_issued",
-      stripeRefundId: refund.id,
-      refundedAmountEur: policy.refundedAmountEur,
-    });
-
-    // Listing-Reservation freigeben
-    for (const item of (order.items || [])) {
-      if (!item.listingId) continue;
-      const listingRef = db.collection("artifacts").doc(APP_ID)
-        .collection("listings").doc(item.listingId);
-      const listingDoc = await listingRef.get();
-      if (listingDoc.exists) {
-        const listing = listingDoc.data();
-        const newReserved = Math.max(0, (listing.reservedQty || 0) - (item.quantity || 1));
-        const updateData = { reservedQty: newReserved };
-        if (listing.status === "reserved") updateData.status = "active";
-        await listingRef.update(updateData);
-      }
-    }
-
-    // Realized Gains reversal (mirrors respondToRefund)
-    const gainOnRecord = order.realizedGainOnShip || order.realizedGainOnDelivery || 0;
-    if (gainOnRecord && order.sellerId) {
-      const reversalAmount = gainOnRecord * (refundPercent / 100);
-      const sellerProfileRef = db.collection("artifacts").doc(APP_ID)
-        .collection("users").doc(order.sellerId).collection("data").doc("profile");
-      await sellerProfileRef.set({
-        realizedGains: admin.firestore.FieldValue.increment(-reversalAmount),
-      }, { merge: true });
-    }
-
-    // Strike if significant
-    if (refundPercent > 50) {
-      await addStrike(order.sellerId,
-        `Admin-resolved dispute refund ${refundPercent}% on order ${orderId}: ${reason.substring(0, 100)}`);
-    }
+    await auditRef.set({ ...auditEntry, outcome: "rejected_no_refund" });
 
     sendNotification(
       order.buyerId,
-      "Refund issued",
-      `Admin: €${policy.refundedAmountEur.toFixed(2)} refunded.`,
+      "Dispute resolved",
+      `Admin entschied gegen den Refund. Begruendung: ${reason.substring(0, 100)}`,
       { type: "order", orderId },
     );
     sendNotification(
       order.sellerId,
-      "Refund issued",
-      `Admin entschied: €${policy.refundedAmountEur.toFixed(2)} refunded to buyer. Reason: ${reason.substring(0, 100)}`,
+      "Dispute resolved",
+      "Admin entschied zu deinen Gunsten. Order setzt fort.",
       { type: "order", orderId },
     );
 
-    return {
-      success: true,
-      outcome: "refund_issued",
-      refundAmount: policy.refundedAmountEur,
-      stripeRefundId: refund.id,
-      serviceFeeStaysWithPlatform: policy.serviceFeeStaysWithPlatform,
-    };
+    console.log(`adminResolveDispute: order ${orderId} resolved 0% (seller win) by ${request.auth.uid}`);
+    return { success: true, outcome: "rejected_no_refund" };
   },
 );
 
