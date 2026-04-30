@@ -1078,6 +1078,7 @@ class SocialScreenState extends State<SocialScreen> {
                       insuredOnly: listing.insuredOnly,
                       forceTracked:
                           ShippingRates.requiresTracking(bundleValue: bundleValue),
+                      bundleValue: bundleValue,
                     )?.price ??
                   1.80)
               : 1.80;

@@ -2608,6 +2608,20 @@ exports.createPaymentIntent = onCall(
       );
     }
 
+    // Insured-Shipping-Required Server-Side Enforcement (Discogs-Modell, 2026-04-30):
+    // Bei Bestellwert ≥ €300 ist nur insured zulaessig. Bei Verlust/Beschaedigung
+    // haftet die Versicherung (DHL Wert-Einschreiben deckt bis €500), nicht
+    // die Plattform — das ist eine reine AGB-Klausel-Folge, kein Plattform-
+    // Wertentscheid am Geld. Riftbound-Realitaet: Top-Karten ~€100-300, Promos
+    // €500+. Bei €300 fangen wir alle reale High-Value-Bestellungen ab.
+    if (effectiveMethod !== "insured" && subtotal >= 300) {
+      throw new HttpsError(
+        "failed-precondition",
+        "Orders ≥ €300 must use insured shipping. Insurance covers loss/damage " +
+        "(DHL Wert-Einschreiben up to €500). Please select insured shipping.",
+      );
+    }
+
     const shippingCost = round2(getShippingRate(sellerCountry, buyerCountry, effectiveMethod));
 
     // ── Fee-Logik (Phase-1) ──
@@ -3204,6 +3218,16 @@ exports.processMultiSellerCart = onCall(
           "failed-precondition",
           `Seller ${sellerId}: orders over €25 must use tracked or insured ` +
           `shipping. Please select a different shipping method.`,
+        );
+      }
+
+      // Insured-Shipping-Required (Discogs-Modell, 2026-04-30): siehe Single-
+      // Seller-Pfad oben. Hier per-seller-group, gleiche Schwelle €300.
+      if (effectiveMethod !== "insured" && cardSubtotal >= 300) {
+        throw new HttpsError(
+          "failed-precondition",
+          `Seller ${sellerId}: orders ≥ €300 must use insured shipping. ` +
+          `Insurance covers loss/damage (DHL Wert-Einschreiben up to €500).`,
         );
       }
 
