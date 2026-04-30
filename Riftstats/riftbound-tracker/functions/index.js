@@ -4690,6 +4690,9 @@ exports.autoReleaseOrders = onSchedule(
  * Test-Trigger `devTriggerStaleShipments` (admin-only HTTP) aufgerufen.
  * Dadurch reproduzierbare E2E-Tests ohne auf den Cron warten zu muessen.
  */
+exports._runStaleShipmentsResolver = _runStaleShipmentsResolver;
+exports._runSellerSilenceResolver = _runSellerSilenceResolver;
+
 async function _runStaleShipmentsResolver() {
     const fourteenDaysAgo = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000)
       .toISOString();
