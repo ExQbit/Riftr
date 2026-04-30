@@ -4793,6 +4793,223 @@ exports.autoResolveStaleShipments = onSchedule(
   },
 );
 
+/**
+ * autoResolveSellerSilence — Cron, Discogs-Modell-Komponente.
+ *
+ * **Zweck (2026-04-30, ZAG-Compliance):**
+ * Wenn ein Kaeufer einen Dispute oeffnet und der Verkaeufer 7 Tage nicht
+ * reagiert (kein `proposeRefund`, disputeStatus bleibt `open`), wird die
+ * Order automatisch zu 100 % refundiert. Wie autoResolveStaleShipments ist
+ * das eine vorab in AGB definierte objektive Folge — kein Plattform-
+ * Schiedsspruch.
+ *
+ * Mechanik (anders als autoResolveStaleShipments):
+ * - Bei `disputed` Status ist Order schon `shipped` (oder
+ *   `delivered`/`auto_completed` im 30-Tage-post-delivery-Window). Geld
+ *   wurde bei `markShipped` captured und liegt auf Connected Account des
+ *   Verkaeufers (oder ist bereits ausgezahlt).
+ * - `stripe.refunds.create` mit `reverse_transfer: true` und
+ *   `refund_application_fee: true` — voller Refund inkl. Service-Gebuehr
+ *   (Verkaeufer komplett ausgefallen = klare Pflichtverletzung).
+ * - Mirrors die Refund-Cleanup-Logik aus respondToRefund: Listing-
+ *   Reservation freigeben, Realized Gains reverse, Strike fuer Verkaeufer.
+ *
+ * Schedule: 05:00 Berlin (30 Min nach autoResolveStaleShipments).
+ */
+exports.autoResolveSellerSilence = onSchedule(
+  {
+    schedule: "0 5 * * *",
+    timeZone: "Europe/Berlin",
+    timeoutSeconds: 300,
+    region: "europe-west1",
+    secrets: ["STRIPE_SECRET_KEY"],
+  },
+  async () => {
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
+      .toISOString();
+    const ordersRef = db.collection("artifacts").doc(APP_ID).collection("orders");
+
+    // Disputed Orders mit disputeStatus "open" (= Verkaeufer hat noch nicht
+    // proposeRefund aufgerufen) und disputedAt ≥ 7 Tage her.
+    const snap = await ordersRef
+      .where("status", "==", "disputed")
+      .where("disputeStatus", "==", "open")
+      .where("disputedAt", "<=", sevenDaysAgo)
+      .get();
+
+    if (snap.empty) {
+      console.log("autoResolveSellerSilence: no silent disputes");
+      return;
+    }
+
+    const stripe = getStripe();
+    let refunded = 0;
+    let skipped = 0;
+    let errors = 0;
+
+    for (const doc of snap.docs) {
+      // Race-Protection: Verkaeufer koennte parallel proposeRefund triggern,
+      // oder Buyer cancelDispute — TX-State-Flip vor Stripe-Call.
+      let order;
+      try {
+        order = await db.runTransaction(async (tx) => {
+          const fresh = await tx.get(doc.ref);
+          if (!fresh.exists) return null;
+          const data = fresh.data();
+          if (data.status !== "disputed" || data.disputeStatus !== "open") {
+            return null;
+          }
+          // Doppelt-Sicher: disputedAt-Alter nochmal pruefen
+          const disputedAtRaw = data.disputedAt;
+          let disputedAtMs = 0;
+          if (disputedAtRaw && typeof disputedAtRaw.toMillis === "function") {
+            disputedAtMs = disputedAtRaw.toMillis();
+          } else if (disputedAtRaw) {
+            disputedAtMs = new Date(disputedAtRaw).getTime();
+          }
+          if (!disputedAtMs ||
+              (Date.now() - disputedAtMs) < 7 * 24 * 60 * 60 * 1000) {
+            return null;
+          }
+          // Markiere als "in progress" damit kein anderer Pfad gleichzeitig
+          // refunded; finaler State wird nach Stripe-Call gesetzt.
+          tx.update(doc.ref, {
+            disputeStatus: "auto_resolving",
+          });
+          return data;
+        });
+      } catch (txErr) {
+        console.error(
+          `autoResolveSellerSilence ${doc.id} TX-flip failed: ${txErr.message}`,
+        );
+        errors++;
+        continue;
+      }
+      if (!order) {
+        skipped++;
+        continue;
+      }
+
+      const piId = order.stripePaymentIntentId;
+      if (!piId) {
+        // Kein PI = legacy balance-order o.ae. — als skipped markieren,
+        // disputeStatus zurueck auf "open" damit Admin manuell eingreifen kann.
+        await doc.ref.update({ disputeStatus: "open" });
+        console.warn(
+          `autoResolveSellerSilence: ${doc.id} has no PaymentIntent — skipping`,
+        );
+        skipped++;
+        continue;
+      }
+
+      // 100% Refund inkl. Service-Gebuehr — Verkaeufer-Schuld klar
+      // (7 Tage nicht reagiert auf Dispute).
+      const refundParams = {
+        payment_intent: piId,
+        reverse_transfer: true,
+        refund_application_fee: true,
+      };
+
+      let refund;
+      try {
+        // Idempotency-Key per orderId — bei Cron-Re-Run keine doppelten Refunds
+        refund = await stripe.refunds.create(refundParams, {
+          idempotencyKey: `refund-auto-silence-${doc.id}`,
+        });
+      } catch (stripeErr) {
+        console.error(
+          `autoResolveSellerSilence: refund failed for ${doc.id}: ${stripeErr.message}`,
+        );
+        // disputeStatus zurueck auf "open" damit's beim naechsten Cron-Run
+        // erneut versucht wird (oder Admin manuell eingreift)
+        await doc.ref.update({ disputeStatus: "open" });
+        errors++;
+        continue;
+      }
+
+      console.log(
+        `autoResolveSellerSilence: refund ${refund.id} created for order ${doc.id}`,
+      );
+
+      // Order final-state setzen
+      await doc.ref.update({
+        status: "refunded",
+        disputeStatus: "resolved",
+        resolvedAt: admin.firestore.FieldValue.serverTimestamp(),
+        autoResolvedAt: admin.firestore.FieldValue.serverTimestamp(),
+        autoResolveReason: "seller_silence_7d",
+        refundedAmount: order.totalPaid || 0,
+        refundServiceFeeStaysWithPlatform: false,
+        stripeRefundId: refund.id,
+      });
+
+      // Listing-Reservation freigeben (mirror respondToRefund)
+      for (const item of (order.items || [])) {
+        if (!item.listingId) continue;
+        const listingRef = db.collection("artifacts").doc(APP_ID)
+          .collection("listings").doc(item.listingId);
+        const listingDoc = await listingRef.get();
+        if (!listingDoc.exists) continue;
+        const listing = listingDoc.data();
+        const newReserved = Math.max(
+          0,
+          (listing.reservedQty || 0) - (item.quantity || 1),
+        );
+        const updateData = { reservedQty: newReserved };
+        if (listing.status === "reserved") updateData.status = "active";
+        await listingRef.update(updateData);
+      }
+
+      // Realized Gains reversal (volle 100%, da Voll-Refund)
+      const gainOnRecord =
+        order.realizedGainOnShip || order.realizedGainOnDelivery || 0;
+      if (gainOnRecord && order.sellerId) {
+        const sellerProfileRef = db.collection("artifacts").doc(APP_ID)
+          .collection("users").doc(order.sellerId)
+          .collection("data").doc("profile");
+        await sellerProfileRef.set({
+          realizedGains: admin.firestore.FieldValue.increment(-gainOnRecord),
+        }, { merge: true });
+      }
+
+      // Strike fuer Verkaeufer (klare Pflichtverletzung — keine Reaktion auf
+      // Dispute). Pattern-Detection (Schritt 7) wertet diese aus.
+      if (order.sellerId) {
+        try {
+          await addStrike(
+            order.sellerId,
+            `Auto-resolved dispute ${doc.id} after 7d seller silence (full refund)`,
+          );
+        } catch (e) {
+          console.error(
+            `autoResolveSellerSilence: addStrike failed for ${order.sellerId}: ${e.message}`,
+          );
+        }
+      }
+
+      // Notifications
+      sendNotification(
+        order.buyerId,
+        "Refund issued automatically",
+        `The seller didn't respond to your dispute within 7 days. Full refund of €${(order.totalPaid || 0).toFixed(2)} has been processed.`,
+        { type: "order", orderId: doc.id },
+      );
+      sendNotification(
+        order.sellerId,
+        "Order auto-refunded (no response)",
+        `An order was automatically refunded because you didn't respond to the buyer's dispute within 7 days. Repeated occurrences may lead to listing pauses or account sanctions.`,
+        { type: "order", orderId: doc.id },
+      );
+
+      refunded++;
+    }
+
+    console.log(
+      `autoResolveSellerSilence: refunded=${refunded} skipped=${skipped} errors=${errors} of ${snap.size} candidates`,
+    );
+  },
+);
+
 // ── Request Cancel (Buyer) ──
 exports.requestCancelOrder = onCall(
   { region: "europe-west1" },
