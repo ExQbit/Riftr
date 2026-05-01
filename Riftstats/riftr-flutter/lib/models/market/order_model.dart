@@ -154,6 +154,14 @@ class MarketOrder {
   /// Widerrufserklärung an den Verkäufer gerichtet werden kann (§ 312i BGB
   /// + Art. 246a EGBGB, Riftr-AGB-Anhang-1 Abschnitt B).
   final String? sellerEmail;
+
+  /// Firmierung des gewerblichen Verkäufers, snapshot zur Order-Zeit.
+  /// DSA Art. 30 / § 5 DDG Pflichtinfo.
+  final String? sellerLegalEntityName;
+
+  /// USt-IdNr des gewerblichen Verkäufers, snapshot zur Order-Zeit.
+  /// DSA Art. 30 / § 5 DDG Pflichtinfo.
+  final String? sellerVatId;
   final DateTime createdAt;
   final DateTime? paidAt;
   final DateTime? shippedAt;
@@ -207,6 +215,8 @@ class MarketOrder {
     this.buyerName,
     this.sellerIsCommercial = false,
     this.sellerEmail,
+    this.sellerLegalEntityName,
+    this.sellerVatId,
     required this.createdAt,
     this.paidAt,
     this.shippedAt,
@@ -276,6 +286,8 @@ class MarketOrder {
       sellerName: d['sellerName'] as String?,
       sellerIsCommercial: d['sellerIsCommercial'] as bool? ?? false,
       sellerEmail: d['sellerEmail'] as String?,
+      sellerLegalEntityName: d['sellerLegalEntityName'] as String?,
+      sellerVatId: d['sellerVatId'] as String?,
       buyerName: d['buyerName'] as String?,
       createdAt: _parseTimestamp(d['createdAt']) ?? DateTime.now(),
       paidAt: _parseTimestamp(d['paidAt']),
@@ -328,6 +340,9 @@ class MarketOrder {
         if (buyerName != null) 'buyerName': buyerName,
         'sellerIsCommercial': sellerIsCommercial,
         if (sellerEmail != null) 'sellerEmail': sellerEmail,
+        if (sellerLegalEntityName != null)
+          'sellerLegalEntityName': sellerLegalEntityName,
+        if (sellerVatId != null) 'sellerVatId': sellerVatId,
         'createdAt': createdAt.toIso8601String(),
         if (paidAt != null) 'paidAt': paidAt!.toIso8601String(),
         if (shippedAt != null) 'shippedAt': shippedAt!.toIso8601String(),
@@ -402,6 +417,8 @@ class MarketOrder {
         buyerName: buyerName,
         sellerIsCommercial: sellerIsCommercial,
         sellerEmail: sellerEmail,
+        sellerLegalEntityName: sellerLegalEntityName,
+        sellerVatId: sellerVatId,
         createdAt: createdAt,
         paidAt: paidAt ?? this.paidAt,
         shippedAt: shippedAt ?? this.shippedAt,

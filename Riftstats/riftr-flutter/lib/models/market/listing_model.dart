@@ -32,6 +32,14 @@ class MarketListing {
   /// (Widerruf-Pfad bei `§ 14 BGB`-Verkäufern). Quelle: `populateListing
   /// SellerStats` Cloud Function aus `sellerProfile.isCommercialSeller`.
   final bool sellerIsCommercial;
+
+  /// Firmierung des gewerblichen Verkäufers, snapshot zur Listing-Zeit.
+  /// DSA Art. 30 / § 5 DDG Pflichtinfo. Nur für commercial sellers.
+  final String? sellerLegalEntityName;
+
+  /// USt-IdNr des gewerblichen Verkäufers, snapshot zur Listing-Zeit.
+  /// DSA Art. 30 / § 5 DDG Pflichtinfo. Nur für commercial sellers.
+  final String? sellerVatId;
   final double price;
   final CardCondition condition;
   final int quantity;
@@ -54,6 +62,8 @@ class MarketListing {
     this.sellerRating = 0,
     this.sellerSales = 0,
     this.sellerIsCommercial = false,
+    this.sellerLegalEntityName,
+    this.sellerVatId,
     required this.price,
     required this.condition,
     this.quantity = 1,
@@ -165,6 +175,8 @@ class MarketListing {
       sellerRating: (d['sellerRating'] as num?)?.toDouble() ?? 0,
       sellerSales: d['sellerSales'] as int? ?? 0,
       sellerIsCommercial: d['sellerIsCommercial'] as bool? ?? false,
+      sellerLegalEntityName: d['sellerLegalEntityName'] as String?,
+      sellerVatId: d['sellerVatId'] as String?,
       price: (d['price'] as num?)?.toDouble() ?? 0,
       condition: CardCondition.values.firstWhere(
         (c) => c.name == d['condition'],

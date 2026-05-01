@@ -59,6 +59,12 @@ class SocialScreenState extends State<SocialScreen> {
   // Edit profile controllers
   final _nameController = TextEditingController();
   final _bioController = TextEditingController();
+  // Address fields editable from Edit Profile (2026-05-01).
+  // Single source of truth = UserProfile; on save we also mirror to
+  // SellerProfile.address so the DSA imprint stays in sync.
+  final _streetController = TextEditingController();
+  final _cityController = TextEditingController();
+  final _zipController = TextEditingController();
   final _avatarController = TextEditingController();
   String? _selectedCountry;
 
@@ -206,6 +212,9 @@ class SocialScreenState extends State<SocialScreen> {
     _nameDebounce?.cancel();
     _nameController.dispose();
     _bioController.dispose();
+    _streetController.dispose();
+    _cityController.dispose();
+    _zipController.dispose();
     _avatarController.dispose();
     _searchController.dispose();
     PublicDeckService.instance.removeListener(_refresh);
@@ -361,6 +370,9 @@ class SocialScreenState extends State<SocialScreen> {
                     _bioController.text = p?.bio ?? '';
                     _avatarController.text = p?.avatarUrl ?? '';
                     _selectedCountry = p?.country;
+                    _streetController.text = p?.street ?? '';
+                    _cityController.text = p?.city ?? '';
+                    _zipController.text = p?.zip ?? '';
                     _privacyWinRate = p?.isWinRateVisible ?? true;
                     _privacyCollection = p?.isCollectionVisible ?? true;
                     _privacyMatchCount = p?.isMatchCountVisible ?? true;
@@ -964,6 +976,43 @@ class SocialScreenState extends State<SocialScreen> {
               ),
             ]),
             const SizedBox(height: AppSpacing.lg),
+            // Address (used for shipping + DSA-imprint at commercial sellers).
+            // 2026-05-01: BACKLOG Ticket — mirror to sellerProfile.address
+            // on save, so the public imprint stays in sync.
+            Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(
+                'Address',
+                style: AppTextStyles.bodySmallSecondary
+                    .copyWith(fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: AppSpacing.sm),
+              _buildField('Street', _streetController, hintText: 'Street'),
+              const SizedBox(height: AppSpacing.sm),
+              Row(children: [
+                Expanded(
+                  flex: 2,
+                  child: _buildField('City', _cityController,
+                      hintText: 'City'),
+                ),
+                const SizedBox(width: AppSpacing.md),
+                Expanded(
+                  child: _buildField('ZIP', _zipController, hintText: 'ZIP'),
+                ),
+              ]),
+              if (SellerService.instance.profile?.isCommercialSeller ==
+                  true) ...[
+                const SizedBox(height: AppSpacing.sm),
+                Text(
+                  'Your address is publicly visible in the seller imprint '
+                  '(§ 5 DDG / Art. 30 DSA).',
+                  style: AppTextStyles.tiny.copyWith(
+                    color: AppColors.textMuted,
+                    fontStyle: FontStyle.italic,
+                  ),
+                ),
+              ],
+            ]),
+            const SizedBox(height: AppSpacing.lg),
             // Privacy toggles
             Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               Text('Privacy', style: AppTextStyles.bodySmallSecondary.copyWith(fontWeight: FontWeight.bold)),
@@ -1269,11 +1318,18 @@ class SocialScreenState extends State<SocialScreen> {
     final currentChanges = existing?.nameChangesLeft ?? 1;
     final newChangesLeft = nameChanged ? (currentChanges - 1).clamp(0, 99) : currentChanges;
 
+    final newStreet = _streetController.text.trim();
+    final newCity = _cityController.text.trim();
+    final newZip = _zipController.text.trim();
+
     final profile = (existing ?? const UserProfile()).copyWith(
       displayName: newName,
       bio: _bioController.text.trim(),
       avatarUrl: _avatarController.text.trim().isEmpty ? null : _avatarController.text.trim(),
       country: _selectedCountry,
+      street: newStreet.isEmpty ? null : newStreet,
+      city: newCity.isEmpty ? null : newCity,
+      zip: newZip.isEmpty ? null : newZip,
       nameChangesLeft: newChangesLeft,
       showWinRate: _privacyWinRate,
       showCollectionProgress: _privacyCollection,
@@ -1282,6 +1338,32 @@ class SocialScreenState extends State<SocialScreen> {
     );
     if (!_isDemo) {
       await ProfileService.instance.updateProfile(profile);
+
+      // Mirror address to sellerProfile.address if the user is already a
+      // seller — keeps DSA imprint in sync without forcing the user to
+      // re-do seller onboarding (BACKLOG Pre-Launch Legal Track).
+      final seller = SellerService.instance.profile;
+      if (seller != null &&
+          newStreet.isNotEmpty &&
+          newCity.isNotEmpty &&
+          newZip.isNotEmpty &&
+          _selectedCountry != null) {
+        final newAddress = SellerAddress(
+          name: seller.address?.name ?? newName,
+          street: newStreet,
+          city: newCity,
+          zip: newZip,
+          country: _selectedCountry!,
+        );
+        await SellerService.instance.saveProfile(
+          displayName: seller.displayName ?? newName,
+          email: seller.email ?? '',
+          address: newAddress,
+          isCommercialSeller: seller.isCommercialSeller,
+          vatId: seller.vatId,
+          legalEntityName: seller.legalEntityName,
+        );
+      }
     }
     if (mounted) {
       setState(() => _view = 'home');

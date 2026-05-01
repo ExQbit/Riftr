@@ -1,6 +1,6 @@
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const { onRequest, onCall, HttpsError } = require("firebase-functions/v2/https");
-const { onDocumentCreated } = require("firebase-functions/v2/firestore");
+const { onDocumentCreated, onDocumentWritten } = require("firebase-functions/v2/firestore");
 const admin = require("firebase-admin");
 const crypto = require("crypto");
 
@@ -2782,6 +2782,11 @@ exports.createPaymentIntent = onCall(
       // damit Widerrufserklaerung an den Verkaeufer adressiert werden kann
       // (§ 312i BGB + Art. 246a EGBGB, AGB-Anhang-1 Abschnitt B).
       sellerEmail: sellerProfileData.email || null,
+      // DSA Art. 30 / § 5 DDG (2026-05-01): Pflicht-Imprint-Felder fuer
+      // gewerbliche Verkaeufer, snapshot zur Order-Zeit damit der Kaeufer
+      // die zum Vertragsschluss gueltigen Daten dauerhaft sieht.
+      sellerLegalEntityName: sellerProfileData.legalEntityName || null,
+      sellerVatId: sellerProfileData.vatId || null,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
@@ -3117,6 +3122,8 @@ exports.processMultiSellerCart = onCall(
     const sellerAddresses = new Map();
     const sellerIsCommercialMap = new Map(); // sellerId -> bool (Discogs-Modell)
     const sellerEmailMap = new Map(); // sellerId -> email (Item 5, AGB-Anhang-1)
+    const sellerLegalEntityMap = new Map(); // sellerId -> legalEntityName (DSA Art. 30)
+    const sellerVatIdMap = new Map(); // sellerId -> vatId (DSA Art. 30)
 
     for (const sellerId of sellerIds) {
       const sellerProfRef = db.collection("artifacts").doc(APP_ID)
@@ -3174,6 +3181,8 @@ exports.processMultiSellerCart = onCall(
         sellerProfData.isCommercialSeller === true,
       );
       sellerEmailMap.set(sellerId, sellerProfData.email || null);
+      sellerLegalEntityMap.set(sellerId, sellerProfData.legalEntityName || null);
+      sellerVatIdMap.set(sellerId, sellerProfData.vatId || null);
     }
 
     // 3. Buyer info
@@ -3543,6 +3552,8 @@ exports.processMultiSellerCart = onCall(
         // Zeit einfrieren — siehe createPaymentIntent Single-Seller-Pfad.
         sellerIsCommercial: sellerIsCommercialMap.get(group.sellerId) === true,
         sellerEmail: sellerEmailMap.get(group.sellerId) || null,
+        sellerLegalEntityName: sellerLegalEntityMap.get(group.sellerId) || null,
+        sellerVatId: sellerVatIdMap.get(group.sellerId) || null,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
 
@@ -5865,11 +5876,23 @@ async function syncPlayerProfile(uid) {
       ...(profile.bio ? { bio: profile.bio } : {}),
       ...(profile.country ? { country: profile.country } : {}),
       ...(profile.city ? { city: profile.city } : {}),
-      // From sellerProfile (reputation — public stats only, NEVER PII like email/address)
+      // From sellerProfile (reputation — public stats only, NEVER PII like email/address
+      // for *private* sellers).
       ...(seller.rating != null ? { rating: seller.rating } : {}),
       ...(seller.reviewCount != null ? { reviewCount: seller.reviewCount } : {}),
       ...(seller.totalSales != null ? { totalSales: seller.totalSales } : {}),
       ...(seller.memberSince ? { memberSince: seller.memberSince } : {}),
+      // DSA Art. 30 / § 5 DDG (2026-05-01): bei gewerblichen Verkaeufern
+      // sind Firmierung, USt-IdNr, Anschrift und Kontakt-Email *gesetzlich
+      // pflicht-oeffentlich* — daher in den Public-Mirror, nicht versteckt.
+      // Bei privaten Verkaeufern bleibt der Mirror PII-frei (kein Spread).
+      isCommercialSeller: seller.isCommercialSeller === true,
+      ...(seller.isCommercialSeller === true ? {
+        ...(seller.legalEntityName ? { sellerLegalEntityName: seller.legalEntityName } : {}),
+        ...(seller.vatId ? { sellerVatId: seller.vatId } : {}),
+        ...(seller.address ? { sellerAddress: seller.address } : {}),
+        ...(seller.email ? { sellerEmail: seller.email } : {}),
+      } : {}),
       updatedAt: new Date().toISOString(),
     };
 
@@ -8298,6 +8321,18 @@ exports.populateListingSellerStats = onDocumentCreated(
         updateData.sellerRating = sellerRating;
         updateData.sellerSales = sellerSales;
       }
+      // DSA Art. 30 / § 5 DDG (2026-05-01): bei gewerblichen Verkaeufern
+      // Imprint-Felder (Firmierung + USt-IdNr) zur Listing-Zeit snapshotten,
+      // damit das Frontend die Pflichtinfos ohne Cross-User-Read anzeigen
+      // kann.
+      if (sellerIsCommercial) {
+        if (seller.legalEntityName) {
+          updateData.sellerLegalEntityName = seller.legalEntityName;
+        }
+        if (seller.vatId) {
+          updateData.sellerVatId = seller.vatId;
+        }
+      }
 
       await snap.ref.update(updateData);
       console.log(
@@ -8306,6 +8341,37 @@ exports.populateListingSellerStats = onDocumentCreated(
     } catch (err) {
       console.error(
         `populateListingSellerStats: ${snap.id} failed: ${err.message}`,
+      );
+    }
+  },
+);
+
+/**
+ * Triggered on every write to a user's sellerProfile doc — keeps the
+ * public playerProfiles mirror in sync. Ensures DSA Art. 30 / § 5 DDG
+ * imprint fields (legalEntityName, vatId, address, email) appear in
+ * the public mirror immediately after a private→commercial reclass
+ * (or initial commercial onboarding), without waiting for the next
+ * review/delivery sync.
+ *
+ * Skip if no isCommercialSeller field on the new state — partial
+ * writes without status info shouldn't trigger a sync.
+ */
+exports.syncSellerProfileToPlayerMirror = onDocumentWritten(
+  {
+    document: "artifacts/{appId}/users/{uid}/data/sellerProfile",
+    region: "europe-west1",
+    timeoutSeconds: 30,
+  },
+  async (event) => {
+    const uid = event.params.uid;
+    if (!uid) return;
+    try {
+      await syncPlayerProfile(uid);
+      console.log(`syncSellerProfileToPlayerMirror: synced uid=${uid}`);
+    } catch (err) {
+      console.error(
+        `syncSellerProfileToPlayerMirror(${uid}) failed: ${err.message}`,
       );
     }
   },

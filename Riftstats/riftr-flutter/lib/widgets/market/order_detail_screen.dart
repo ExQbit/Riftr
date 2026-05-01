@@ -2,7 +2,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../../data/shipping_rates.dart';
 import '../../models/market/order_model.dart';
-import '../../models/market/seller_profile.dart';
 import '../../screens/legal_screen.dart';
 import '../../services/order_service.dart';
 import '../../theme/app_components.dart';
@@ -16,6 +15,7 @@ import 'order_price_summary.dart';
 import 'order_tile.dart';
 import 'order_timeline.dart';
 import 'refund_path_choice_sheet.dart';
+import 'seller_imprint_card.dart';
 import 'seller_status_badge.dart';
 import 'widerruf_modal.dart';
 import '../../screens/seller_reviews_screen.dart';
@@ -673,12 +673,6 @@ class _OrderDetailScreenState extends State<OrderDetailScreen> {
       final sellerName = order.sellerName ?? 'Seller';
       final canTap = order.sellerId.isNotEmpty
           && widget.onViewSellerListings != null;
-      // Pflicht-Kontakt-Daten fuer gewerbliche Verkaeufer (§ 312i BGB +
-      // Art. 246a EGBGB + § 5 DDG / Art. 30 DSA): Email + Anschrift, damit
-      // Verbraucher-Kaeufer die Widerrufserklaerung an den Verkaeufer
-      // adressieren kann (Riftr-AGB-Anhang-1 Abschnitt B).
-      final showContact = order.sellerIsCommercial &&
-          (order.sellerEmail != null || order.sellerAddress != null);
       return Padding(
         padding: const EdgeInsets.only(bottom: AppSpacing.lg),
         child: Column(
@@ -692,105 +686,48 @@ class _OrderDetailScreenState extends State<OrderDetailScreen> {
                       widget.onViewSellerListings!(order.sellerId, sellerName);
                     }
                   : null,
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
+              child: Row(
                 children: [
-                  Row(
-                    children: [
-                      Icon(Icons.storefront, size: 16, color: AppColors.textMuted),
-                      const SizedBox(width: AppSpacing.sm),
-                      Expanded(
-                        child: Text(
-                          sellerName,
-                          style: AppTextStyles.body
-                              .copyWith(fontWeight: FontWeight.w600),
-                        ),
-                      ),
-                      SellerStatusBadge(
-                        isCommercial: order.sellerIsCommercial,
-                        compact: true,
-                      ),
-                      if (canTap) ...[
-                        const SizedBox(width: AppSpacing.sm),
-                        Icon(Icons.chevron_right,
-                            size: 16, color: AppColors.textMuted),
-                      ],
-                    ],
-                  ),
-                  if (showContact) ...[
-                    const SizedBox(height: AppSpacing.md),
-                    Container(
-                      width: double.infinity,
-                      height: 1,
-                      color: AppColors.border,
+                  Icon(Icons.storefront, size: 16, color: AppColors.textMuted),
+                  const SizedBox(width: AppSpacing.sm),
+                  Expanded(
+                    child: Text(
+                      sellerName,
+                      style: AppTextStyles.body
+                          .copyWith(fontWeight: FontWeight.w600),
                     ),
-                    const SizedBox(height: AppSpacing.md),
-                    if (order.sellerEmail != null)
-                      _sellerContactRow(
-                        icon: Icons.mail_outline,
-                        label: 'Email',
-                        value: order.sellerEmail!,
-                      ),
-                    if (order.sellerAddress != null &&
-                        order.sellerAddress!.isComplete) ...[
-                      if (order.sellerEmail != null)
-                        const SizedBox(height: AppSpacing.sm),
-                      _sellerContactRow(
-                        icon: Icons.location_on_outlined,
-                        label: 'Address',
-                        value: _formatSellerAddress(order.sellerAddress!),
-                      ),
-                    ],
+                  ),
+                  SellerStatusBadge(
+                    isCommercial: order.sellerIsCommercial,
+                    compact: true,
+                  ),
+                  if (canTap) ...[
+                    const SizedBox(width: AppSpacing.sm),
+                    Icon(Icons.chevron_right,
+                        size: 16, color: AppColors.textMuted),
                   ],
                 ],
               ),
             ),
+            // DSA Art. 30 / § 5 DDG Pflicht-Imprint fuer gewerbliche
+            // Verkaeufer. Bei privaten Verkaeufern rendert das Widget
+            // SizedBox.shrink (keine Offenlegungspflicht).
+            if (order.sellerIsCommercial) ...[
+              const SizedBox(height: AppSpacing.sm),
+              SellerImprintCard(
+                isCommercial: order.sellerIsCommercial,
+                legalEntityName: order.sellerLegalEntityName,
+                vatId: order.sellerVatId,
+                address: order.sellerAddress,
+                email: order.sellerEmail,
+              ),
+            ],
           ],
         ),
       );
     }
     // Seller already sees buyer address in shipping section
     return const SizedBox.shrink();
-  }
-
-  Widget _sellerContactRow({
-    required IconData icon,
-    required String label,
-    required String value,
-  }) {
-    return Row(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Icon(icon, size: 14, color: AppColors.textMuted),
-        const SizedBox(width: AppSpacing.sm),
-        SizedBox(
-          width: 64,
-          child: Text(
-            label,
-            style: AppTextStyles.tiny.copyWith(
-              color: AppColors.textMuted,
-              fontWeight: FontWeight.w700,
-            ),
-          ),
-        ),
-        Expanded(
-          child: Text(
-            value,
-            style: AppTextStyles.bodySmall
-                .copyWith(color: AppColors.textPrimary, height: 1.4),
-          ),
-        ),
-      ],
-    );
-  }
-
-  String _formatSellerAddress(SellerAddress a) {
-    final parts = <String>[
-      a.street.trim(),
-      [a.zip.trim(), a.city.trim()].where((s) => s.isNotEmpty).join(' '),
-      a.country.trim(),
-    ].where((s) => s.isNotEmpty).toList();
-    return parts.join(', ');
   }
 
   // ── Dispute info ────────────────────────────────────
