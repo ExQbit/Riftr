@@ -8378,6 +8378,140 @@ exports.syncSellerProfileToPlayerMirror = onDocumentWritten(
 );
 
 /**
+ * Daily carry-forward of portfolio_history snapshots — closes the gap
+ * for users who don't open the app every day.
+ *
+ * **Why not server-side recompute?** The Flutter client computes
+ * portfolio value from market prices using a non-trivial
+ * cardUUID↔cmId matching pass (precise + name/set/rarity fallbacks).
+ * Replicating that on the backend would duplicate logic and risk
+ * drift. Collection mutations (buy/sell/transactions) always happen
+ * in-app, so the value can only have changed since last snapshot
+ * if the user opened the app — in which case the client has already
+ * written today's snapshot. Therefore: copy yesterday's value forward
+ * is correct on idle days.
+ *
+ * **Skip rules:**
+ * - User has no portfolio_history doc at all → don't seed €0 (lying
+ *   about data we don't have). User will get a snapshot organically
+ *   when they next open the app.
+ * - Today's snapshot already exists (Frontend wrote it during this
+ *   day's app-open) → skip, idempotent.
+ *
+ * Schedule: 04:00 Berlin daily (before the existing dispute crons at
+ * 04:30/05:00/05:30, so it doesn't compete for the morning batch).
+ */
+async function _runPortfolioCarryForward() {
+  const todayKey = new Date().toISOString().slice(0, 10); // YYYY-MM-DD UTC
+  const usersRef = db.collection("artifacts").doc(APP_ID).collection("users");
+  const userRefs = await usersRef.listDocuments();
+
+  let extended = 0;
+  let skippedAlreadyToday = 0;
+  let skippedNoHistory = 0;
+  let errored = 0;
+
+  for (const userRef of userRefs) {
+    try {
+      const phRef = userRef.collection("data").doc("portfolio_history");
+      const phDoc = await phRef.get();
+
+      if (!phDoc.exists) {
+        skippedNoHistory++;
+        continue;
+      }
+
+      const data = phDoc.data() || {};
+      const snapshots = data.snapshots || {};
+      const dateKeys = Object.keys(snapshots);
+
+      if (dateKeys.length === 0) {
+        skippedNoHistory++;
+        continue;
+      }
+
+      if (snapshots[todayKey]) {
+        skippedAlreadyToday++;
+        continue;
+      }
+
+      // Find the most-recent past snapshot.
+      dateKeys.sort();
+      const latestKey = dateKeys[dateKeys.length - 1];
+      const latest = snapshots[latestKey];
+
+      if (latest == null) {
+        skippedNoHistory++;
+        continue;
+      }
+
+      // Carry the same shape forward — both legacy (number) and v2
+      // ({v,u,r,p}) maps roundtrip cleanly through merge.
+      const carryValue = (typeof latest === "number")
+        ? latest
+        : { ...latest };
+
+      await phRef.set(
+        {
+          snapshots: { [todayKey]: carryValue },
+          lastUpdated: new Date().toISOString(),
+        },
+        { merge: true },
+      );
+      extended++;
+    } catch (err) {
+      errored++;
+      console.error(
+        `dailyPortfolioCarryForward(${userRef.id}) failed: ${err.message}`,
+      );
+    }
+  }
+
+  console.log(
+    `dailyPortfolioCarryForward: extended=${extended} ` +
+    `skipped(today-exists)=${skippedAlreadyToday} ` +
+    `skipped(no-history)=${skippedNoHistory} ` +
+    `errors=${errored} of ${userRefs.length} users`,
+  );
+  return { extended, skippedAlreadyToday, skippedNoHistory, errored, total: userRefs.length };
+}
+
+exports._runPortfolioCarryForward = _runPortfolioCarryForward;
+
+exports.dailyPortfolioCarryForward = onSchedule(
+  {
+    schedule: "0 4 * * *",
+    timeZone: "Europe/Berlin",
+    region: "europe-west1",
+    timeoutSeconds: 540, // up to 9min (large user-base safety)
+    memory: "512MiB",
+  },
+  async () => {
+    await _runPortfolioCarryForward();
+  },
+);
+
+/**
+ * devTriggerPortfolioCarryForward — admin-only HTTP test trigger for
+ * `_runPortfolioCarryForward`. Pattern matches the dispute-cron dev
+ * triggers (devTriggerStaleShipments, devTriggerSellerSilence, etc.).
+ */
+exports.devTriggerPortfolioCarryForward = onCall(
+  { region: "europe-west1", timeoutSeconds: 540 },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Must be signed in");
+    }
+    if (request.auth.token.admin !== true) {
+      throw new HttpsError("permission-denied", "Admin only");
+    }
+    console.log(`devTriggerPortfolioCarryForward invoked by admin=${request.auth.uid}`);
+    const result = await _runPortfolioCarryForward();
+    return result;
+  },
+);
+
+/**
  * Clean up expired cart reservations (runs every 5 minutes).
  */
 exports.cleanExpiredReservations = onSchedule(
