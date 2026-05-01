@@ -64,6 +64,14 @@ class SellerService extends ChangeNotifier {
   /// `isCommercialSeller=true` werden vatId + legalEntityName gespeichert
   /// und [commercialDeclaredAt] auf jetzt gesetzt (Audit-Log fuer
   /// § 308 Nr. 4 BGB — keine stille Re-Klassifizierung).
+  ///
+  /// Schreibt nur User-editable Felder (Firestore-Rules-Allowlist:
+  /// displayName, email, country, address, isCommercialSeller, vatId,
+  /// legalEntityName, commercialDeclaredAt, memberSince, updatedAt).
+  /// CF-managed Felder (rating, reviewCount, totalSales, totalRevenue,
+  /// strikes, suspended, emailVerified, stripeAccountId, stripeOnboarded)
+  /// werden NICHT vom Client geschrieben — die Defaults greifen erst beim
+  /// ersten CF-Lifecycle-Event oder durch fromMap-Read-Defaults.
   Future<bool> saveProfile({
     required String displayName,
     required String email,
@@ -81,20 +89,28 @@ class SellerService extends ChangeNotifier {
           ? DateTime.now()
           : _profile?.commercialDeclaredAt;
 
-      final data = (_profile ?? const SellerProfile()).copyWith(
-        displayName: displayName,
-        email: email,
-        country: address.country,
-        address: address,
-        memberSince: _profile?.memberSince ?? DateTime.now(),
-        isCommercialSeller: isCommercialSeller,
-        vatId: isCommercialSeller ? vatId : null,
-        legalEntityName: isCommercialSeller ? legalEntityName : null,
-        commercialDeclaredAt: declaredAt,
-      );
+      // Minimal payload — nur User-editable + Allowlist-konforme Felder.
+      // Verhindert dass CF-managed defaults beim Create vom Client
+      // geschrieben werden (Rules-Reject + Self-Rating-Fraud-Schutz).
+      final data = <String, dynamic>{
+        'displayName': displayName,
+        'email': email,
+        'country': address.country,
+        'address': address.toJson(),
+        'isCommercialSeller': isCommercialSeller,
+        if (isCommercialSeller && vatId != null) 'vatId': vatId,
+        if (isCommercialSeller && legalEntityName != null)
+          'legalEntityName': legalEntityName,
+        if (declaredAt != null)
+          'commercialDeclaredAt': declaredAt.toIso8601String(),
+        if (_profile?.memberSince == null)
+          'memberSince': DateTime.now().toIso8601String(),
+        'updatedAt': DateTime.now().toIso8601String(),
+      };
+
       await FirestoreService.instance
           .userDoc('data', 'sellerProfile')
-          .set(data.toJson(), SetOptions(merge: true));
+          .set(data, SetOptions(merge: true));
       return true;
     } catch (e) {
       debugPrint('SellerService.saveProfile error: $e');
