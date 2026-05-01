@@ -1511,6 +1511,13 @@ exports.sendVerificationCode = onCall(
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
+        // TODO(beta-blocker): switch to verified Riftr domain after
+        //   resend.com/domains verification (BACKLOG Ticket 5). The
+        //   `onboarding@resend.dev` address is Resend's test sandbox and
+        //   only delivers to the verified Resend account owner email
+        //   (currently eladiorubiohernandez@gmail.com). Once
+        //   `mail.getriftr.app` (or chosen domain) is verified, change
+        //   to: `Riftr <noreply@mail.getriftr.app>`
         from: "Riftr <onboarding@resend.dev>",
         to: [email],
         subject: "Your Riftr Verification Code",
