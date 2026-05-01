@@ -15,6 +15,7 @@ import '../widgets/market/checkout_sheet.dart';
 import '../widgets/market/condition_badge.dart';
 import 'admin_disputes_screen.dart';
 import 'legal_screen.dart';
+import '../widgets/market/dac7_status_banner.dart';
 import '../widgets/market/seller_reclassification_sheet.dart';
 import '../services/auth_service.dart';
 import '../services/demo_service.dart';
@@ -356,6 +357,16 @@ class SocialScreenState extends State<SocialScreen> {
               ],
 
               const SizedBox(height: AppSpacing.base),
+
+              // DAC7 / PStTG status banner — prominent for sellers near
+              // or at the threshold. Renders nothing for users without a
+              // seller profile or commercial sellers (exempt).
+              if (!_isDemo && SellerService.instance.profile != null) ...[
+                Dac7StatusBanner(
+                  seller: SellerService.instance.profile!,
+                ),
+                const SizedBox(height: AppSpacing.base),
+              ],
 
               // Theme toggle — hidden for now, infrastructure kept for later
               // TODO: Re-enable when Fire & Gold theme is ready

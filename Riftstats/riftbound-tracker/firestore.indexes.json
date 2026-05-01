@@ -106,6 +106,14 @@
         { "fieldPath": "seen", "order": "ASCENDING" },
         { "fieldPath": "createdAt", "order": "DESCENDING" }
       ]
+    },
+    {
+      "collectionGroup": "sellerProfileAudit",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "field", "order": "ASCENDING" },
+        { "fieldPath": "timestamp", "order": "DESCENDING" }
+      ]
     }
   ],
   "fieldOverrides": [

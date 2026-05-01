@@ -3845,6 +3845,24 @@ exports.confirmDelivery = onCall(
         completedSalesCount: admin.firestore.FieldValue.increment(1),
       }, { merge: true });
 
+      // DAC7 / PStTG private-seller volume counter (BACKLOG Ticket 3,
+      // 2026-05-01). Idempotent because confirmDelivery flips status
+      // delivered inside a TX — the autoReleaseOrders branch only fires
+      // for status=shipped orders and skips this one (status check at
+      // line ~4647). Fire-and-forget on failure: a DAC7 helper error
+      // must NOT block delivery confirmation.
+      try {
+        await _incrementDac7Counter(
+          order.sellerId,
+          order.totalPaid || 0,
+          orderId,
+        );
+      } catch (dac7Err) {
+        console.error(
+          `_incrementDac7Counter (confirmDelivery) failed for ${order.sellerId}: ${dac7Err.message}`,
+        );
+      }
+
       // Record sale prices for analytics
       await recordSales(order, orderId);
 
@@ -4488,6 +4506,19 @@ exports.respondToRefund = onCall(
         console.log(`Reversed realized gains for seller ${order.sellerId}: -€${reversalAmount.toFixed(2)} (${refundPercent}% of ${gainOnRecord.toFixed(2)})`);
       }
 
+      // DAC7 / PStTG (BACKLOG Ticket 3, 2026-05-01): if this order was
+      // already counted toward the year-bucket (= status had advanced
+      // to delivered/auto_completed before the dispute), decrement the
+      // same year-bucket. No-op for orders that never reached that
+      // status. Idempotent via _dac7Decremented flag.
+      try {
+        await _decrementDac7Counter(order.sellerId, orderId);
+      } catch (dac7Err) {
+        console.error(
+          `_decrementDac7Counter (respondToRefund) failed for ${order.sellerId}: ${dac7Err.message}`,
+        );
+      }
+
       // Strike seller only for significant refunds (>50%)
       if (refundPercent > 50) {
         await addStrike(order.sellerId, `Dispute refund ${refundPercent}% on order ${orderId}`);
@@ -4660,6 +4691,22 @@ exports.autoReleaseOrders = onSchedule(
         totalSales: admin.firestore.FieldValue.increment(totalQty),
         totalRevenue: admin.firestore.FieldValue.increment(order.sellerPayout || 0),
       }, { merge: true });
+
+      // DAC7 / PStTG private-seller volume counter (BACKLOG Ticket 3,
+      // 2026-05-01). Same as confirmDelivery — idempotent via
+      // status-flip TX. autoReleaseOrders queries status=shipped, so
+      // already-confirmed orders skip. Fire-and-forget on failure.
+      try {
+        await _incrementDac7Counter(
+          order.sellerId,
+          order.totalPaid || 0,
+          doc.id,
+        );
+      } catch (dac7Err) {
+        console.error(
+          `_incrementDac7Counter (autoReleaseOrders) failed for ${order.sellerId}: ${dac7Err.message}`,
+        );
+      }
 
       // Record sale prices for analytics
       await recordSales(order, doc.id);
@@ -5118,6 +5165,17 @@ async function _runSellerSilenceResolver() {
         await sellerProfileRef.set({
           realizedGains: admin.firestore.FieldValue.increment(-gainOnRecord),
         }, { merge: true });
+      }
+
+      // DAC7 / PStTG: decrement counter if this order was previously
+      // counted (had reached delivered/auto_completed before dispute).
+      // No-op for the typical case of disputed-while-shipped.
+      try {
+        await _decrementDac7Counter(order.sellerId, doc.id);
+      } catch (dac7Err) {
+        console.error(
+          `_decrementDac7Counter (autoResolveSellerSilence) failed for ${order.sellerId}: ${dac7Err.message}`,
+        );
       }
 
       // Strike fuer Verkaeufer (klare Pflichtverletzung — keine Reaktion auf
@@ -5968,6 +6026,349 @@ async function syncSellerTier(sellerId) {
     (stripeFloorActive ? ` (Stripe-Floor aktiv: actual=${stripeDelayDaysActual})` : ""),
   );
 }
+
+// ─── DAC7 / PStTG private-seller volume tracker ─────────────────────
+//
+// Per-seller, per-calendar-year counter of completed sales + gross
+// gross revenue in EUR (= what the buyer paid, before platform fees,
+// per § 5 PStTG). Soft + hard thresholds trigger notifications;
+// 14 days after the hard threshold, listings get auto-suspended
+// unless the seller re-declares as commercial.
+//
+// Soft threshold:  20 transactions OR €1.200 gross
+// Hard threshold:  30 transactions OR €1.800 gross
+//                  (DAC7 statutory limit: 30 Tx OR €2.000 — we keep a
+//                  safety margin per BACKLOG decision)
+//
+// Skip rules:
+// - sellerIsCommercialSeller === true → DAC7 limits don't apply
+// - threshold-reached timestamps are set ONCE; subsequent crossings
+//   don't re-fire notifications
+//
+// Counter storage on sellerProfile:
+//   yearlyCounters: { "2026": { count: int, grossRevenue: number }, ... }
+//   softThresholdReachedAt: Timestamp?
+//   hardThresholdReachedAt: Timestamp?
+//   volumeSuspensionDeadline: Timestamp?  (= hard + 14 days)
+//   volumeSuspended: bool                 (set by enforceVolumeSuspension cron)
+
+const DAC7_SOFT_TX = 20;
+const DAC7_SOFT_EUR = 1200;
+const DAC7_HARD_TX = 30;
+const DAC7_HARD_EUR = 1800;
+const DAC7_HARD_DEADLINE_DAYS = 14;
+
+async function _incrementDac7Counter(sellerId, orderTotalPaid, orderId) {
+  if (!sellerId) return;
+  const grossEur = Number(orderTotalPaid || 0);
+  if (grossEur <= 0) return;
+
+  const sellerRef = db.collection("artifacts").doc(APP_ID)
+    .collection("users").doc(sellerId)
+    .collection("data").doc("sellerProfile");
+  const sellerDoc = await sellerRef.get();
+  if (!sellerDoc.exists) return;
+  const seller = sellerDoc.data();
+
+  // Commercial sellers are exempt from DAC7 thresholds.
+  if (seller.isCommercialSeller === true) return;
+
+  const yearKey = new Date().getUTCFullYear().toString();
+
+  // Mark the order doc so a later refund can decrement the right year
+  // bucket — even if the refund happens in a different calendar year.
+  // Idempotency: if this flag is already set, the order was counted
+  // before; skip to avoid double-counting (e.g. confirmDelivery and
+  // autoReleaseOrders both firing for some race-condition reason).
+  if (orderId) {
+    try {
+      const orderRef = db.collection("artifacts").doc(APP_ID)
+        .collection("orders").doc(orderId);
+      const orderSnap = await orderRef.get();
+      if (orderSnap.exists && orderSnap.data()._dac7Counted === true) {
+        console.log(`_incrementDac7Counter: order ${orderId} already counted, skipping`);
+        return;
+      }
+      await orderRef.update({
+        _dac7Counted: true,
+        _dac7CountedYear: yearKey,
+        _dac7CountedGrossEur: grossEur,
+      });
+    } catch (markErr) {
+      console.error(`_incrementDac7Counter: failed to mark order ${orderId}: ${markErr.message}`);
+      // Continue — the counter increment is more important than the flag.
+    }
+  }
+
+  // Atomic increment in nested map field — works on both initial-create
+  // (Firestore creates the parent map) and update.
+  await sellerRef.update({
+    [`yearlyCounters.${yearKey}.count`]:
+      admin.firestore.FieldValue.increment(1),
+    [`yearlyCounters.${yearKey}.grossRevenue`]:
+      admin.firestore.FieldValue.increment(grossEur),
+    "updatedAt": admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  // Re-read to get post-increment values for threshold check.
+  const after = await sellerRef.get();
+  const afterData = after.data() || {};
+  const bucket = (afterData.yearlyCounters || {})[yearKey] || {
+    count: 0, grossRevenue: 0,
+  };
+  const count = Number(bucket.count || 0);
+  const gross = Number(bucket.grossRevenue || 0);
+
+  const reachedSoft = count >= DAC7_SOFT_TX || gross >= DAC7_SOFT_EUR;
+  const reachedHard = count >= DAC7_HARD_TX || gross >= DAC7_HARD_EUR;
+
+  // Soft threshold — fire once.
+  if (reachedSoft && !afterData.softThresholdReachedAt) {
+    await sellerRef.update({
+      softThresholdReachedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    sendNotification(
+      sellerId,
+      "Approaching commercial threshold",
+      `Du hast dieses Jahr ${count} Verkaeufe (€${gross.toFixed(2)}). ` +
+      `Ab ${DAC7_HARD_TX} Verkaeufen oder €${DAC7_HARD_EUR} musst du dich ` +
+      `als gewerblicher Verkaeufer registrieren (DAC7).`,
+      { type: "dac7_soft", count, grossRevenue: gross },
+    );
+    await _writeDac7Audit(sellerId, "softThresholdReached", {
+      yearKey, count, grossRevenue: gross, orderId,
+    });
+  }
+
+  // Hard threshold — fire once + set 14-day deadline.
+  if (reachedHard && !afterData.hardThresholdReachedAt) {
+    const deadlineMs = Date.now() + DAC7_HARD_DEADLINE_DAYS * 24 * 60 * 60 * 1000;
+    const deadline = new Date(deadlineMs);
+    await sellerRef.update({
+      hardThresholdReachedAt: admin.firestore.FieldValue.serverTimestamp(),
+      volumeSuspensionDeadline: admin.firestore.Timestamp.fromDate(deadline),
+    });
+    sendNotification(
+      sellerId,
+      "Action required: declare commercial",
+      `Du hast die DAC7-Schwelle erreicht (${count} Verkaeufe, ` +
+      `€${gross.toFixed(2)}). Du hast ${DAC7_HARD_DEADLINE_DAYS} Tage ` +
+      `Zeit, dich als gewerblicher Verkaeufer zu registrieren — sonst ` +
+      `werden deine Listings pausiert (§ 4 PStTG).`,
+      {
+        type: "dac7_hard",
+        count, grossRevenue: gross,
+        deadline: deadline.toISOString(),
+      },
+    );
+    await _writeDac7Audit(sellerId, "hardThresholdReached", {
+      yearKey, count, grossRevenue: gross, orderId,
+      deadline: deadline.toISOString(),
+    });
+  }
+}
+
+/**
+ * Decrement the DAC7 counter for a previously-counted sale that got
+ * refunded. Reads the year-bucket from the order doc (`_dac7CountedYear`)
+ * so a refund in 2027 of a 2026 sale correctly decrements the 2026
+ * bucket. Idempotent via `_dac7Decremented` flag — second call no-ops.
+ *
+ * Does NOT clear soft/hard threshold timestamps even if the counter
+ * drops below the threshold again. Once a seller has been notified that
+ * they're approaching/at the limit, that audit-log entry stays. The
+ * downstream effect (volumeSuspended, deadline) lifts only via re-
+ * declaration, not by passing back below the threshold via refunds.
+ */
+async function _decrementDac7Counter(sellerId, orderId) {
+  if (!sellerId || !orderId) return;
+  const orderRef = db.collection("artifacts").doc(APP_ID)
+    .collection("orders").doc(orderId);
+  const orderSnap = await orderRef.get();
+  if (!orderSnap.exists) return;
+  const order = orderSnap.data();
+
+  if (order._dac7Counted !== true) return; // never counted, nothing to undo
+  if (order._dac7Decremented === true) return; // already decremented
+
+  const yearKey = order._dac7CountedYear ||
+    new Date().getUTCFullYear().toString();
+  const grossEur = Number(order._dac7CountedGrossEur || order.totalPaid || 0);
+  if (grossEur <= 0) return;
+
+  const sellerRef = db.collection("artifacts").doc(APP_ID)
+    .collection("users").doc(sellerId)
+    .collection("data").doc("sellerProfile");
+
+  await sellerRef.update({
+    [`yearlyCounters.${yearKey}.count`]:
+      admin.firestore.FieldValue.increment(-1),
+    [`yearlyCounters.${yearKey}.grossRevenue`]:
+      admin.firestore.FieldValue.increment(-grossEur),
+    "updatedAt": admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  await orderRef.update({ _dac7Decremented: true });
+
+  await _writeDac7Audit(sellerId, "saleDecrementedAfterRefund", {
+    yearKey, grossRevenue: grossEur, orderId,
+  });
+}
+
+exports._decrementDac7Counter = _decrementDac7Counter;
+
+async function _writeDac7Audit(sellerId, eventType, payload) {
+  try {
+    const auditRef = db.collection("artifacts").doc(APP_ID)
+      .collection("users").doc(sellerId)
+      .collection("sellerProfileAudit").doc();
+    await auditRef.set({
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      field: "dac7",
+      eventType,
+      ...payload,
+      triggeredBy: "_incrementDac7Counter",
+    });
+  } catch (err) {
+    console.error(`_writeDac7Audit(${sellerId}, ${eventType}) failed: ${err.message}`);
+  }
+}
+
+exports._incrementDac7Counter = _incrementDac7Counter;
+exports._writeDac7Audit = _writeDac7Audit;
+
+/**
+ * Daily cron — find sellers whose hardThresholdReachedAt + 14 days has
+ * passed without re-declaration, and flip volumeSuspended=true. Idempotent
+ * via volumeSuspended-flag check.
+ *
+ * Schedule: 04:15 Europe/Berlin (between portfolio-carry-forward at 04:00
+ * and stale-shipments at 04:30).
+ *
+ * Skip rules:
+ * - isCommercialSeller=true → re-declared in time, deadline canceled
+ *   (handled at re-declaration time — flags get cleared there)
+ * - volumeSuspended already true → idempotent skip
+ * - volumeSuspensionDeadline not yet passed → not yet
+ */
+async function _runEnforceVolumeSuspension() {
+  const now = admin.firestore.Timestamp.now();
+  const userRefs = await db.collection("artifacts").doc(APP_ID)
+    .collection("users").listDocuments();
+
+  let suspended = 0;
+  let skippedAlreadySuspended = 0;
+  let skippedCommercial = 0;
+  let skippedDeadlineFuture = 0;
+  let skippedNoDeadline = 0;
+  let errored = 0;
+
+  for (const userRef of userRefs) {
+    try {
+      const sellerRef = userRef.collection("data").doc("sellerProfile");
+      const sellerDoc = await sellerRef.get();
+      if (!sellerDoc.exists) continue;
+      const seller = sellerDoc.data();
+
+      const deadline = seller.volumeSuspensionDeadline;
+      if (!deadline) {
+        skippedNoDeadline++;
+        continue;
+      }
+      if (seller.volumeSuspended === true) {
+        skippedAlreadySuspended++;
+        continue;
+      }
+      if (seller.isCommercialSeller === true) {
+        skippedCommercial++;
+        continue;
+      }
+
+      const deadlineMs = (typeof deadline.toMillis === "function")
+        ? deadline.toMillis()
+        : new Date(deadline).getTime();
+      if (!deadlineMs || now.toMillis() < deadlineMs) {
+        skippedDeadlineFuture++;
+        continue;
+      }
+
+      // Suspend.
+      await sellerRef.update({
+        volumeSuspended: true,
+        volumeSuspendedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      sendNotification(
+        userRef.id,
+        "Listings paused — DAC7 deadline expired",
+        "Du hast die 14-Tage-Frist zur Anmeldung als gewerblicher " +
+        "Verkaeufer ueberschritten. Deine Listings sind pausiert. " +
+        "Wechsle in Profil → 'Switch to commercial seller' um fortzufahren.",
+        { type: "dac7_suspension_applied" },
+      );
+
+      await _writeDac7Audit(userRef.id, "volumeSuspensionApplied", {
+        deadlineWas: new Date(deadlineMs).toISOString(),
+        appliedAt: new Date().toISOString(),
+      });
+
+      suspended++;
+    } catch (err) {
+      errored++;
+      console.error(
+        `_runEnforceVolumeSuspension(${userRef.id}) failed: ${err.message}`,
+      );
+    }
+  }
+
+  console.log(
+    `enforceVolumeSuspension: suspended=${suspended} ` +
+    `skipped(already)=${skippedAlreadySuspended} ` +
+    `skipped(commercial)=${skippedCommercial} ` +
+    `skipped(future-deadline)=${skippedDeadlineFuture} ` +
+    `skipped(no-deadline)=${skippedNoDeadline} ` +
+    `errors=${errored} of ${userRefs.length} users`,
+  );
+  return {
+    suspended,
+    skippedAlreadySuspended,
+    skippedCommercial,
+    skippedDeadlineFuture,
+    skippedNoDeadline,
+    errored,
+    total: userRefs.length,
+  };
+}
+
+exports._runEnforceVolumeSuspension = _runEnforceVolumeSuspension;
+
+exports.enforceVolumeSuspension = onSchedule(
+  {
+    schedule: "15 4 * * *",
+    timeZone: "Europe/Berlin",
+    region: "europe-west1",
+    timeoutSeconds: 540,
+    memory: "512MiB",
+  },
+  async () => {
+    await _runEnforceVolumeSuspension();
+  },
+);
+
+exports.devTriggerEnforceVolumeSuspension = onCall(
+  { region: "europe-west1", timeoutSeconds: 540 },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Must be signed in");
+    }
+    if (request.auth.token.admin !== true) {
+      throw new HttpsError("permission-denied", "Admin only");
+    }
+    console.log(`devTriggerEnforceVolumeSuspension invoked by admin=${request.auth.uid}`);
+    return await _runEnforceVolumeSuspension();
+  },
+);
 
 /**
  * setSellerDelayDays — Admin-Cloud-Function für manuellen Override.
@@ -8371,6 +8772,54 @@ exports.syncSellerProfileToPlayerMirror = onDocumentWritten(
   async (event) => {
     const uid = event.params.uid;
     if (!uid) return;
+
+    // DAC7 / PStTG (BACKLOG Ticket 4, 2026-05-01): clear DAC7 throttle
+    // flags when a seller re-declares as commercial. Done here as Admin
+    // SDK so it bypasses the user-write Firestore rules (those fields are
+    // CF-managed by design, user can't clear them client-side).
+    try {
+      const before = event.data?.before?.data() || {};
+      const after = event.data?.after?.data() || {};
+      const wasPrivate = before.isCommercialSeller !== true;
+      const isNowCommercial = after.isCommercialSeller === true;
+      if (wasPrivate && isNowCommercial) {
+        const sellerRef = db.collection("artifacts").doc(APP_ID)
+          .collection("users").doc(uid)
+          .collection("data").doc("sellerProfile");
+        const cleanup = {};
+        if (after.softThresholdReachedAt != null) {
+          cleanup.softThresholdReachedAt =
+            admin.firestore.FieldValue.delete();
+        }
+        if (after.hardThresholdReachedAt != null) {
+          cleanup.hardThresholdReachedAt =
+            admin.firestore.FieldValue.delete();
+        }
+        if (after.volumeSuspensionDeadline != null) {
+          cleanup.volumeSuspensionDeadline =
+            admin.firestore.FieldValue.delete();
+        }
+        const wasVolumeSuspended = after.volumeSuspended === true;
+        if (wasVolumeSuspended) {
+          cleanup.volumeSuspended = false;
+        }
+        if (Object.keys(cleanup).length > 0) {
+          await sellerRef.update(cleanup);
+          await _writeDac7Audit(uid, "volumeSuspensionLifted", {
+            reason: "commercial_re_declaration",
+            wasVolumeSuspended,
+          });
+          console.log(
+            `syncSellerProfileToPlayerMirror: cleared DAC7 flags for ${uid} (re-declared commercial)`,
+          );
+        }
+      }
+    } catch (dac7Err) {
+      console.error(
+        `syncSellerProfileToPlayerMirror DAC7 cleanup(${uid}) failed: ${dac7Err.message}`,
+      );
+    }
+
     try {
       await syncPlayerProfile(uid);
       console.log(`syncSellerProfileToPlayerMirror: synced uid=${uid}`);

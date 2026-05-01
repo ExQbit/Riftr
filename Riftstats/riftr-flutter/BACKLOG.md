@@ -377,19 +377,18 @@ Test-Suite: `functions/test-scenarios/phase8_e2e_tests.js` — 46/46 Checks grue
       - [ ] Seller-Profile-Page — noch offen
 - [ ] Bei gewerblichen Verkaeufern: § 5 DDG / Art. 30 DSA-Pflichtinfos anzeigen (Firmierung, Adresse, USt-IdNr, etc.)
 
-**Ticket 3 — Privat-Limit-Backend**
-- [ ] Counter pro Kalenderjahr, Reset 1.1. 00:00 UTC
-- [ ] **Counter zaehlt Brutto-Vergueting** (Listing-Preis × Menge, vor Plattform-Gebuehren) — NICHT Netto-Auszahlung
-      - Begruendung: PStTG zaehlt "gezahlte/gutgeschriebene Verguetung" = Brutto vom Kaeufer
-      - Implementation-Note: Verkaeufer kriegt €1.692 ausgezahlt, Counter steht aber bei €1.800 — das ist die rechtlich saubere Logik
-- [ ] Tracker fuer (a) Anzahl abgeschlossener Verkaeufe, (b) kumulierter Brutto-Umsatz
-- [ ] Trigger Soft-Schwelle (20 Tx oder €1.200): Notification only (Push + Email)
-- [ ] Trigger Hard-Schwelle (30 Tx oder €1.800): Notification + 14-Tage-Countdown + Listing-Suspension nach Frist
-- [ ] **Suspension-Flag persistiert UNABHAENGIG vom Counter-Reset** — sonst hebt der 1.1.-Reset versehentlich die Suspension auf. Edge-Case: Verkaeufer reisst Schwelle 31.12., reagiert nicht, am 1.1. resettet Counter aber Suspension bleibt bis Re-Deklaration.
-- [ ] Definition "abgeschlossener Verkauf": Zahlung + Stripe-Gutschrift + keine Rueckabwicklung im delay_days-Zeitraum; bei nachtraeglicher Rueckabwicklung Counter dekrementieren; Multi-Item-Bestellung = 1 Verkauf (nicht n Verkaeufe)
-- [ ] Trigger-Audit-Log (DSA Art. 17 Begruendungspflicht — beim Suspendieren genau dokumentieren welche Schwelle wann gerissen)
-- [ ] Re-Deklarations-Endpoint: setzt Counter zurueck und schaltet auf gewerblich um (mit Daten-Erhebung Art. 30 DSA + DAC7)
-- [ ] Abuse-Schutz: Limits-Reset nicht durch Account-Loeschung + Wiederanlage — Stripe-Connected-Account-Bindung als Identifier
+**Ticket 3 — Privat-Limit-Backend** — ✅ **erledigt 2026-05-01** (Discogs-DAC7-Sprint)
+- [x] Counter pro Kalenderjahr (UTC) als nested map `yearlyCounters.{YYYY}.{count,grossRevenue}` auf `sellerProfile`. Reset durch fehlenden Key beim 1.1.-Rollover (kein Cron noetig).
+- [x] Counter zaehlt **Brutto-Vergueting** (`order.totalPaid`) — pro ORDER (Multi-Item = 1 Sale).
+- [x] Tracker fuer (a) Anzahl abgeschlossener Verkaeufe, (b) kumulierter Brutto-Umsatz — beides im selben Bucket, atomic increment.
+- [x] Soft-Schwelle (20 Tx oder €1.200): `softThresholdReachedAt` Timestamp + In-App-Notification. (Email-Notification wartet auf Resend-Domain Phase 2 — TODO im Code.)
+- [x] Hard-Schwelle (30 Tx oder €1.800): `hardThresholdReachedAt` + `volumeSuspensionDeadline` (= +14d) + Notification.
+- [x] **Suspension-Flag persistiert** — `volumeSuspended` ist eigenes Field, getrennt vom Counter; Cron `enforceVolumeSuspension` (04:15 Berlin) setzt es bei abgelaufener Deadline. Re-Decl-Pfad cleart die Flags via `syncSellerProfileToPlayerMirror` Trigger.
+- [x] „Abgeschlossener Verkauf" definiert via Hook in `confirmDelivery` + `autoReleaseOrders` — idempotent ueber `_dac7Counted`-Flag aufm Order-Doc.
+- [x] Decrement bei Post-Sale-Refund: `_decrementDac7Counter` in `respondToRefund` + `autoResolveSellerSilence`. Year-Bucket vom Original-Sale (`_dac7CountedYear`) — auch bei Cross-Year-Refunds korrekt.
+- [x] Audit-Log in `sellerProfileAudit` (DSA Art. 17): Events `softThresholdReached`, `hardThresholdReached`, `saleDecrementedAfterRefund`, `volumeSuspensionApplied`, `volumeSuspensionLifted`.
+- [x] Re-Deklaration cleart Flags automatisch via `syncSellerProfileToPlayerMirror` onDocumentWritten-Trigger (Admin-SDK bypass'd Rules) — Counter-History bleibt fuer Audit.
+- [⚠️] Abuse-Schutz: Limits-Reset durch Account-Loeschung + Wiederanlage ist mit Firebase-Auth-UID-Bindung NICHT moeglich (UID neu, Counter neu). Stripe-Connected-Account-ID-basierte Identifier-Bindung ist eigenes Ticket fuer Phase 2 (low-risk fuer Beta mit 7 Testern).
 
 **Ticket 4 — Self-Reclassification-Flow (privat → gewerblich)**
 - [ ] UI fuer "ich bin doch gewerblich"-Umstellung

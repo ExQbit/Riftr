@@ -94,6 +94,31 @@ class SellerProfile {
   /// Self-Reclassification (Privat → Gewerblich).
   final DateTime? commercialDeclaredAt;
 
+  /// DAC7 / PStTG (BACKLOG Ticket 3, 2026-05-01) — per-Kalenderjahr-
+  /// Counter: `{ "2026": {count, grossRevenue}, ... }`. Wird vom Cloud
+  /// Function `_incrementDac7Counter` bei confirmDelivery + auto-
+  /// ReleaseOrders gefuellt. NICHT user-editable (CF-managed).
+  /// Frontend liest fuer den aktuellen Jahr-Bucket via
+  /// `currentYearDac7Count` / `currentYearDac7GrossRevenue`.
+  final Map<String, Map<String, num>> yearlyCounters;
+
+  /// Wann die Soft-Schwelle (20 Tx oder €1.200 im laufenden Jahr) erreicht
+  /// wurde. Wird einmal gesetzt, dann nicht ueberschrieben.
+  final DateTime? softThresholdReachedAt;
+
+  /// Wann die Hard-Schwelle (30 Tx oder €1.800 im laufenden Jahr) erreicht
+  /// wurde. Loest 14-Tage-Countdown bis Listing-Suspension aus.
+  final DateTime? hardThresholdReachedAt;
+
+  /// Deadline = hardThresholdReachedAt + 14 Tage. Cron
+  /// `enforceVolumeSuspension` setzt nach Ablauf `volumeSuspended=true`.
+  final DateTime? volumeSuspensionDeadline;
+
+  /// DAC7-getrenntes Suspension-Flag (separat vom strike-basierten
+  /// `suspended`). Lift nur durch Re-Declaration als gewerblich
+  /// (BACKLOG-Bedingung — keine stille Re-Klassifizierung).
+  final bool volumeSuspended;
+
   const SellerProfile({
     this.displayName,
     this.email,
@@ -115,6 +140,11 @@ class SellerProfile {
     this.vatId,
     this.legalEntityName,
     this.commercialDeclaredAt,
+    this.yearlyCounters = const {},
+    this.softThresholdReachedAt,
+    this.hardThresholdReachedAt,
+    this.volumeSuspensionDeadline,
+    this.volumeSuspended = false,
   });
 
   /// Seller has completed full onboarding (name, address, verified email, Stripe).
@@ -130,7 +160,48 @@ class SellerProfile {
   bool get hasAddress => address != null && address!.isComplete;
 
   /// Seller can actively sell (complete + not suspended).
-  bool get canSell => isComplete && !suspended;
+  bool get canSell => isComplete && !suspended && !volumeSuspended;
+
+  // ─── DAC7 / PStTG convenience getters ─────────────────────────────
+
+  /// Current calendar year (UTC) — used as map key in `yearlyCounters`.
+  static String get _currentYearKey =>
+      DateTime.now().toUtc().year.toString();
+
+  /// Number of completed sales the seller has made this calendar year.
+  int get currentYearDac7Count {
+    final bucket = yearlyCounters[_currentYearKey];
+    return bucket?['count']?.toInt() ?? 0;
+  }
+
+  /// Gross revenue (€, what the buyer paid before platform fees) the
+  /// seller has booked this calendar year.
+  double get currentYearDac7GrossRevenue {
+    final bucket = yearlyCounters[_currentYearKey];
+    return bucket?['grossRevenue']?.toDouble() ?? 0.0;
+  }
+
+  /// Days remaining until listings auto-suspend after the hard threshold.
+  /// Returns null if hard threshold isn't reached yet.
+  int? get daysUntilVolumeSuspension {
+    if (volumeSuspensionDeadline == null) return null;
+    final ms = volumeSuspensionDeadline!.difference(DateTime.now()).inMilliseconds;
+    if (ms <= 0) return 0;
+    return (ms / (24 * 60 * 60 * 1000)).ceil();
+  }
+
+  /// User-facing DAC7 status.
+  ///   none  → no threshold reached
+  ///   soft  → soft threshold reached, hard not yet
+  ///   hard  → hard threshold reached, deadline running, not yet suspended
+  ///   suspended → deadline expired, listings paused
+  String get dac7Status {
+    if (isCommercialSeller) return 'none'; // commercials are exempt
+    if (volumeSuspended) return 'suspended';
+    if (hardThresholdReachedAt != null) return 'hard';
+    if (softThresholdReachedAt != null) return 'soft';
+    return 'none';
+  }
 
   factory SellerProfile.fromFirestore(DocumentSnapshot doc) {
     final data = doc.data() as Map<String, dynamic>? ?? {};
@@ -161,7 +232,30 @@ class SellerProfile {
       vatId: data['vatId'] as String?,
       legalEntityName: data['legalEntityName'] as String?,
       commercialDeclaredAt: _parseTimestamp(data['commercialDeclaredAt']),
+      yearlyCounters: _parseYearlyCounters(data['yearlyCounters']),
+      softThresholdReachedAt:
+          _parseTimestamp(data['softThresholdReachedAt']),
+      hardThresholdReachedAt:
+          _parseTimestamp(data['hardThresholdReachedAt']),
+      volumeSuspensionDeadline:
+          _parseTimestamp(data['volumeSuspensionDeadline']),
+      volumeSuspended: data['volumeSuspended'] as bool? ?? false,
     );
+  }
+
+  static Map<String, Map<String, num>> _parseYearlyCounters(dynamic raw) {
+    if (raw is! Map) return const {};
+    final out = <String, Map<String, num>>{};
+    raw.forEach((key, value) {
+      if (key is String && value is Map) {
+        final inner = <String, num>{};
+        value.forEach((k, v) {
+          if (k is String && v is num) inner[k] = v;
+        });
+        out[key] = inner;
+      }
+    });
+    return out;
   }
 
   Map<String, dynamic> toJson() => {
