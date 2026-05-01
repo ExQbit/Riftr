@@ -8,6 +8,7 @@ import '../services/cart_service.dart';
 import 'cart_screen.dart';
 import '../services/notification_inbox_service.dart';
 import '../widgets/drag_to_dismiss.dart';
+import '../widgets/riftr_drag_handle.dart';
 import '../theme/app_theme.dart';
 import '../data/shipping_rates.dart';
 import '../services/card_service.dart';
@@ -33,7 +34,7 @@ import '../widgets/market/card_price_tile.dart';
 import '../widgets/market/price_overview_card.dart';
 import '../widgets/market/listing_tile.dart';
 import '../widgets/market/time_range_selector.dart';
-import '../widgets/market/market_search_bar.dart';
+import '../widgets/riftr_search_bar.dart';
 import '../widgets/market/gainers_losers_list.dart';
 import '../widgets/market/sell_sheet.dart';
 import '../widgets/market/seller_onboarding_sheet.dart';
@@ -43,10 +44,15 @@ import '../models/market/order_model.dart';
 import '../widgets/market/condition_badge.dart';
 import '../services/order_service.dart';
 import '../models/market/cost_basis_entry.dart';
+import '../widgets/card_detail_sections.dart';
 import '../widgets/card_image.dart';
+import '../widgets/card_ribbon.dart';
+import '../widgets/market/market_card_detail_view.dart';
+import '../widgets/market/smart_cart_preferences_sheet.dart';
+import '../widgets/market/smart_cart_review_sheet.dart';
+import '../models/market/buy_plan.dart';
+import '../services/market/missing_cards_optimizer.dart';
 import 'dispute_detail_screen.dart';
-import 'wallet_screen.dart';
-import '../services/wallet_service.dart';
 import '../theme/app_components.dart';
 
 /// Holdings metric display mode (Trade Republic-style)
@@ -90,8 +96,12 @@ class MarketScreenState extends State<MarketScreen> {
   List<CardPriceData> _filteredResults = [];
   String? _activeQuickFilter;
 
-  // Recently viewed cards (local, max 10)
-  static const _recentlyViewedKey = 'recently_viewed_cards';
+  // Recently viewed cards (local, max 10). Per-user SharedPrefs key to
+  // prevent cross-user leaks when multiple accounts use the same device.
+  static String _recentlyViewedKey() {
+    final uid = AuthService.instance.uid;
+    return uid == null ? 'recently_viewed_cards' : 'recently_viewed_cards_$uid';
+  }
   List<String> _recentlyViewedIds = [];
 
   // Missing cards filter (from Decks screen)
@@ -109,6 +119,360 @@ class MarketScreenState extends State<MarketScreen> {
     if (_scrollController.hasClients) {
       _scrollController.animateTo(0, duration: const Duration(milliseconds: 300), curve: Curves.easeOut);
     }
+  }
+
+  /// Switch to Discover filtered to one seller's active listings.
+  /// Called from ListingTile seller-name tap — leaves the card-detail view
+  /// and shows all cards this seller has for sale. All other Discover filters
+  /// (search, domain, rarity, etc.) remain active and stack on top.
+  void _filterBySeller(String sellerId, String sellerName) {
+    setState(() {
+      _selectedCard = null;
+      _view = 'discover';
+      _searchController.clear();
+      _activeQuickFilter = null;
+      _missingCardIds = null;
+      _discoverFilter = _discoverFilter.copyWith(
+        sellerId: () => sellerId,
+        sellerName: () => sellerName,
+      );
+    });
+    // Leaving card-detail (fullscreen) → reveal nav bar.
+    widget.onFullscreenChanged?.call(false);
+    _refreshFilteredResults();
+    resetScroll();
+  }
+
+  /// Smart Cart flow — 3-step wizard to optimize the purchase of all
+  /// missing cards across sellers with shipping-aware consolidation.
+  ///
+  /// 1. Preferences sheet (condition/foil/language/country/art preferences)
+  /// 2. Loading (compute optimized BuyPlan — typically <1s)
+  /// 3. Review sheet (Pareto strip + seller groups + "Add all to cart")
+  ///
+  /// On Add-to-Cart: adds each listing to CartService. If any listing is
+  /// no longer available (sold between plan and add), a toast is shown and
+  /// the optimizer re-runs automatically with the updated listing pool.
+  Future<void> startSmartCartFlow(
+    Map<String, int> missingCards, {
+    SmartCartFilters? prefilledFilters,
+  }) async {
+    final totalMissing = missingCards.values.fold(0, (s, q) => s + q);
+
+    // Step 1 — Preferences. `prefilledFilters` is set by the
+    // "Lower condition" round-trip from the review sheet so the user lands on
+    // a sheet that already has all their previous choices + the new lowered
+    // condition pre-selected.
+    final filters = await showRiftrSheet<SmartCartFilters>(
+      context: context,
+      builder: (_) => SmartCartPreferencesSheet(
+        missingCardCount: totalMissing,
+        initialMinCondition: prefilledFilters?.minCondition,
+        initialFoilPreference: prefilledFilters?.foilPreference,
+        initialLanguage: prefilledFilters?.language,
+        initialSellerCountry: prefilledFilters?.sellerCountry,
+        initialAcceptCheaperArt: prefilledFilters?.acceptCheaperArt,
+      ),
+    );
+    if (filters == null || !mounted) return;
+
+    // Step 2 — Compute. Brief loading indicator while the algorithm runs.
+    BuyPlan? plan;
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) {
+        // Defer compute so the dialog actually paints before the ms-range work.
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          plan = _computeSmartCartPlan(missingCards, filters);
+          if (ctx.mounted) Navigator.of(ctx).pop();
+        });
+        return Dialog(
+          backgroundColor: AppColors.surface,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(AppRadius.large),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.all(AppSpacing.lg),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                SizedBox(
+                  width: 28, height: 28,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2.5,
+                    color: AppColors.amber500,
+                  ),
+                ),
+                const SizedBox(height: AppSpacing.md),
+                Text(
+                  'Finding best deals…',
+                  style: AppTextStyles.body.copyWith(color: AppColors.textPrimary),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+    if (plan == null || !mounted) return;
+
+    // Step 3 — Review
+    await _showSmartCartReview(plan!, missingCards, totalMissing);
+  }
+
+  BuyPlan _computeSmartCartPlan(
+    Map<String, int> missingCards,
+    SmartCartFilters filters,
+  ) {
+    final buyerCountry = ProfileService.instance.ownProfile?.country ?? 'DE';
+    return MissingCardsOptimizer.computeBestPlan(
+      missingCards: missingCards,
+      buyerCountry: buyerCountry,
+      buyerUid: AuthService.instance.uid,
+      filters: filters,
+    );
+  }
+
+  /// Sentinel BuyPlan — used as a sheet.pop() value to signal "user tapped
+  /// the art-toggle hint, please recompute". Compared via `identical()`.
+  static final BuyPlan _artToggleSentinel = BuyPlan(
+    sellerPlans: const {},
+    unavailable: const [],
+    baselineCost: 0,
+    generatedAt: DateTime(0),
+    appliedFilters: const SmartCartFilters(),
+    buyerCountry: '',
+  );
+
+  /// Sentinel for the "Lower condition" CTA in the review sheet's
+  /// unavailable banner. Carries the next-looser CardCondition embedded in
+  /// `appliedFilters.minCondition` — parent reads it to re-open preferences
+  /// with the new value pre-selected. Discriminator is `generatedAt`
+  /// (DateTime(1)) so we don't clash with the art-toggle sentinel above.
+  static BuyPlan _lowerConditionSentinel(CardCondition next) => BuyPlan(
+        sellerPlans: const {},
+        unavailable: const [],
+        baselineCost: 0,
+        generatedAt: DateTime(1),
+        appliedFilters: SmartCartFilters(minCondition: next),
+        buyerCountry: '',
+      );
+
+  static bool _isLowerConditionSentinel(BuyPlan p) =>
+      p.generatedAt == DateTime(1) && p.sellerPlans.isEmpty;
+
+  /// Show the review sheet. Handles the add-to-cart flow including
+  /// expiry-prompt and stale-listing auto-retry.
+  Future<void> _showSmartCartReview(
+    BuyPlan plan,
+    Map<String, int> missingCards,
+    int totalMissing,
+  ) async {
+    // PageRouteBuilder + DragToDismiss pattern (mirrors DeckShoppingRoute /
+    // CardPreviewRoute) so drag-from-anywhere dismissal works the same way
+    // across the entire Smart Cart flow.
+    final accepted = await Navigator.of(context).push<BuyPlan>(
+      PageRouteBuilder<BuyPlan>(
+        opaque: false,
+        transitionDuration: const Duration(milliseconds: 300),
+        reverseTransitionDuration: const Duration(milliseconds: 250),
+        pageBuilder: (sheetCtx, animation, secondaryAnimation) =>
+            SmartCartReviewSheet(
+          initialPlan: plan,
+          totalMissingCopies: totalMissing,
+          // Banner tap: pop current route with sentinel, parent re-runs below.
+          onRequestArtToggle: () => Navigator.of(sheetCtx).pop(_artToggleSentinel),
+          // "Lower condition" CTA in unavailable banner: pop with a sentinel
+          // carrying the new condition; parent re-opens preferences sheet with
+          // it pre-selected (and existing filters preserved).
+          onRequestLowerCondition: (next) => Navigator.of(sheetCtx)
+              .pop(_lowerConditionSentinel(next)),
+        ),
+        transitionsBuilder: (_, anim, __, child) => SlideTransition(
+          position: Tween<Offset>(
+            begin: const Offset(0, 1),
+            end: Offset.zero,
+          ).animate(CurvedAnimation(
+            parent: anim,
+            curve: Curves.easeOutCubic,
+          )),
+          child: child,
+        ),
+      ),
+    );
+    if (accepted == null || !mounted) return;
+
+    // Art-toggle sentinel: user tapped the hint — recompute with flipped
+    // acceptCheaperArt flag and re-show the review sheet.
+    if (identical(accepted, _artToggleSentinel)) {
+      final flippedFilters = plan.appliedFilters.copyWith(
+        acceptCheaperArt: !plan.appliedFilters.acceptCheaperArt,
+      );
+      final fresh = _computeSmartCartPlan(missingCards, flippedFilters);
+      if (!mounted) return;
+      await _showSmartCartReview(fresh, missingCards, totalMissing);
+      return;
+    }
+
+    // Lower-condition sentinel: user tapped "Lower condition to {next}" in
+    // the unavailable banner. Restart the flow at the preferences sheet with
+    // their previous filters preserved + the new condition pre-selected.
+    if (_isLowerConditionSentinel(accepted)) {
+      final newCondition = accepted.appliedFilters.minCondition;
+      final preserved = plan.appliedFilters.copyWith(minCondition: newCondition);
+      if (!mounted) return;
+      await startSmartCartFlow(missingCards, prefilledFilters: preserved);
+      return;
+    }
+
+    // Plan expiry: prompt user to refresh if >15 min old.
+    if (accepted.isExpired) {
+      final refresh = await _confirmRefreshStalePlan();
+      if (refresh == null || !mounted) return;
+      if (refresh) {
+        final fresh = _computeSmartCartPlan(missingCards, accepted.appliedFilters);
+        if (!mounted) return;
+        await _showSmartCartReview(fresh, missingCards, totalMissing);
+        return;
+      }
+    }
+
+    // Attempt add-to-cart. On stale failures, recompute + re-show review.
+    final result = await _addPlanToCart(accepted);
+    if (!mounted) return;
+    if (result.staleFailed > 0) {
+      RiftrToast.info(
+        context,
+        '${result.staleFailed} of ${result.totalAttempted} cards no longer available — re-checking',
+      );
+      final fresh = _computeSmartCartPlan(missingCards, accepted.appliedFilters);
+      if (!mounted) return;
+      await _showSmartCartReview(fresh, missingCards, totalMissing);
+      return;
+    }
+    if (result.successCount > 0) {
+      // Toast says "cards" not "listings": the user thinks in terms of how
+      // many cards from their missing-list got covered, not how many seller
+      // listings (one listing can cover multiple copies of the same card).
+      final n = result.successCardCopies;
+      RiftrToast.cart(
+        context,
+        'Added $n card${n == 1 ? '' : 's'} to cart',
+      );
+      // Clear the missing-cards filter since user moved into cart flow.
+      setState(() {
+        _missingCardIds = null;
+        _searchResults = [];
+      });
+    }
+  }
+
+  Future<bool?> _confirmRefreshStalePlan() async {
+    return showRiftrSheet<bool>(
+      context: context,
+      builder: (ctx) => Padding(
+        padding: const EdgeInsets.fromLTRB(
+          AppSpacing.base, 0, AppSpacing.base, AppSpacing.lg,
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              'Listings may have changed',
+              style: AppTextStyles.bodyLarge.copyWith(
+                color: AppColors.textPrimary,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+            const SizedBox(height: AppSpacing.sm),
+            Text(
+              'This plan is more than 15 minutes old. Refresh to see current availability.',
+              textAlign: TextAlign.center,
+              style: AppTextStyles.bodySmall.copyWith(color: AppColors.textSecondary),
+            ),
+            const SizedBox(height: AppSpacing.lg),
+            Row(
+              children: [
+                Expanded(flex: 1, child: RiftrButton(
+                  label: 'Cancel',
+                  style: RiftrButtonStyle.secondary,
+                  onPressed: () => Navigator.of(ctx).pop(null),
+                )),
+                const SizedBox(width: AppSpacing.md),
+                Expanded(flex: 2, child: RiftrButton(
+                  label: 'Refresh',
+                  onPressed: () => Navigator.of(ctx).pop(true),
+                )),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<({int successCount, int successCardCopies, int staleFailed, int totalAttempted})>
+      _addPlanToCart(BuyPlan plan) async {
+    // Collect every (listing, qty) op to fire — both the optimizer's plan
+    // picks and the user's opted-in alternative cards.
+    //
+    // Each addItem awaits two CF round-trips (reserveForCart + the
+    // ListingService.refreshListing follow-up that prevents the Smart
+    // Cart race condition). At ~350ms per item, a 22-item plan took 7-8s
+    // sequentially. Fire them in parallel via Future.wait → total time
+    // collapses to max(individual) ≈ 500ms.
+    //
+    // Safety: dedupe by listingId so two concurrent addItems for the same
+    // listing can't race on the local cart's `_items.indexWhere`/`newQty`
+    // logic. In practice plan picks have unique listingIds, but an
+    // alternative card might point to a listing that's also in
+    // sellerPlans — the merge keeps total qty correct in either order.
+    final byListingId = <String, ({MarketListing listing, int qty})>{};
+    for (final sellerPlan in plan.sellerPlans.values) {
+      for (final purchase in sellerPlan.items) {
+        final id = purchase.listing.id;
+        final existing = byListingId[id];
+        byListingId[id] = (
+          listing: purchase.listing,
+          qty: (existing?.qty ?? 0) + purchase.quantity,
+        );
+      }
+    }
+    for (final alt in plan.alternativeCards) {
+      if (!plan.includedAlternativeGroupKeys.contains(alt.groupKey)) continue;
+      final id = alt.cheapest.id;
+      final existing = byListingId[id];
+      byListingId[id] = (
+        listing: alt.cheapest,
+        qty: (existing?.qty ?? 0) + alt.neededQty,
+      );
+    }
+
+    final ops = byListingId.values.toList();
+    final results = await Future.wait(
+      ops.map((op) => CartService.instance.addItem(
+            CartItem.fromListing(op.listing, quantity: op.qty),
+          )),
+    );
+
+    int success = 0;
+    int successCopies = 0;
+    int stale = 0;
+    for (int i = 0; i < ops.length; i++) {
+      if (results[i]) {
+        success++;
+        successCopies += ops[i].qty;
+      } else {
+        stale++;
+      }
+    }
+    return (
+      successCount: success,
+      successCardCopies: successCopies,
+      staleFailed: stale,
+      totalAttempted: ops.length,
+    );
   }
 
   /// Show missing cards from a deck in the Discover view
@@ -140,7 +504,7 @@ class MarketScreenState extends State<MarketScreen> {
 
   Future<void> _loadRecentlyViewed() async {
     final prefs = await SharedPreferences.getInstance();
-    final ids = prefs.getStringList(_recentlyViewedKey) ?? [];
+    final ids = prefs.getStringList(_recentlyViewedKey()) ?? [];
     if (mounted) setState(() => _recentlyViewedIds = ids);
   }
 
@@ -151,7 +515,7 @@ class MarketScreenState extends State<MarketScreen> {
       _recentlyViewedIds = _recentlyViewedIds.sublist(0, 10);
     }
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setStringList(_recentlyViewedKey, _recentlyViewedIds);
+    await prefs.setStringList(_recentlyViewedKey(), _recentlyViewedIds);
   }
 
   void _refresh() {
@@ -170,67 +534,63 @@ class MarketScreenState extends State<MarketScreen> {
     super.dispose();
   }
 
-  bool _loadingHistory = false;
-
   /// Navigate to a card by its ID (called from other tabs, e.g. Social)
   void navigateToCardById(String cardId) {
-    final card = _market.getPrice(cardId);
+    // Try priced data first; fall back to zero-price CardPriceData for
+    // unpriced cards (e.g. UNL pre-release). Ensures navigation works
+    // from Cards/Collection tap even when no market price exists yet.
+    final card = _market.getPrice(cardId) ?? _market.getFallbackPrice(cardId);
     if (card == null) return;
     _navigateToCard(card);
   }
 
   void _navigateToCard(CardPriceData card, {bool isFoil = false}) {
     _addRecentlyViewed(card.cardId);
+    // History lazy-load + loading-state lives inside MarketCardDetailView
+    // (it manages its own _loadingHistory + service listeners). Parent only
+    // owns the navigation-level state (which card, foil-or-not initially).
     setState(() {
       _viewBeforeDetail = _view;
       _selectedCard = card;
       _selectedRange = '1M';
       _view = 'cardDetail';
       _detailShowFoil = isFoil;
-      _loadingHistory = card.priceHistory.isEmpty;
     });
     widget.onFullscreenChanged?.call(true);
     resetScroll();
-
-    // Lazy-load history from Firestore if not cached
-    final hasCmId = _market.hasCmId(card.cardId);
-    if (card.priceHistory.isEmpty && hasCmId) {
-      debugPrint('MarketScreen: Loading history for ${card.cardName} (${card.cardId})');
-      _market.loadHistory(card.cardId).then((_) {
-        if (mounted && _selectedCard?.cardId == card.cardId) {
-          final updated = _market.getPrice(card.cardId);
-          debugPrint('MarketScreen: History loaded for ${card.cardName} — '
-              'foil=${updated?.priceHistory.length ?? 0}, '
-              'nf=${updated?.nonFoilHistory.length ?? 0}');
-          setState(() {
-            _selectedCard = updated ?? _selectedCard;
-            _loadingHistory = false;
-          });
-        }
-      });
-    } else if (!hasCmId) {
-      _loadingHistory = false;
-    }
   }
 
   String _viewBeforeDetail = 'portfolio';
 
   void _goBack() {
+    // 3-branch dismiss target by current _view:
+    //   cardDetail              → restore _viewBeforeDetail (origin sub-tab)
+    //   discover/listings/orders → portfolio (Market hero / main view)
+    //   portfolio               → no-op (already at top of nav stack)
+    //
+    // Layer 1 (per-view ValueKey on each DragToDismiss) handles the
+    // state-leak that previously caused a black screen on rapid view
+    // switches; this 3-branch logic restores the legitimate "drag-back"
+    // flow each sub-tab needs.
     if (_view == 'cardDetail') {
-      // Return to wherever we came from (discover, portfolio, etc.)
       setState(() {
         _selectedCard = null;
         _view = _viewBeforeDetail;
       });
-      widget.onFullscreenChanged?.call(false);
-    } else {
-      // From any other view → back to portfolio
-      setState(() {
-        _selectedCard = null;
-        _view = 'portfolio';
-      });
-      widget.onFullscreenChanged?.call(false);
+      // Fullscreen parity: discover/listings/orders all run fullscreen,
+      // only portfolio shows the navbar.
+      final returnsFullscreen = _viewBeforeDetail != 'portfolio';
+      widget.onFullscreenChanged?.call(returnsFullscreen);
+      resetScroll();
+      return;
     }
+    if (_view == 'portfolio') return;
+    // Sub-tab → Portfolio (Market hero with Market Value / Trend-Chart / Holdings).
+    setState(() {
+      _selectedCard = null;
+      _view = 'portfolio';
+    });
+    widget.onFullscreenChanged?.call(false); // portfolio shows the navbar
     resetScroll();
   }
 
@@ -240,24 +600,32 @@ class MarketScreenState extends State<MarketScreen> {
       color: AppColors.surfaceLight,
       borderRadius: AppRadius.baseBR,
     ),
-    child: const Icon(Icons.style, size: 40, color: AppColors.textMuted),
+    child: Icon(Icons.style, size: 40, color: AppColors.textMuted),
   );
 
   /// Wraps a scrollable child with DragToDismiss for pull-to-dismiss.
+  ///
+  /// `ValueKey('dismiss-$_view')` forces Flutter to instantiate a fresh
+  /// DragToDismiss-State whenever `_view` changes. Without this key, the
+  /// internal `_offset` (which sits at `screenHeight + 50` after a successful
+  /// dismiss animation) leaks across view transitions — Discover would
+  /// render with its content translated off-screen, looking like a black
+  /// scaffold. The key ties the State's lifetime to the active view.
   Widget _wrapWithDismiss(Widget child) {
     return DragToDismiss(
+      key: ValueKey('dismiss-$_view'),
       onDismissed: _goBack,
       backgroundColor: AppColors.background,
       child: Column(children: [
-        // Drag handle indicator
-        Container(
-          height: 36,
-          color: AppColors.background,
-          child: Center(child: Container(
-            margin: const EdgeInsets.only(top: 10),
-            width: 40, height: 5,
-            decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(3)),
-          )),
+        // Drag handle — md top + sm bottom matches CardPreviewOverlay
+        // (Cards-Tab card detail) so handle-to-content distance is uniform
+        // across the app.
+        const Padding(
+          padding: EdgeInsets.only(
+            top: AppSpacing.md,
+            bottom: AppSpacing.sm,
+          ),
+          child: RiftrDragHandle(style: RiftrDragHandleStyle.fullscreen),
         ),
         Expanded(child: child),
       ]),
@@ -267,7 +635,7 @@ class MarketScreenState extends State<MarketScreen> {
   @override
   Widget build(BuildContext context) {
     if (!_market.initialized) {
-      return const Center(
+      return Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -287,19 +655,27 @@ class MarketScreenState extends State<MarketScreen> {
       _ => _buildPortfolio(),
     };
 
-    // Wallet FAB only on portfolio view
-    final showWalletFab = !_isDemo &&
-        _view != 'discover' &&
-        _view != 'cardDetail' &&
-        _view != 'listings' &&
-        _view != 'orders';
-
-    // Cart FAB on ALL Market views (except cardDetail)
+    // Wallet-FAB wurde in Phase 2 (2026-04-28) entfernt — Customer-Balance
+    // ist nicht mehr aktiv (keine Top-Ups, keine Wallet-Buys). Verkaeufer-
+    // Earnings laufen ueber Stripe Connect; eine eigene Earnings-View
+    // entscheidet Phase 6/7 wenn das Konzept klar ist.
+    //
+    // Cart FAB nur in den Discover/Portfolio-Views (Listings + Orders + cardDetail
+    // ausgeblendet — dort stoert er und ist nicht kontextrelevant: in „MY LISTINGS"
+    // verkauft der User, in „ORDERS" prueft er bestehende Kaeufe, im Card-Detail
+    // gibt's eigene Buy/Sell-Buttons).
     final showCartFab = !_isDemo &&
         _view != 'cardDetail' &&
+        _view != 'listings' &&
+        _view != 'orders' &&
         CartService.instance.totalItems > 0;
 
-    if (!showWalletFab && !showCartFab) return content;
+    debugPrint(
+      '[MARKET-FAB] view=$_view demo=$_isDemo cartItems=${CartService.instance.totalItems} '
+      'showCart=$showCartFab',
+    );
+
+    if (!showCartFab) return content;
 
     final viewPadding = MediaQuery.of(context).viewPadding;
     return Stack(
@@ -320,7 +696,7 @@ class MarketScreenState extends State<MarketScreen> {
         if (showCartFab)
           Positioned(
             right: AppSpacing.lg,
-            bottom: (showWalletFab ? 133 : 68) + viewPadding.bottom,
+            bottom: 68 + viewPadding.bottom,
             child: GestureDetector(
               onTap: () => Navigator.of(context).push(
                 PageRouteBuilder(
@@ -345,7 +721,7 @@ class MarketScreenState extends State<MarketScreen> {
                   padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
                   decoration: BoxDecoration(
                     color: AppColors.error,
-                    borderRadius: BorderRadius.circular(AppRadius.iconButton),
+                    borderRadius: BorderRadius.circular(AppRadius.rounded),
                     border: Border.all(color: AppColors.background, width: 2),
                   ),
                   child: Text('${CartService.instance.totalItems}',
@@ -353,12 +729,6 @@ class MarketScreenState extends State<MarketScreen> {
                 )),
               ]),
             ),
-          ),
-        if (showWalletFab)
-          Positioned(
-            right: AppSpacing.lg,
-            bottom: 68 + viewPadding.bottom,
-            child: _buildWalletFab(),
           ),
           ]), // FAB Stack (child of VLB)
         ), // ValueListenableBuilder
@@ -437,10 +807,11 @@ class MarketScreenState extends State<MarketScreen> {
       }
     }
 
-    // Sort by total value
-    holdings.sort((a, b) => (b.unitPrice * b.quantity).compareTo(a.unitPrice * a.quantity));
-
-    // Metric-aware sort value for gainers/losers
+    // Metric value for the right-column number display AND for
+    // Gainers/Losers sort. Holdings-tab sort is NOT metric-driven —
+    // it's always by total market value (see below). Like Trade Republic:
+    // portfolio is always sorted by position size; the dropdown only
+    // switches which return number is shown next to each card.
     double metricVal(_HoldingEntry h) => switch (_holdingsMetric) {
       HoldingsMetric.sincePurchaseRelative => h.cbChangePct,
       HoldingsMetric.sincePurchaseAbsolute => h.cbChangeAbs,
@@ -448,13 +819,67 @@ class MarketScreenState extends State<MarketScreen> {
       HoldingsMetric.dayTrendAbsolute => h.dayChangeAbs,
     };
 
-    // Filter for sub-tabs
+    // Alphabetical tiebreaker by card name — deterministic order when
+    // primary sort values are equal.
+    int byName(_HoldingEntry a, _HoldingEntry b) =>
+        a.data.cardName.toLowerCase().compareTo(b.data.cardName.toLowerCase());
+
+    // Holdings-tab sort: total market value desc (unitPrice × quantity),
+    // name asc as tiebreaker. Never changes based on dropdown.
+    int byTotalValueDesc(_HoldingEntry a, _HoldingEntry b) {
+      final cmp = (b.unitPrice * b.quantity).compareTo(a.unitPrice * a.quantity);
+      return cmp != 0 ? cmp : byName(a, b);
+    }
+
+    // Gainers/Losers: sort by selected metric, ties → alphabetical.
+    int byMetricDesc(_HoldingEntry a, _HoldingEntry b) {
+      final cmp = metricVal(b).compareTo(metricVal(a));
+      return cmp != 0 ? cmp : byName(a, b);
+    }
+
+    int byMetricAsc(_HoldingEntry a, _HoldingEntry b) {
+      final cmp = metricVal(a).compareTo(metricVal(b));
+      return cmp != 0 ? cmp : byName(a, b);
+    }
+
+    // Meaningful-mover threshold: a holding qualifies for Gainers/Losers
+    // only if its movement clears at least one of the two axes —
+    // €0.10 absolute (per holding total) OR 5% relative. Both axes are
+    // checked independently regardless of which metric the user has
+    // active in the dropdown, so the filter behaves consistently when
+    // the user toggles between Day-Trend and Since-Buy views.
+    //
+    // Without this, a 1-cent drop on a holding (e.g. Doran's Shield
+    // SFD #33) would appear as Loser #2 — the global movers list in
+    // MarketService._computeMovers had this threshold but the personal
+    // Holdings filter was a separate code path that never got it.
+    bool clearsThreshold(_HoldingEntry h) {
+      final absMovement = switch (_holdingsMetric) {
+        HoldingsMetric.sincePurchaseAbsolute ||
+        HoldingsMetric.sincePurchaseRelative => h.cbChangeAbs.abs(),
+        HoldingsMetric.dayTrendAbsolute ||
+        HoldingsMetric.dayTrendRelative => h.dayChangeAbs.abs(),
+      };
+      final pctMovement = switch (_holdingsMetric) {
+        HoldingsMetric.sincePurchaseAbsolute ||
+        HoldingsMetric.sincePurchaseRelative => h.cbChangePct.abs(),
+        HoldingsMetric.dayTrendAbsolute ||
+        HoldingsMetric.dayTrendRelative => h.dayChangePct.abs(),
+      };
+      return absMovement >= 0.10 || pctMovement >= 5.0;
+    }
+
+    // Filter + sort per sub-tab.
     final displayList = switch (_holdingsTab) {
-      'gainers' => holdings.where((h) => metricVal(h) > 0).toList()
-        ..sort((a, b) => metricVal(b).compareTo(metricVal(a))),
-      'losers' => holdings.where((h) => metricVal(h) < 0).toList()
-        ..sort((a, b) => metricVal(a).compareTo(metricVal(b))),
-      _ => holdings,
+      'gainers' => holdings
+          .where((h) => metricVal(h) > 0 && clearsThreshold(h))
+          .toList()
+        ..sort(byMetricDesc),
+      'losers' => holdings
+          .where((h) => metricVal(h) < 0 && clearsThreshold(h))
+          .toList()
+        ..sort(byMetricAsc),
+      _ => [...holdings]..sort(byTotalValueDesc),
     };
 
     // Chart line = performance if available, value as legacy fallback
@@ -517,23 +942,44 @@ class MarketScreenState extends State<MarketScreen> {
           _buildViewToggle(),
           const SizedBox(height: AppSpacing.md),
 
-          // Holdings section header
+          // Holdings section header — counts inlined in the trailing slot
+          // (was a standalone "18 Cards · 42 Copies" row inside
+          // PortfolioHeader; moved here to keep counts adjacent to the
+          // list they describe and free up vertical space in the hero).
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
-            child: SectionDivider(icon: Icons.wallet, label: 'YOUR HOLDINGS'),
+            child: SectionDivider(
+              icon: Icons.wallet,
+              label: 'YOUR HOLDINGS',
+              trailing: Text(
+                '${portfolio.cardCount} cards · ${portfolio.totalCopies} copies',
+                style: AppTextStyles.captionBold.copyWith(
+                  color: AppColors.amber400,
+                ),
+              ),
+            ),
           ),
           const SizedBox(height: AppSpacing.xs),
 
-          // Sub-tabs
-          _buildHoldingsTabs(),
-          const SizedBox(height: 6),
-
-          // Metric selector (TR-style: right-aligned text link)
+          // Sub-tabs (Holdings/Gainers/Losers) + metric dropdown in one row.
+          // Pills left, dropdown right — saves a full vertical line vs. stacking.
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
-            child: Align(
-              alignment: Alignment.centerRight,
-              child: _buildMetricDropdown(),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    _holdingsTabPill('Holdings', 'holdings'),
+                    const SizedBox(width: 6),
+                    _holdingsTabPill('Gainers', 'gainers'),
+                    const SizedBox(width: 6),
+                    _holdingsTabPill('Losers', 'losers'),
+                  ],
+                ),
+                _buildMetricDropdown(),
+              ],
             ),
           ),
           const SizedBox(height: 6),
@@ -557,6 +1003,11 @@ class MarketScreenState extends State<MarketScreen> {
             ...displayList.take(_holdingsDisplayCount).map((h) {
               final changeText = _formatMetricValue(h);
               final isPositive = metricVal(h) >= 0;
+              // TR-style split:
+              //   LEFT: total position value (unitPrice × quantity)
+              //   RIGHT: per-card unit price + change
+              final totalValueLabel =
+                  '€${(h.unitPrice * h.quantity).toStringAsFixed(2)}';
               return Padding(
                 padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: 3),
                 child: CardPriceTile(
@@ -564,8 +1015,9 @@ class MarketScreenState extends State<MarketScreen> {
                   quantity: h.quantity,
                   onTap: () => _navigateToCard(h.data, isFoil: h.isFoil),
                   showFoilStar: h.isFoil,
-
-                  priceOverride: h.isFoil ? h.unitPrice : null,
+                  // Foil-aware per-card price on the right.
+                  priceOverride: h.unitPrice,
+                  totalValueLabel: totalValueLabel,
                   changeText: changeText,
                   changePositive: isPositive,
                 ),
@@ -579,15 +1031,19 @@ class MarketScreenState extends State<MarketScreen> {
               child: Center(
                 child: GestureDetector(
                   onTap: () => setState(() => _holdingsDisplayCount += 50),
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(vertical: AppSpacing.sm, horizontal: AppSpacing.lg),
-                    decoration: BoxDecoration(
-                      color: AppColors.surfaceLight,
-                      borderRadius: AppRadius.pillBR,
-                    ),
-                    child: Text(
-                      'Show more (${displayList.length - _holdingsDisplayCount} remaining)',
-                      style: AppTextStyles.bodySmall.copyWith(color: AppColors.amber400),
+                  child: SizedBox(
+                    height: 44, // Apple HIG touch-target minimum
+                    child: Container(
+                      alignment: Alignment.center,
+                      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
+                      decoration: BoxDecoration(
+                        color: AppColors.surfaceLight,
+                        borderRadius: AppRadius.pillBR,
+                      ),
+                      child: Text(
+                        'Show more (${displayList.length - _holdingsDisplayCount} remaining)',
+                        style: AppTextStyles.bodySmall.copyWith(color: AppColors.amber400),
+                      ),
                     ),
                   ),
                 ),
@@ -607,88 +1063,6 @@ class MarketScreenState extends State<MarketScreen> {
   // ═══════════════════════════════════════════
 
 
-  Widget _buildWalletFab() {
-    return ListenableBuilder(
-      listenable: WalletService.instance,
-      builder: (context, _) {
-        final bal = WalletService.instance.balance;
-        final label = '€${bal.availableEur.toStringAsFixed(2)}';
-
-        return TweenAnimationBuilder<double>(
-          key: const ValueKey('wallet-fab-anim'),
-          tween: Tween(begin: 0.0, end: 1.0),
-          duration: const Duration(milliseconds: 350),
-          curve: Curves.easeOut,
-          builder: (context, value, child) {
-            return Opacity(
-              opacity: value,
-              child: Transform.scale(
-                scale: 0.3 + value * 0.7,
-                child: child,
-              ),
-            );
-          },
-          child: GestureDetector(
-            onTap: () => Navigator.push(
-              context,
-              PageRouteBuilder(
-                opaque: false,
-                barrierColor: Colors.black54,
-                pageBuilder: (_, __, ___) => Material(
-                  color: AppColors.background,
-                  child: DragToDismiss(
-                    onDismissed: () => Navigator.pop(context),
-                    backgroundColor: AppColors.background,
-                    child: SafeArea(
-                      child: Column(children: [
-                        Container(
-                          height: 36,
-                          color: AppColors.background,
-                          child: Center(child: Container(
-                            margin: const EdgeInsets.only(top: 10),
-                            width: 40, height: 5,
-                            decoration: BoxDecoration(
-                              color: AppColors.textSecondary,
-                              borderRadius: BorderRadius.circular(3),
-                            ),
-                          )),
-                        ),
-                        const Expanded(child: WalletScreen()),
-                      ]),
-                    ),
-                  ),
-                ),
-                transitionsBuilder: (_, anim, __, child) =>
-                    SlideTransition(position: Tween(begin: const Offset(0, 1), end: Offset.zero).animate(anim), child: child),
-              ),
-            ),
-            child: Container(
-              height: 56,
-              padding: const EdgeInsets.symmetric(horizontal: AppSpacing.base),
-              decoration: BoxDecoration(
-                color: AppColors.amber400,
-                borderRadius: AppRadius.pillBR,
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Icon(Icons.account_balance_wallet_outlined, color: AppColors.textPrimary, size: 22),
-                  const SizedBox(width: AppSpacing.sm),
-                  Text(
-                    label,
-                    style: AppTextStyles.bodyBold.copyWith(
-                      color: AppColors.textPrimary,
-                      fontWeight: FontWeight.w800,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        );
-      },
-    );
-  }
 
   Widget _buildViewToggle() {
     return Padding(
@@ -726,7 +1100,7 @@ class MarketScreenState extends State<MarketScreen> {
           if (showDot && !active)
             Positioned(
               top: -2, right: 4,
-              child: Container(width: 8, height: 8, decoration: const BoxDecoration(
+              child: Container(width: 8, height: 8, decoration: BoxDecoration(
                 color: AppColors.amber400, shape: BoxShape.circle,
               )),
             ),
@@ -735,20 +1109,8 @@ class MarketScreenState extends State<MarketScreen> {
     );
   }
 
-  Widget _buildHoldingsTabs() {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
-      child: Row(
-        children: [
-          _holdingsTabPill('Holdings', 'holdings'),
-          const SizedBox(width: 6),
-          _holdingsTabPill('Gainers', 'gainers'),
-          const SizedBox(width: 6),
-          _holdingsTabPill('Losers', 'losers'),
-        ],
-      ),
-    );
-  }
+  // _buildHoldingsTabs() removed — pills are now inlined directly in the
+  // Holdings section header so they share a Row with the metric dropdown.
 
   Widget _holdingsTabPill(String label, String value) {
     return RiftrPill(
@@ -802,19 +1164,23 @@ class MarketScreenState extends State<MarketScreen> {
   Widget _buildMetricDropdown() {
     return GestureDetector(
       onTap: _showMetricSheet,
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Text(
-            _metricLabel(_holdingsMetric),
-            style: AppTextStyles.bodySmall.copyWith(
-              color: AppColors.textMuted,
-              fontWeight: FontWeight.w500,
+      behavior: HitTestBehavior.opaque,
+      child: SizedBox(
+        height: 44, // Apple HIG touch-target minimum
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              _metricLabel(_holdingsMetric),
+              style: AppTextStyles.bodySmall.copyWith(
+                color: AppColors.textMuted,
+                fontWeight: FontWeight.w500,
+              ),
             ),
-          ),
-          const SizedBox(width: 2),
-          const Icon(Icons.keyboard_arrow_down, size: 18, color: AppColors.textMuted),
-        ],
+            const SizedBox(width: 2),
+            Icon(Icons.keyboard_arrow_down, size: 18, color: AppColors.textMuted),
+          ],
+        ),
       ),
     );
   }
@@ -863,7 +1229,7 @@ class MarketScreenState extends State<MarketScreen> {
               ),
             ),
             if (isSelected)
-              const Icon(Icons.check, color: AppColors.textPrimary, size: 20),
+              Icon(Icons.check, color: AppColors.textPrimary, size: 20),
           ],
         ),
       ),
@@ -877,11 +1243,34 @@ class MarketScreenState extends State<MarketScreen> {
   Widget _buildMyListings() {
     final myListings = _isDemo ? _demoListings : _listings.myListings;
 
-    return _wrapWithDismiss(SingleChildScrollView(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const GoldOrnamentHeader(title: 'MY LISTINGS'),
+    // Card-Preview pattern (per RIFTR_DESIGN_SYSTEM 6.6.1): Stack with
+    //   DragToDismiss wraps Column[handle, Expanded(scroll)]  — DRAG LAYER
+    //   Positioned(bottom: 22) action buttons                  — STICKY LAYER
+    // Drag returns to portfolio (Market hero) via _goBack.
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        DragToDismiss(
+          key: const ValueKey('dismiss-listings'),
+          onDismissed: _goBack,
+          backgroundColor: AppColors.background,
+          child: Column(
+            children: [
+              const Padding(
+                padding: EdgeInsets.only(
+                  top: AppSpacing.md,
+                  bottom: AppSpacing.sm,
+                ),
+                child: RiftrDragHandle(style: RiftrDragHandleStyle.fullscreen),
+              ),
+              Expanded(
+                child: SingleChildScrollView(
+                  // 120dp bottom-padding clears the pinned bulk-action pills.
+                  padding: const EdgeInsets.only(bottom: 120),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const GoldOrnamentHeader(title: 'MY LISTINGS'),
           const SizedBox(height: AppSpacing.sm),
           _buildViewToggle(),
           const SizedBox(height: AppSpacing.base),
@@ -896,11 +1285,11 @@ class MarketScreenState extends State<MarketScreen> {
                   padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.xs),
                   child: Container(
                     width: double.infinity,
-                    padding: const EdgeInsets.all(10),
+                    padding: const EdgeInsets.all(AppSpacing.md),
                     decoration: BoxDecoration(
-                      color: AppColors.loss.withValues(alpha: 0.15),
+                      color: AppColors.lossMuted,
                       borderRadius: BorderRadius.circular(AppRadius.md),
-                      border: Border.all(color: AppColors.loss.withValues(alpha: 0.3)),
+                      border: Border.all(color: AppColors.lossBorder),
                     ),
                     child: Row(
                       children: [
@@ -922,15 +1311,15 @@ class MarketScreenState extends State<MarketScreen> {
                   padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.xs),
                   child: Container(
                     width: double.infinity,
-                    padding: const EdgeInsets.all(10),
+                    padding: const EdgeInsets.all(AppSpacing.md),
                     decoration: BoxDecoration(
-                      color: AppColors.amber500.withValues(alpha: 0.15),
+                      color: AppColors.amberMuted,
                       borderRadius: BorderRadius.circular(AppRadius.md),
-                      border: Border.all(color: AppColors.amber500.withValues(alpha: 0.3)),
+                      border: Border.all(color: AppColors.amberBorderMuted),
                     ),
                     child: Row(
                       children: [
-                        const Icon(Icons.warning_amber_rounded, size: 14, color: AppColors.amber500),
+                        Icon(Icons.warning_amber_rounded, size: 14, color: AppColors.amber500),
                         const SizedBox(width: AppSpacing.sm),
                         Text(
                           'Strikes: ${profile.strikes}/3 — Ship orders on time to avoid suspension.',
@@ -971,10 +1360,49 @@ class MarketScreenState extends State<MarketScreen> {
                   child: _myListingTile(l),
                 )),
 
-          const SizedBox(height: AppSpacing.xl),
-        ],
-      ),
-    ));
+          const SizedBox(height: AppSpacing.legacyXl),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+          // Bulk actions pinned at bottom — Card-Preview pattern: Positioned
+          // bottom: 22, Row of two 56dp pills (destructive LEFT, primary RIGHT
+          // per V2 §7.3 dialog-pair convention).
+          if (myListings.isNotEmpty)
+            Positioned(
+              left: AppSpacing.base,
+              right: AppSpacing.base,
+              bottom: 22,
+              child: Row(
+                children: [
+                  Expanded(
+                    child: RiftrButton(
+                      label: 'Cancel all',
+                      icon: Icons.delete_outline,
+                      style: RiftrButtonStyle.danger,
+                      height: 56,
+                      radius: AppRadius.pill,
+                      onPressed: () => _cancelAllListings(myListings),
+                    ),
+                  ),
+                  const SizedBox(width: AppSpacing.md),
+                  Expanded(
+                    child: RiftrButton(
+                      label: 'Adjust all prices',
+                      style: RiftrButtonStyle.primary,
+                      height: 56,
+                      radius: AppRadius.pill,
+                      onPressed: () => _showPriceAdjustmentSheet(myListings),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+      ],
+    );
   }
 
   // ═══════════════════════════════════════════
@@ -1085,8 +1513,22 @@ class MarketScreenState extends State<MarketScreen> {
                         }
                       }
                     },
-                    onOpenDispute: (id, reason, description) async {
-                      final ok = await OrderService.instance.openDispute(id, reason, description: description);
+                    onOpenDispute: (
+                      id,
+                      reason,
+                      description, {
+                      String reasonCodeChoice = 'no_choice_required',
+                      DateTime? widerrufHinweisShownAt,
+                      DateTime? widerrufHinweisChosenAt,
+                    }) async {
+                      final ok = await OrderService.instance.openDispute(
+                        id,
+                        reason,
+                        description: description,
+                        reasonCodeChoice: reasonCodeChoice,
+                        widerrufHinweisShownAt: widerrufHinweisShownAt,
+                        widerrufHinweisChosenAt: widerrufHinweisChosenAt,
+                      );
                       if (mounted) {
                         if (ok) {
                           RiftrToast.info(context, 'Dispute opened');
@@ -1113,6 +1555,10 @@ class MarketScreenState extends State<MarketScreen> {
                         ),
                       );
                     },
+                    // Tap on Seller section-card inside Order Detail →
+                    // close detail, jump to Market Discover filtered by seller.
+                    onViewSellerListings: (sellerId, sellerName) =>
+                        _filterBySeller(sellerId, sellerName),
                   ),
                 )),
         ],
@@ -1138,7 +1584,8 @@ class MarketScreenState extends State<MarketScreen> {
           children: [
             Container(
               width: double.infinity,
-              padding: const EdgeInsets.symmetric(vertical: AppSpacing.sm),
+              height: 44, // Apple HIG touch-target minimum
+              alignment: Alignment.center,
               decoration: BoxDecoration(
                 color: active ? color : AppColors.surface,
                 borderRadius: BorderRadius.circular(AppRadius.md),
@@ -1158,7 +1605,7 @@ class MarketScreenState extends State<MarketScreen> {
                 top: -3, right: -3,
                 child: Container(
                   width: 8, height: 8,
-                  decoration: const BoxDecoration(
+                  decoration: BoxDecoration(
                     color: AppColors.amber400,
                     shape: BoxShape.circle,
                   ),
@@ -1247,8 +1694,9 @@ class MarketScreenState extends State<MarketScreen> {
       results = results.where((p) => p.cardType == filter.cardType).toList();
     }
 
-    // Listing-level filters (condition, language, country)
-    if (filter.conditions.isNotEmpty || filter.languages.isNotEmpty || filter.sellerCountry != null) {
+    // Listing-level filters (condition, language, country, seller)
+    if (filter.conditions.isNotEmpty || filter.languages.isNotEmpty ||
+        filter.sellerCountry != null || filter.sellerId != null) {
       final listings = ListingService.instance.allActive;
       final listingsByCard = <String, List<MarketListing>>{};
       for (final l in listings) {
@@ -1261,6 +1709,7 @@ class MarketScreenState extends State<MarketScreen> {
           if (filter.conditions.isNotEmpty && !filter.conditions.contains(l.condition)) return false;
           if (filter.languages.isNotEmpty && !filter.languages.contains(l.language)) return false;
           if (filter.sellerCountry != null && l.sellerCountry != filter.sellerCountry) return false;
+          if (filter.sellerId != null && l.sellerId != filter.sellerId) return false;
           return true;
         });
       }).toList();
@@ -1344,6 +1793,8 @@ class MarketScreenState extends State<MarketScreen> {
         itemCount: cards.length,
         itemBuilder: (context, index) {
           final card = cards[index];
+          final riftCard = CardService.getLookup()[card.cardId];
+          final isBattlefield = riftCard?.isBattlefield == true;
           return Padding(
             padding: const EdgeInsets.only(right: AppSpacing.sm),
             child: GestureDetector(
@@ -1353,22 +1804,39 @@ class MarketScreenState extends State<MarketScreen> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    // Card image (portrait ratio ~63:88)
-                    ClipRRect(
-                      borderRadius: BorderRadius.circular(AppRadius.sm),
-                      child: card.imageUrl != null
-                          ? CardImage(
-                              imageUrl: card.imageUrl,
-                              fallbackText: card.cardName,
-                              width: 105,
-                              height: 147,
-                              fit: BoxFit.cover,
-                            )
-                          : Container(
-                              width: 105, height: 147,
-                              color: AppColors.surfaceLight,
-                              child: const Icon(Icons.style, color: AppColors.textMuted),
-                            ),
+                    // Card image (portrait slot 105×147). Battlefield art is
+                    // landscape — RotatedBox(quarterTurns:1) lets it fill the
+                    // portrait slot fully instead of cropping left/right.
+                    // Same pattern as cart_screen._buildMoreCard,
+                    // CardPriceTile, smart_cart_review_sheet.
+                    SizedBox(
+                      width: 105, height: 147,
+                      child: ClipRRect(
+                        borderRadius: BorderRadius.circular(AppRadius.rounded),
+                        child: card.imageUrl != null
+                            ? (isBattlefield
+                                ? RotatedBox(
+                                    quarterTurns: 1,
+                                    child: CardImage(
+                                      imageUrl: card.imageUrl,
+                                      fallbackText: card.cardName,
+                                      fit: BoxFit.cover,
+                                      card: riftCard,
+                                    ),
+                                  )
+                                : CardImage(
+                                    imageUrl: card.imageUrl,
+                                    fallbackText: card.cardName,
+                                    width: 105,
+                                    height: 147,
+                                    fit: BoxFit.cover,
+                                    card: riftCard,
+                                  ))
+                            : Container(
+                                color: AppColors.surfaceLight,
+                                child: Icon(Icons.style, color: AppColors.textMuted),
+                              ),
+                      ),
                     ),
                     const SizedBox(height: AppSpacing.xs),
                     // Name
@@ -1423,27 +1891,53 @@ class MarketScreenState extends State<MarketScreen> {
           _buildViewToggle(),
           const SizedBox(height: AppSpacing.md),
 
-          // Missing cards banner
+          // Missing cards banner + Smart Cart CTA.
+          // Visual hierarchy: status banner (quiet) → primary CTA (loud).
+          // Previously both rendered as solid amber blocks of equal weight —
+          // user couldn't tell what was info vs. action.
           if (_missingCardIds != null) ...[
+            // Status banner — dezent surfaceLight bg, no competing color.
+            // Uses RiftrCard (V2 §16) with override radius to match the
+            // banner-family (rounded/8dp) used elsewhere in the app.
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.sm),
-                decoration: BoxDecoration(
-                  color: AppColors.amber400.withValues(alpha: 0.12),
-                  borderRadius: BorderRadius.circular(AppRadius.iconButton),
-                  border: Border.all(color: AppColors.amber400.withValues(alpha: 0.3)),
+              child: RiftrCard(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: AppSpacing.md,
+                  vertical: AppSpacing.sm,
                 ),
+                color: AppColors.surfaceLight,
+                borderColor: AppColors.surfaceLight, // borderless look
+                radius: AppRadius.rounded,
                 child: Row(children: [
-                  const Icon(Icons.style, size: 16, color: AppColors.amber400),
+                  Icon(Icons.style, size: 16, color: AppColors.textSecondary),
                   const SizedBox(width: AppSpacing.sm),
-                  Text('${_missingCardIds!.values.fold(0, (s, q) => s + q)} missing cards',
-                    style: AppTextStyles.caption.copyWith(color: AppColors.amber400, fontWeight: FontWeight.w700)),
+                  Text(
+                    '${_missingCardIds!.values.fold(0, (s, q) => s + q)} missing cards',
+                    style: AppTextStyles.captionBold,
+                  ),
                   const Spacer(),
                   GestureDetector(
                     onTap: () => setState(() { _missingCardIds = null; _searchResults = []; }),
-                    child: const Icon(Icons.close, size: 16, color: AppColors.textMuted)),
+                    behavior: HitTestBehavior.opaque,
+                    child: SizedBox(
+                      width: 44, height: 44, // Apple HIG touch-target minimum
+                      child: Icon(Icons.close, size: 16, color: AppColors.textMuted),
+                    ),
+                  ),
                 ]),
+              ),
+            ),
+            const SizedBox(height: AppSpacing.sm),
+            // Smart Cart CTA — single primary action on this screen. No
+            // sparkle icon (app-wide consistency with Review-Sheet CTAs);
+            // label shortened because "Smart cart" is already the feature
+            // name in context.
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
+              child: RiftrButton(
+                label: 'Find best deals',
+                onPressed: () => startSmartCartFlow(_missingCardIds!),
               ),
             ),
             const SizedBox(height: AppSpacing.md),
@@ -1453,9 +1947,14 @@ class MarketScreenState extends State<MarketScreen> {
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
             child: Row(children: [
-              Expanded(child: MarketSearchBar(
+              Expanded(child: RiftrSearchBar(
                 controller: _searchController,
                 onChanged: (q) {
+                  setState(() => _missingCardIds = null);
+                  _refreshFilteredResults();
+                },
+                onSuggest: (q) => CardService.suggestCardNames(q),
+                onSuggestionTap: (_) {
                   setState(() => _missingCardIds = null);
                   _refreshFilteredResults();
                 },
@@ -1466,9 +1965,15 @@ class MarketScreenState extends State<MarketScreen> {
           ),
           const SizedBox(height: AppSpacing.sm),
 
-          // Quick-filter pills
-          _buildQuickFilterPills(),
-          const SizedBox(height: AppSpacing.sm),
+          // Quick-filter pills — hidden while a seller filter is active.
+          // The quick-filters reset _discoverFilter on tap, which would
+          // silently drop the seller context. Hiding them keeps the user's
+          // "view this seller's listings" intent intact. When the user
+          // clears the seller filter (via X on the chip), pills reappear.
+          if (_discoverFilter.sellerId == null) ...[
+            _buildQuickFilterPills(),
+            const SizedBox(height: AppSpacing.sm),
+          ],
 
           // Active filter pills
           if (!_discoverFilter.isEmpty)
@@ -1504,7 +2009,7 @@ class MarketScreenState extends State<MarketScreen> {
             )),
             if (_filteredResults.isEmpty)
               const Padding(
-                padding: EdgeInsets.only(top: AppSpacing.xl),
+                padding: EdgeInsets.only(top: AppSpacing.legacyXl),
                 child: RiftrEmptyState(
                   icon: Icons.search_off,
                   title: 'No results',
@@ -1567,9 +2072,9 @@ class MarketScreenState extends State<MarketScreen> {
             Positioned(top: 4, right: 4,
               child: Container(
                 width: 18, height: 18,
-                decoration: const BoxDecoration(color: AppColors.loss, shape: BoxShape.circle),
+                decoration: BoxDecoration(color: AppColors.loss, shape: BoxShape.circle),
                 child: Center(child: Text('$count',
-                    style: AppTextStyles.small.copyWith(color: Colors.white, fontSize: 10, fontWeight: FontWeight.w700))),
+                    style: AppTextStyles.labelSmall.copyWith(color: AppColors.textPrimary, fontWeight: FontWeight.w700))),
               ),
             ),
         ]),
@@ -1651,14 +2156,14 @@ class MarketScreenState extends State<MarketScreen> {
               child: Container(
                 padding: const EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: AppSpacing.xs),
                 decoration: BoxDecoration(
-                  color: AppColors.amber400.withValues(alpha: 0.15),
+                  color: AppColors.amber500,
                   borderRadius: AppRadius.pillBR,
-                  border: Border.all(color: AppColors.amber400.withValues(alpha: 0.3)),
+                  border: Border.all(color: AppColors.amber500),
                 ),
                 child: Row(mainAxisSize: MainAxisSize.min, children: [
-                  Text(item.label, style: AppTextStyles.small.copyWith(color: AppColors.amber400)),
+                  Text(item.label, style: AppTextStyles.small.copyWith(color: AppColors.background)),
                   const SizedBox(width: 4),
-                  const Icon(Icons.close, size: 12, color: AppColors.amber400),
+                  Icon(Icons.close, size: 12, color: AppColors.background),
                 ]),
               ),
             ),
@@ -1672,8 +2177,15 @@ class MarketScreenState extends State<MarketScreen> {
               });
               _refreshFilteredResults();
             },
-            child: Text('Clear all', style: AppTextStyles.small.copyWith(
-              color: AppColors.textMuted, fontWeight: FontWeight.w600)),
+            behavior: HitTestBehavior.opaque,
+            child: SizedBox(
+              height: 44, // Apple HIG touch-target minimum
+              child: Align(
+                alignment: Alignment.center,
+                child: Text('Clear all', style: AppTextStyles.small.copyWith(
+                  color: AppColors.textMuted, fontWeight: FontWeight.w600)),
+              ),
+            ),
           ),
         ]),
       ),
@@ -1687,335 +2199,92 @@ class MarketScreenState extends State<MarketScreen> {
   Widget _buildCardDetail() {
     final card = _selectedCard;
     if (card == null) return const SizedBox.shrink();
-
-    final chartData = _filterByRange(
-      card.isNonFoilOnly ? card.nonFoilHistory
-          : card.isFoilOnly ? _getFoilOnlyChartData(card)
-          : card.priceHistory,
-      _selectedRange,
+    // Single source of truth for the §7.2 card detail UI lives in
+    // MarketCardDetailView. Both this in-tab path AND the modal sheet
+    // (showMarketCardDetailSheet from DeckShoppingOverlay) render it.
+    // ValueKey resets the widget's State when the user navigates to a
+    // different card via _navigateToCard.
+    //
+    // _wrapWithDismiss adds the DragToDismiss + drag-handle wrapper so the
+    // user can pull down anywhere on the detail to return to the previous
+    // view. Modal sheet path doesn't need this — showRiftrSheet provides
+    // its own drag handle.
+    return _wrapWithDismiss(
+      MarketCardDetailView(
+        key: ValueKey(card.cardId),
+        card: card,
+        initialShowFoil: _detailShowFoil,
+        onCheckout: _openCheckoutSheet,
+        onAddToCart: _addToCart,
+        onSell: () => _openSellSheet(card),
+        onFilterSeller: _filterBySeller,
+      ),
     );
-    final liveListings = _listings.getListings(card.cardId);
-    final listings = _isDemo
-        ? ([...liveListings, ..._demoListings.where((l) => l.cardId == card.cardId)]
-            ..sort((a, b) => a.price.compareTo(b.price)))
-        : liveListings;
+  }
 
-    // Buyable listings: exclude own, sort by total cost (price + shipping)
-    final uid = AuthService.instance.uid;
-    final buyerCountry = ProfileService.instance.ownProfile?.country;
-    final buyableListings = listings
-        .where((l) => l.sellerId != uid && l.availableQty > 0)
-        .toList()
-      ..sort((a, b) {
-        final aCost = buyerCountry != null ? a.totalPriceFor(buyerCountry) : a.price;
-        final bCost = buyerCountry != null ? b.totalPriceFor(buyerCountry) : b.price;
-        final priceCmp = aCost.compareTo(bCost);
-        if (priceCmp != 0) return priceCmp;
-        // Same total price → prefer better condition
-        return a.condition.index.compareTo(b.condition.index);
-      });
 
-    // Calculate change relative to selected range
-    double rangeChangeAbs = card.dayChangeAbs;
-    double rangeChangePct = card.dayChange;
-    if (chartData.length >= 2) {
-      final startPrice = chartData.first.price;
-      final endPrice = chartData.last.price;
-      rangeChangeAbs = endPrice - startPrice;
-      rangeChangePct = startPrice > 0 ? (rangeChangeAbs / startPrice * 100) : 0;
+  /// Compute status badge label + type for a listing.
+  /// Mirrors OrderTile's status-badge pattern so both tiles read similar.
+  (String, RiftrBadgeType) _listingStatus(MarketListing listing) {
+    if (listing.status == 'cancelled') {
+      return ('Cancelled', RiftrBadgeType.error);
     }
-    final rangePositive = rangeChangeAbs >= 0;
-    final changeColor = rangePositive ? AppColors.win : AppColors.loss;
-    final changeSign = rangePositive ? '+' : '';
-
-    final content = _wrapWithDismiss(SingleChildScrollView(
-          controller: _scrollController,
-          padding: const EdgeInsets.only(bottom: 120, top: 36),
-          child: Column(
-            children: [
-              // Card image (battlefields shown landscape via rotation)
-              if (card.imageUrl != null)
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
-                  child: Center(
-                    child: ClipRRect(
-                            borderRadius: AppRadius.baseBR,
-                            child: CardImage(
-                              imageUrl: card.imageUrl,
-                              fallbackText: card.cardName,
-                              width: card.isBattlefield ? 280 : 160,
-                              height: card.isBattlefield ? 200 : 224,
-                              fit: BoxFit.cover,
-                            ),
-                          ),
-                  ),
-                ),
-              const SizedBox(height: AppSpacing.md),
-
-              // Name + set
-              Text(
-                card.cardName,
-                style: AppTextStyles.subtitle.copyWith(fontWeight: FontWeight.w900),
-                textAlign: TextAlign.center,
-              ),
-              if (card.setId != null || card.rarity != null)
-                Padding(
-                  padding: const EdgeInsets.only(top: 2),
-                  child: Builder(builder: (_) {
-                    final riftCard = CardService.getLookup()[card.cardId];
-                    final col = riftCard?.collectorNumber;
-                    return Text(
-                      [
-                        if (card.setId != null) card.setId!.toUpperCase(),
-                        if (col != null) col,
-                        if (card.rarity != null) card.rarity!,
-                      ].join(' · '),
-                      style: AppTextStyles.small,
-                    );
-                  }),
-                ),
-              const SizedBox(height: AppSpacing.sm),
-
-              // Price + change (relative to selected range)
-              if (card.currentPrice == 0 && card.foilPrice == 0 && card.nonFoilPrice == 0)
-                Padding(
-                  padding: const EdgeInsets.symmetric(vertical: AppSpacing.md),
-                  child: Text('No price data available',
-                    style: AppTextStyles.bodySecondary,
-                    textAlign: TextAlign.center),
-                )
-              else ...[
-              // Show selected variant price (foil or non-foil)
-              // Promo sets: always foil (standardPrice already returns foil via _isNonFoilStandard)
-              Builder(builder: (_) {
-                final showFoil = _detailShowFoil || card.isFoilOnly;
-                final displayPrice = showFoil
-                    ? (card.foilPrice > 0 ? card.foilPrice : card.currentPrice)
-                    : (card.standardPrice > 0 ? card.standardPrice : card.currentPrice);
-                return Text(
-                  '€${displayPrice.toStringAsFixed(2)}',
-                  style: AppTextStyles.displaySmall.copyWith(fontWeight: FontWeight.w900),
-                );
-              }),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Icon(
-                    rangePositive ? Icons.arrow_drop_up : Icons.arrow_drop_down,
-                    size: 18,
-                    color: changeColor,
-                  ),
-                  Text(
-                    '$changeSign€${rangeChangeAbs.abs().toStringAsFixed(2)} ($changeSign${rangeChangePct.toStringAsFixed(1)}%)',
-                    style: AppTextStyles.captionBold.copyWith(
-                      color: changeColor,
-                    ),
-                  ),
-                ],
-              ),
-
-              // Variant price badges (foil + non-foil) — tappable
-              // Toggle only for Common/Uncommon in base sets (both variants exist)
-              if (card.showVariantToggle)
-                Padding(
-                  padding: const EdgeInsets.only(top: 6),
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      GestureDetector(
-                        onTap: () => setState(() => _detailShowFoil = false),
-                        child: _variantBadge(
-                          card.standardLabel,
-                          card.standardPrice,
-                          _detailShowFoil ? AppColors.textMuted : AppColors.textPrimary,
-                        ),
-                      ),
-                      const SizedBox(width: 10),
-                      GestureDetector(
-                        onTap: () => setState(() => _detailShowFoil = true),
-                        child: _variantBadge(
-                          card.premiumLabel,
-                          card.premiumPrice,
-                          _detailShowFoil ? AppColors.textPrimary : AppColors.textMuted,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              const SizedBox(height: AppSpacing.md),
-
-              // Time range selector
-              TimeRangeSelector(
-                selected: _selectedRange,
-                onChanged: (r) => setState(() => _selectedRange = r),
-              ),
-              const SizedBox(height: AppSpacing.sm),
-
-              // Price chart(s)
-              if (_loadingHistory)
-                const Padding(
-                  padding: EdgeInsets.symmetric(horizontal: AppSpacing.md),
-                  child: SizedBox(
-                    height: 180,
-                    child: Center(
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2,
-                        color: AppColors.amber400,
-                      ),
-                    ),
-                  ),
-                )
-              else ...[
-                // Overlaid chart — active variant solid, inactive dimmed
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
-                  child: PriceChart(
-                    data: card.isNonFoilOnly
-                        ? _filterByRange(card.nonFoilHistory, _selectedRange)
-                        : card.isFoilOnly
-                            ? _filterByRange(_getFoilOnlyChartData(card), _selectedRange)
-                            : (_detailShowFoil
-                                ? _getFoilChartData(card)
-                                : _getStandardChartData(card)),
-                    isPositive: rangePositive,
-                    secondaryData: card.showVariantToggle
-                        ? (_detailShowFoil
-                            ? _getStandardChartData(card)
-                            : _getPremiumChartData(card))
-                        : null,
-                  ),
-                ),
-              ],
-              const SizedBox(height: AppSpacing.base),
-
-              // Price overview
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
-                child: PriceOverviewCard(data: card, showFoil: _detailShowFoil || card.isFoilOnly),
-              ),
-              const SizedBox(height: AppSpacing.base),
-              ], // end of price data section
-
-              // Listings
-              if (listings.isNotEmpty) ...[
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
-                  child: SectionDivider(icon: Icons.sell, label: 'LISTINGS (${listings.length})'),
-                ),
-                const SizedBox(height: AppSpacing.xs),
-                ...listings.map((l) {
-                  final uid = AuthService.instance.uid;
-                  final canBuy = l.sellerId != uid && l.availableQty > 0;
-                  return Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: 3),
-                    child: ListingTile(
-                      listing: l,
-                      onBuy: canBuy ? () => _openCheckoutSheet(l) : null,
-                      onAddToCart: canBuy ? () => _addToCart(l) : null,
-                    ),
-                  );
-                }),
-              ] else
-                const Padding(
-                  padding: EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.sm),
-                  child: RiftrEmptyState(
-                    icon: Icons.storefront_outlined,
-                    title: 'No Listings Yet',
-                    subtitle: 'Be the first to list this card for sale',
-                  ),
-                ),
-            ],
-          ),
-    ));
-
-    final viewPadding = MediaQuery.of(context).viewPadding;
-
-    return Stack(
-      fit: StackFit.expand,
-      children: [
-        content,
-        // Gradient fade behind buttons
-        Positioned(
-          left: 0, right: 0,
-          bottom: 0,
-          child: IgnorePointer(
-            child: Container(
-              height: 100,
-              decoration: BoxDecoration(
-                gradient: LinearGradient(
-                  begin: Alignment.topCenter,
-                  end: Alignment.bottomCenter,
-                  colors: [
-                    AppColors.surface.withValues(alpha: 0),
-                    AppColors.surface,
-                  ],
-                ),
-              ),
-            ),
-          ),
-        ),
-        // Fixed Buy/Sell FABs
-        Positioned(
-          left: AppSpacing.base,
-          right: AppSpacing.base,
-          bottom: AppSpacing.base,
-          child: Row(
-            children: [
-              Expanded(
-                child: _buyButton(buyableListings.isNotEmpty ? buyableListings.first : null),
-              ),
-              const SizedBox(width: AppSpacing.md),
-              Expanded(
-                child: _sellButton(card),
-              ),
-            ],
-          ),
-        ),
-      ],
-    );
+    if (listing.availableQty <= 0) {
+      return ('Sold', RiftrBadgeType.success);
+    }
+    final reserved = listing.quantity - listing.availableQty;
+    if (reserved > 0) {
+      return ('Reserved $reserved', RiftrBadgeType.warning);
+    }
+    return ('Active', RiftrBadgeType.gold);
   }
 
-  Widget _variantBadge(String label, double price, Color color) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: 3),
-      decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.1),
-        borderRadius: BorderRadius.circular(AppRadius.sm),
-        border: Border.all(color: color.withValues(alpha: 0.2)),
-      ),
-      child: Text(
-        '$label  €${price.toStringAsFixed(2)}',
-        style: AppTextStyles.tiny.copyWith(
-          color: color,
-          fontWeight: FontWeight.w700,
-        ),
-      ),
-    );
-  }
-
+  /// Structural parity with OrderTile: RiftrCard(md, listItem) + 40×56
+  /// thumbnail with scale 1.25, single-row info, small inline Cancel pill.
   Widget _myListingTile(MarketListing listing) {
-    return Container(
+    final card = CardService.getLookup()[listing.cardId];
+    final marketPrice = _market.getPrice(listing.cardId);
+    final mktPrice = marketPrice != null
+        ? (listing.isFoil ? marketPrice.getPrice(true) : marketPrice.currentPrice)
+        : null;
+
+    final (statusLabel, statusType) = _listingStatus(listing);
+
+    // Compose meta line: "SFD #123 · Mkt €1.20"
+    final metaParts = <String>[];
+    if (card != null) {
+      final setCn = [
+        if (card.setId != null) card.setId!,
+        if (card.collectorNumber != null) '#${card.collectorNumber}',
+      ].join(' ');
+      if (setCn.isNotEmpty) metaParts.add(setCn);
+    }
+    if (mktPrice != null && mktPrice > 0) {
+      metaParts.add('Mkt €${mktPrice.toStringAsFixed(2)}');
+    }
+    final metaLine = metaParts.join(' · ');
+
+    return RiftrCard(
       padding: const EdgeInsets.all(AppSpacing.md),
-      decoration: BoxDecoration(
-        color: AppColors.surface,
-        borderRadius: AppRadius.baseBR,
-        border: Border.all(color: AppColors.border),
-      ),
+      radius: AppRadius.listItem,
       child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // Thumbnail
+          // Thumbnail — identical to OrderTile (40×56 + scale 1.25)
           SizedBox(
             width: 40,
             height: 56,
             child: Transform.scale(
               scale: 1.25,
               child: ClipRRect(
-                borderRadius: BorderRadius.circular(AppRadius.sm),
+                borderRadius: BorderRadius.circular(AppRadius.rounded),
                 child: CardImage(
                   imageUrl: listing.imageUrl,
                   fallbackText: listing.cardName,
                   width: 40,
                   height: 56,
+                  card: card,
+                  ribbonSize: CardRibbonSize.compact,
                 ),
               ),
             ),
@@ -2025,13 +2294,26 @@ class MarketScreenState extends State<MarketScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(
-                  listing.cardName,
-                  style: AppTextStyles.bodySmall.copyWith(fontWeight: FontWeight.w800),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
+                // Row 1: Name + Status badge
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Expanded(
+                      child: Text(
+                        listing.cardName,
+                        // body (14sp) — matches OrderTile/CardPriceTile.
+                        style: AppTextStyles.body.copyWith(fontWeight: FontWeight.w800),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    const SizedBox(width: AppSpacing.sm),
+                    RiftrBadge(label: statusLabel, type: statusType),
+                  ],
                 ),
                 const SizedBox(height: 6),
+
+                // Row 2: Condition + qty + foil + meta + price + edit
                 Row(
                   children: [
                     ConditionBadge(condition: listing.condition),
@@ -2040,52 +2322,254 @@ class MarketScreenState extends State<MarketScreen> {
                       Text(
                         '×${listing.availableQty}',
                         style: AppTextStyles.tiny.copyWith(
-                          color: AppColors.textMuted,
                           fontWeight: FontWeight.w600,
+                          color: AppColors.textMuted,
                         ),
+                      ),
+                    ],
+                    if (listing.isFoil) ...[
+                      const SizedBox(width: 6),
+                      // App-wide Foil-Indicator standard '★' (V2 §15.17).
+                      Text(
+                        '★',
+                        style: AppTextStyles.tiny.copyWith(color: AppColors.amber300),
                       ),
                     ],
                     const SizedBox(width: AppSpacing.sm),
+                    Expanded(
+                      child: Text(
+                        metaLine,
+                        style: AppTextStyles.tiny.copyWith(
+                          color: AppColors.textMuted,
+                          fontWeight: FontWeight.w600,
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    const SizedBox(width: AppSpacing.sm),
+                    // Price (plain — adjust action moved to dedicated pill below)
                     Text(
                       '€${listing.price.toStringAsFixed(2)}',
-                      style: AppTextStyles.bodySmall.copyWith(fontWeight: FontWeight.w900),
+                      // body (14sp) — matches OrderTile price size.
+                      style: AppTextStyles.body.copyWith(fontWeight: FontWeight.w900),
                     ),
-                    if (listing.isPreRelease) ...[
-                      const SizedBox(width: AppSpacing.sm),
-                      Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                        decoration: BoxDecoration(
-                          color: AppColors.amber400.withValues(alpha: 0.15),
-                          borderRadius: AppRadius.pillBR,
-                        ),
-                        child: Text('PRE-ORDER',
-                          style: AppTextStyles.micro.copyWith(
-                            color: AppColors.amber400, fontWeight: FontWeight.w700)),
-                      ),
-                    ],
                   ],
                 ),
+
+                // Row 3: Inline action pills (only for active listings).
+                // Layout matches OrderTile Sales-row (Cancel + Ship pair):
+                //   LEFT  = Cancel (red, flex 1 — narrower)
+                //   RIGHT = Adjust price (amber, flex 2 — wider primary action)
+                // Adjust price = explicit pill (replaces previous pencil icon
+                // next to the price — clearer affordance, easier to hit).
+                if (listing.status == 'active') ...[
+                  const SizedBox(height: AppSpacing.sm),
+                  Row(
+                    children: [
+                      Expanded(
+                        flex: 1,
+                        child: _smallActionPill(
+                          label: 'Cancel',
+                          color: AppColors.loss,
+                          onTap: () => _cancelListing(listing),
+                        ),
+                      ),
+                      const SizedBox(width: AppSpacing.sm),
+                      Expanded(
+                        flex: 2,
+                        child: _smallActionPill(
+                          label: 'Adjust price',
+                          color: AppColors.amber500,
+                          onTap: () => _showListingPriceEditor(listing),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
               ],
             ),
           ),
-          GestureDetector(
-            onTap: () => _cancelListing(listing),
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.sm),
-              decoration: BoxDecoration(
-                color: AppColors.loss,
-                borderRadius: BorderRadius.circular(AppRadius.md),
+        ],
+      ),
+    );
+  }
+
+  /// Small inline action pill — matches OrderTile's inline-action style.
+  /// Used for Cancel in list tiles and for bulk-actions above the list.
+  Widget _smallActionPill({
+    required String label,
+    required Color color,
+    required VoidCallback onTap,
+    IconData? icon,
+  }) {
+    return GestureDetector(
+      onTap: () {
+        HapticFeedback.lightImpact();
+        onTap();
+      },
+      child: Container(
+        padding: const EdgeInsets.symmetric(
+          horizontal: AppSpacing.md,
+          vertical: AppSpacing.xs + 2,
+        ),
+        decoration: BoxDecoration(
+          color: color,
+          borderRadius: AppRadius.pillBR,
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            if (icon != null) ...[
+              Icon(icon, size: 14, color: AppColors.background),
+              const SizedBox(width: 4),
+            ],
+            Text(
+              label,
+              style: AppTextStyles.small.copyWith(
+                color: AppColors.background,
+                fontWeight: FontWeight.w700,
               ),
-              child: Text(
-                'Cancel',
-                style: AppTextStyles.small.copyWith(
-                  color: AppColors.textPrimary,
-                  fontWeight: FontWeight.w700,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Segmented toggle button — visual parity with `_orderSubTabButton`
+  /// (Purchases/Sales sub-tabs). Used inside the Adjust-all-prices sheet.
+  /// 44dp height, AppRadius.md (8dp), solid amber active + border inactive.
+  Widget _segmentedToggle({
+    required String label,
+    required bool active,
+    required VoidCallback onTap,
+  }) {
+    return GestureDetector(
+      onTap: () {
+        HapticFeedback.lightImpact();
+        onTap();
+      },
+      child: Container(
+        width: double.infinity,
+        height: 44,
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: active ? AppColors.amber500 : AppColors.surface,
+          borderRadius: BorderRadius.circular(AppRadius.md),
+          border: active ? null : Border.all(color: AppColors.border),
+        ),
+        child: Text(
+          label,
+          textAlign: TextAlign.center,
+          style: AppTextStyles.small.copyWith(
+            color: active ? AppColors.background : AppColors.textMuted,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Tappable snap-point label below the percent slider.
+  /// 44dp touch-target (Apple HIG) wraps the small text.
+  Widget _percentSnapLabel({
+    required String label,
+    required int value,
+    required bool active,
+    required VoidCallback onTap,
+  }) {
+    return GestureDetector(
+      onTap: () {
+        HapticFeedback.selectionClick();
+        onTap();
+      },
+      behavior: HitTestBehavior.opaque,
+      child: SizedBox(
+        width: 44,
+        height: 44,
+        child: Center(
+          child: Text(
+            label,
+            style: AppTextStyles.labelSmall.copyWith(
+              color: active ? AppColors.amber400 : AppColors.textMuted,
+              fontWeight: active ? FontWeight.w700 : FontWeight.w500,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _showListingPriceEditor(MarketListing listing) {
+    final controller = TextEditingController(text: listing.price.toStringAsFixed(2));
+    showRiftrSheet<void>(
+      context: context,
+      builder: (ctx) => Padding(
+        padding: const EdgeInsets.fromLTRB(AppSpacing.lg, 0, AppSpacing.lg, AppSpacing.lg),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(listing.cardName,
+              style: AppTextStyles.bodyBold.copyWith(color: AppColors.textPrimary)),
+            const SizedBox(height: AppSpacing.md),
+            TextField(
+              controller: controller,
+              autofocus: true,
+              keyboardType: const TextInputType.numberWithOptions(decimal: true),
+              style: AppTextStyles.titleMedium.copyWith(color: AppColors.textPrimary, fontWeight: FontWeight.bold),
+              decoration: InputDecoration(
+                prefixText: '€ ',
+                prefixStyle: AppTextStyles.titleMedium.copyWith(color: AppColors.amber400, fontWeight: FontWeight.bold),
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(AppRadius.rounded)),
+                enabledBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(AppRadius.rounded),
+                  borderSide: BorderSide(color: AppColors.surfaceLight),
+                ),
+                focusedBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(AppRadius.rounded),
+                  borderSide: BorderSide(color: AppColors.amber400),
                 ),
               ),
             ),
-          ),
-        ],
+            const SizedBox(height: AppSpacing.md),
+            RiftrButton(
+              label: 'Confirm',
+              style: RiftrButtonStyle.primary,
+              onPressed: () async {
+                final parsed = double.tryParse(controller.text);
+                Navigator.pop(ctx);
+                if (parsed == null || parsed < 0.01) return;
+
+                if (_isDemo) {
+                  final idx = _demoListings.indexWhere((l) => l.id == listing.id);
+                  if (idx >= 0) {
+                    setState(() {
+                      _demoListings[idx] = MarketListing(
+                        id: listing.id, cardId: listing.cardId, cardName: listing.cardName,
+                        imageUrl: listing.imageUrl, sellerId: listing.sellerId,
+                        sellerName: listing.sellerName, sellerCountry: listing.sellerCountry,
+                        sellerRating: listing.sellerRating, sellerSales: listing.sellerSales,
+                        price: parsed, condition: listing.condition, quantity: listing.quantity,
+                        insuredOnly: listing.insuredOnly, isFoil: listing.isFoil,
+                        status: listing.status, listedAt: listing.listedAt,
+                      );
+                    });
+                  }
+                  return;
+                }
+
+                final ok = await _listings.updateListingPrice(listing.id, parsed);
+                if (!mounted) return;
+                if (ok) {
+                  RiftrToast.success(context, 'Price updated');
+                } else {
+                  RiftrToast.error(context, 'Failed to update price');
+                }
+              },
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -2136,93 +2620,281 @@ class MarketScreenState extends State<MarketScreen> {
     }
   }
 
-  Widget _sellButton(CardPriceData card) {
-    return GestureDetector(
-      onTap: () {
-        HapticFeedback.lightImpact();
-        _openSellSheet(card);
-      },
-      child: Container(
-        height: 56,
-        alignment: Alignment.center,
-        decoration: BoxDecoration(
-          color: AppColors.amber400,
-          borderRadius: AppRadius.pillBR,
-          boxShadow: [
-            BoxShadow(
-              color: AppColors.amber400.withValues(alpha: 0.5),
-              blurRadius: 16,
-              spreadRadius: 2,
-            ),
-          ],
-        ),
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.center,
+  Future<void> _cancelAllListings(List<MarketListing> listings) async {
+    final confirm = await showRiftrSheet<bool>(
+      context: context,
+      builder: (ctx) => Padding(
+        padding: const EdgeInsets.fromLTRB(AppSpacing.base, 0, AppSpacing.base, AppSpacing.lg),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Icon(Icons.sell_outlined, color: AppColors.background, size: 20),
-            const SizedBox(width: AppSpacing.sm),
-            Text(
-              'Sell',
-              style: AppTextStyles.bodyBold.copyWith(
-                color: AppColors.background,
-                fontWeight: FontWeight.w800,
-              ),
-            ),
+            Text('CANCEL ALL LISTINGS?',
+                style: AppTextStyles.h2.copyWith(color: AppColors.error, fontWeight: FontWeight.w900)),
+            const SizedBox(height: AppSpacing.sm),
+            Text('Cancel all ${listings.length} listing${listings.length > 1 ? 's' : ''}? This cannot be undone.',
+                style: AppTextStyles.bodySecondary),
+            const SizedBox(height: AppSpacing.lg),
+            Row(children: [
+              Expanded(child: RiftrButton(label: 'Keep',
+                  onPressed: () => Navigator.pop(ctx, false), style: RiftrButtonStyle.secondary)),
+              const SizedBox(width: AppSpacing.md),
+              Expanded(child: RiftrButton(label: 'Cancel All',
+                  onPressed: () => Navigator.pop(ctx, true), style: RiftrButtonStyle.danger)),
+            ]),
           ],
         ),
       ),
     );
+
+    if (confirm != true || !mounted) return;
+
+    if (_isDemo) {
+      setState(() => _demoListings.clear());
+      if (mounted) RiftrToast.success(context, '${listings.length} listings cancelled (Demo)');
+      return;
+    }
+
+    int cancelled = 0;
+    for (final l in listings) {
+      final ok = await _listings.cancelListing(l.id);
+      if (ok) cancelled++;
+    }
+
+    if (!mounted) return;
+    RiftrToast.success(context, '$cancelled listing${cancelled > 1 ? 's' : ''} cancelled');
   }
 
-  Widget _buyButton(MarketListing? listing) {
-    final canBuy = listing != null;
-    final label = canBuy ? 'Buy €${listing.price.toStringAsFixed(2)}' : 'Buy';
-    return GestureDetector(
-      onTap: canBuy
-          ? () {
-              HapticFeedback.lightImpact();
-              _openCheckoutSheet(listing);
-            }
-          : () {
-              HapticFeedback.lightImpact();
-              RiftrToast.info(context, 'No listings available');
-            },
-      child: Container(
-        height: 56,
-        alignment: Alignment.center,
-        decoration: BoxDecoration(
-          color: canBuy ? AppColors.win : AppColors.surfaceLight,
-          borderRadius: AppRadius.pillBR,
-          boxShadow: canBuy
-              ? [
-                  BoxShadow(
-                    color: AppColors.win.withValues(alpha: 0.5),
-                    blurRadius: 16,
-                    spreadRadius: 2,
+  void _showPriceAdjustmentSheet(List<MarketListing> listings) {
+    int modifierPercent = 0;
+    bool fromMarket = true; // true = market price, false = current listing price
+
+    showRiftrSheet(
+      context: context,
+      builder: (_) => StatefulBuilder(
+        builder: (ctx, setSheetState) {
+          // Calculate preview prices
+          final previews = listings.map((l) {
+            final basePrice = fromMarket
+                ? (_market.getPrice(l.cardId)?.currentPrice ?? l.price)
+                : l.price;
+            final newPrice = ((basePrice * (1.0 + modifierPercent / 100.0)) * 100).roundToDouble() / 100;
+            return (listing: l, oldPrice: l.price, newPrice: newPrice.clamp(0.01, 9999.99));
+          }).toList();
+
+          final label = modifierPercent == 0
+              ? '0%'
+              : '${modifierPercent > 0 ? '+' : ''}$modifierPercent%';
+
+          return Padding(
+            padding: const EdgeInsets.fromLTRB(AppSpacing.base, 0, AppSpacing.base, AppSpacing.lg),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                // ── FIXED TOP: Header + Mode + Slider ──
+                Text('Adjust all prices',
+                    style: AppTextStyles.bodyLarge.copyWith(fontWeight: FontWeight.w500, color: AppColors.textPrimary)),
+                const SizedBox(height: 4),
+                Text('${listings.length} listings will be updated',
+                    style: AppTextStyles.bodySmall.copyWith(color: AppColors.textMuted)),
+                const SizedBox(height: AppSpacing.md),
+
+                // Mode toggle — matches Purchases/Sales segmented pattern
+                // (44dp, AppRadius.md, solid amber active + border inactive).
+                Row(children: [
+                  Expanded(
+                    child: _segmentedToggle(
+                      label: 'From market price',
+                      active: fromMarket,
+                      onTap: () => setSheetState(() => fromMarket = true),
+                    ),
                   ),
-                ]
-              : null,
-        ),
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(Icons.shopping_bag_outlined,
-                color: canBuy ? AppColors.background : AppColors.textMuted,
-                size: 20),
-            const SizedBox(width: AppSpacing.sm),
-            Text(
-              label,
-              style: AppTextStyles.bodyBold.copyWith(
-                color: canBuy ? AppColors.background : AppColors.textMuted,
-                fontWeight: FontWeight.w800,
-              ),
+                  const SizedBox(width: AppSpacing.sm),
+                  Expanded(
+                    child: _segmentedToggle(
+                      label: 'From current price',
+                      active: !fromMarket,
+                      onTap: () => setSheetState(() => fromMarket = false),
+                    ),
+                  ),
+                ]),
+                const SizedBox(height: AppSpacing.md),
+
+                // Slider — form-group label + live value indicator
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    // FormSectionLabel-equivalent inline (sheet form-group label
+                    // tokens: captionBold + textSecondary + letterSpacing 1.2).
+                    Text('ADJUSTMENT', style: AppTextStyles.captionBold.copyWith(
+                      color: AppColors.textSecondary, letterSpacing: 1.2)),
+                    Text(label, style: AppTextStyles.titleMedium.copyWith(color: AppColors.amber400)),
+                  ],
+                ),
+                SliderTheme(
+                  data: SliderTheme.of(ctx).copyWith(
+                    activeTrackColor: AppColors.amber500,
+                    inactiveTrackColor: AppColors.surfaceLight,
+                    thumbColor: AppColors.amber500,
+                    // Token instead of inline alpha (V2 Rule 2 — interactive el.)
+                    overlayColor: AppColors.amberMuted,
+                    trackHeight: 4,
+                    thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 12),
+                  ),
+                  child: Slider(
+                    value: modifierPercent.toDouble(),
+                    min: -10, max: 10, divisions: 20,
+                    onChanged: (v) => setSheetState(() => modifierPercent = v.round()),
+                  ),
+                ),
+                // Tappable snap-points — 44dp touch-target per Apple HIG.
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    for (final entry in const [
+                      ('-10%', -10), ('-5%', -5), ('0%', 0), ('+5%', 5), ('+10%', 10),
+                    ])
+                      _percentSnapLabel(
+                        label: entry.$1,
+                        value: entry.$2,
+                        active: modifierPercent == entry.$2,
+                        onTap: () => setSheetState(() => modifierPercent = entry.$2),
+                      ),
+                  ],
+                ),
+                const SizedBox(height: AppSpacing.md),
+
+                // ── SCROLLABLE MIDDLE: Preview list ──
+                // RiftrCard (V2 standard content container) instead of custom
+                // surface+border+radius Container.
+                Flexible(
+                  child: RiftrCard(
+                    padding: const EdgeInsets.all(AppSpacing.md),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        // In-box label per V2 §15.4 (centered + amber + l-spacing 1.5)
+                        // — same pattern as MARKET PRICE / YOUR COLLECTION boxes.
+                        Text(
+                          'PREVIEW',
+                          textAlign: TextAlign.center,
+                          style: AppTextStyles.labelSmall.copyWith(
+                            color: AppColors.amber500,
+                            letterSpacing: 1.5,
+                          ),
+                        ),
+                        const SizedBox(height: AppSpacing.sm),
+                        Flexible(
+                          child: ListView.separated(
+                            shrinkWrap: true,
+                            itemCount: previews.length,
+                            separatorBuilder: (_, __) => Divider(height: 1, color: AppColors.surfaceLight),
+                            itemBuilder: (_, i) {
+                              final p = previews[i];
+                              final changed = (p.oldPrice - p.newPrice).abs() >= 0.005;
+                              return Padding(
+                                padding: const EdgeInsets.symmetric(vertical: 4),
+                                child: Row(children: [
+                                  Expanded(child: Text(
+                                    '${p.listing.cardName}${p.listing.quantity > 1 ? ' ×${p.listing.quantity}' : ''}',
+                                    style: AppTextStyles.bodySmallSecondary,
+                                    maxLines: 1, overflow: TextOverflow.ellipsis,
+                                  )),
+                                  if (changed) ...[
+                                    Text('€${p.oldPrice.toStringAsFixed(2)} ',
+                                        style: AppTextStyles.bodySmall.copyWith(color: AppColors.textMuted,
+                                          decoration: TextDecoration.lineThrough)),
+                                  ],
+                                  Text('€${p.newPrice.toStringAsFixed(2)}',
+                                      style: AppTextStyles.bodySmall.copyWith(fontWeight: FontWeight.w500,
+                                        color: AppColors.textPrimary)),
+                                ]),
+                              );
+                            },
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: AppSpacing.md),
+
+                // ── FIXED BOTTOM: Buttons ──
+                // Gap = md (12dp) per V2 §1 (button-pair gap rule).
+                Row(children: [
+                  Expanded(
+                    child: RiftrButton(
+                      label: 'Cancel',
+                      style: RiftrButtonStyle.secondary,
+                      onPressed: () => Navigator.pop(ctx),
+                    ),
+                  ),
+                  const SizedBox(width: AppSpacing.md),
+                  Expanded(
+                    child: RiftrButton(
+                      label: 'Apply to all',
+                      style: RiftrButtonStyle.primary,
+                      onPressed: () async {
+                        Navigator.pop(ctx);
+                        await _applyPriceAdjustment(previews);
+                      },
+                    ),
+                  ),
+                ]),
+              ],
             ),
-          ],
-        ),
+          );
+        },
       ),
     );
   }
 
+  Future<void> _applyPriceAdjustment(
+    List<({MarketListing listing, double oldPrice, double newPrice})> previews,
+  ) async {
+    if (_isDemo) {
+      setState(() {
+        for (final p in previews) {
+          final idx = _demoListings.indexWhere((l) => l.id == p.listing.id);
+          if (idx >= 0) {
+            _demoListings[idx] = MarketListing(
+              id: p.listing.id,
+              cardId: p.listing.cardId,
+              cardName: p.listing.cardName,
+              imageUrl: p.listing.imageUrl,
+              sellerId: p.listing.sellerId,
+              sellerName: p.listing.sellerName,
+              sellerCountry: p.listing.sellerCountry,
+              sellerRating: p.listing.sellerRating,
+              sellerSales: p.listing.sellerSales,
+              price: p.newPrice,
+              condition: p.listing.condition,
+              quantity: p.listing.quantity,
+              insuredOnly: p.listing.insuredOnly,
+              isFoil: p.listing.isFoil,
+              status: p.listing.status,
+              listedAt: p.listing.listedAt,
+            );
+          }
+        }
+      });
+      if (mounted) RiftrToast.success(context, '${previews.length} prices updated (Demo)');
+      return;
+    }
+
+    int updated = 0;
+    for (final p in previews) {
+      if ((p.oldPrice - p.newPrice).abs() < 0.005) continue; // skip unchanged
+      final ok = await _listings.updateListingPrice(p.listing.id, p.newPrice);
+      if (ok) updated++;
+    }
+
+    if (!mounted) return;
+    RiftrToast.success(context, '$updated prices updated');
+  }
+
+  Future<void> addToCart(MarketListing listing) => _addToCart(listing);
   Future<void> _addToCart(MarketListing listing) async {
     HapticFeedback.lightImpact();
     final ok = await CartService.instance.addItem(CartItem.fromListing(listing));
@@ -2234,15 +2906,22 @@ class MarketScreenState extends State<MarketScreen> {
     }
   }
 
+  Future<void> openCheckoutSheet(MarketListing listing) =>
+      _openCheckoutSheet(listing);
   Future<void> _openCheckoutSheet(MarketListing listing) async {
+    // CheckoutSheet self-wraps in Scaffold + DragToDismiss + Stack now;
+    // pushed via the Card-Preview pattern (Fade 200ms, opaque:false) so
+    // the sheet feels identical to the Cards-Tab detail view.
     final result = await Navigator.push<dynamic>(
       context,
       PageRouteBuilder(
         opaque: false,
-        barrierColor: Colors.black54,
-        pageBuilder: (_, __, ___) => _CheckoutFullScreen(listing: listing),
-        transitionsBuilder: (_, anim, __, child) =>
-            SlideTransition(position: Tween(begin: const Offset(0, 1), end: Offset.zero).animate(anim), child: child),
+        transitionDuration: const Duration(milliseconds: 200),
+        reverseTransitionDuration: const Duration(milliseconds: 150),
+        pageBuilder: (ctx, anim, secondaryAnim) =>
+            CheckoutSheet(listing: listing),
+        transitionsBuilder: (ctx, anim, secondaryAnim, child) =>
+            FadeTransition(opacity: anim, child: child),
       ),
     );
 
@@ -2252,6 +2931,16 @@ class MarketScreenState extends State<MarketScreen> {
     if (result is String) {
       RiftrToast.success(context, result == 'demo-order' ? 'Order placed (Demo Mode)' : 'Order placed!');
     }
+  }
+
+  /// Public entry point for the sell flow — can be called from Cards/Collection
+  /// tab preview without switching to the Market tab. Looks up price data with
+  /// fallback (UNL cards without a Firestore price still work) and delegates
+  /// to [_openSellSheet].
+  Future<void> openSellSheetById(String cardId) async {
+    final card = _market.getPrice(cardId) ?? _market.getFallbackPrice(cardId);
+    if (card == null) return;
+    await _openSellSheet(card);
   }
 
   Future<void> _openSellSheet(CardPriceData card) async {
@@ -2319,6 +3008,7 @@ class MarketScreenState extends State<MarketScreen> {
           condition: result['condition'] as CardCondition,
           quantity: quantity,
           insuredOnly: result['insuredOnly'] as bool? ?? false,
+          isFoil: FirestoreCollectionService.isFoilVariant(card.setId, card.rarity),
           status: 'active',
           listedAt: DateTime.now(),
         ));
@@ -2330,6 +3020,8 @@ class MarketScreenState extends State<MarketScreen> {
     // Look up full card data for set/collector info
     final fullCard = CardService.getLookup()[card.cardId];
 
+    final isFoil = FirestoreCollectionService.isFoilVariant(card.setId, card.rarity);
+
     final listingId = await _listings.createListing(
       cardId: card.cardId,
       cardName: card.cardName,
@@ -2338,6 +3030,7 @@ class MarketScreenState extends State<MarketScreen> {
       price: result['price'] as double,
       quantity: quantity,
       insuredOnly: result['insuredOnly'] as bool? ?? false,
+      isFoil: isFoil,
       language: result['language'] as String? ?? 'EN',
       setId: card.setId,
       setCode: fullCard?.setId ?? card.setId,
@@ -2351,7 +3044,6 @@ class MarketScreenState extends State<MarketScreen> {
       final newLots = isNewCards ? quantity : (quantity - collectionQty).clamp(0, quantity);
       if (newLots > 0) {
         final collection = FirestoreCollectionService.instance;
-        final isFoil = FirestoreCollectionService.isFoilVariant(card.setId, card.rarity);
         final costPrice = card.currentPrice;
         for (int i = 0; i < newLots; i++) {
           collection.increment(card.cardId, costPrice: costPrice, foil: isFoil, source: 'listing');
@@ -2391,7 +3083,7 @@ class MarketScreenState extends State<MarketScreen> {
                 style: AppTextStyles.h3.copyWith(fontWeight: FontWeight.w900),
               ),
               const SizedBox(height: AppSpacing.xs),
-              const Text(
+              Text(
                 'Used to calculate shipping costs for buyers.',
                 style: AppTextStyles.small,
               ),
@@ -2406,7 +3098,7 @@ class MarketScreenState extends State<MarketScreen> {
                       padding: const EdgeInsets.symmetric(horizontal: AppSpacing.base, vertical: AppSpacing.md),
                       decoration: BoxDecoration(
                         color: AppColors.background,
-                        borderRadius: BorderRadius.circular(AppRadius.iconButton),
+                        borderRadius: BorderRadius.circular(AppRadius.listItem),
                         border: Border.all(color: AppColors.border),
                       ),
                       child: Column(
@@ -2433,76 +3125,13 @@ class MarketScreenState extends State<MarketScreen> {
     );
   }
 
-  Widget _comingSoonButton(String label, Color color) {
-    return Container(
-      height: 56,
-      alignment: Alignment.center,
-      decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.2),
-        borderRadius: AppRadius.pillBR,
-      ),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Icon(Icons.shopping_bag_outlined, color: color.withValues(alpha: 0.4), size: 20),
-          const SizedBox(width: AppSpacing.sm),
-          Text(
-            'Coming Soon',
-            style: AppTextStyles.bodyBold.copyWith(
-              color: color.withValues(alpha: 0.4),
-              fontWeight: FontWeight.w800,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
   // ═══════════════════════════════════════════
   // ─── HELPERS ───
   // ═══════════════════════════════════════════
 
-  /// Best available history for foil-only cards: foil preferred, NF fallback
-  /// (e.g. Nexus Night promos have NF-only history on Cardmarket)
-  List<PricePoint> _getFoilOnlyChartData(CardPriceData card) {
-    if (card.priceHistory.isNotEmpty) return card.priceHistory;
-    return card.nonFoilHistory;
-  }
-
-  /// Standard variant chart data: nf history for Common/Uncommon, foil for Rare+
-  List<PricePoint> _getStandardChartData(CardPriceData card) {
-    // OGS: always non-foil history
-    if (card.isNonFoilOnly) return _filterByRange(card.nonFoilHistory, _selectedRange);
-    // Foil-only cards: foil history, NF fallback if foil empty
-    if (card.isFoilOnly) return _filterByRange(_getFoilOnlyChartData(card), _selectedRange);
-    final r = (card.rarity ?? '').toLowerCase();
-    final isCommonUncommon = r == 'common' || r == 'uncommon';
-    // Common/Uncommon standard = non-foil → use nonFoilHistory
-    // Rare+ standard = foil → use priceHistory (foil)
-    final data = isCommonUncommon && card.nonFoilHistory.isNotEmpty
-        ? card.nonFoilHistory
-        : card.priceHistory;
-    return _filterByRange(data, _selectedRange);
-  }
-
-  /// Foil chart data (always uses foil/priceHistory)
-  List<PricePoint> _getFoilChartData(CardPriceData card) {
-    // priceHistory is the foil history; for Rare+ it's the standard
-    // For Common/Uncommon, foil = priceHistory (premium)
-    return _filterByRange(card.priceHistory, _selectedRange);
-  }
-
-  /// Premium variant chart data: foil for Common/Uncommon, nf for Rare+
-  List<PricePoint> _getPremiumChartData(CardPriceData card) {
-    final r = (card.rarity ?? '').toLowerCase();
-    final isCommonUncommon = r == 'common' || r == 'uncommon';
-    // Common/Uncommon premium = foil → use priceHistory (foil)
-    // Rare+ premium = non-foil → use nonFoilHistory
-    final data = isCommonUncommon
-        ? card.priceHistory
-        : card.nonFoilHistory;
-    return _filterByRange(data, _selectedRange);
-  }
+  // Foil-variant chart helpers (`_getFoilOnlyChartData`,
+  // `_getFoilChartData`, `_getStandardChartData`, `_getPremiumChartData`)
+  // moved into MarketCardDetailView — only the card detail used them.
 
   List<PricePoint> _filterByRange(List<PricePoint> data, String range) {
     if (data.isEmpty) return data;
@@ -2542,9 +3171,15 @@ class _HoldingEntry {
     return cbChangeAbs / costBasis!.totalCost * 100;
   }
 
-  /// Day trend (c24)
-  double get dayChangeAbs => data.dayChangeAbs * quantity;
-  double get dayChangePct => data.dayChange;
+  /// Day trend (c24) — variant-specific. Previously used `data.dayChange`
+  /// (the generic `c24`) and `data.dayChangeAbs` (derived from
+  /// currentPrice/previousClose, which mirror the standard variant). For
+  /// a foil holding of a Both-Variants Common/Uncommon card, that meant
+  /// the price tile showed correct foil €-amount but a NON-foil %-delta
+  /// underneath. Now uses variant-aware getDayChangeAbs / getDayChange so
+  /// price and percentage agree with each other and with the chart.
+  double get dayChangeAbs => data.getDayChangeAbs(isFoil) * quantity;
+  double get dayChangePct => data.getDayChange(isFoil);
 }
 
 /// Pulsing Cart FAB — same style as Shop FAB in Deck Viewer but with cart icon.
@@ -2564,11 +3199,12 @@ class _CartFab extends StatelessWidget {
           scale: scale,
           child: Container(
             width: 56, height: 56,
-            decoration: const BoxDecoration(
+            decoration: BoxDecoration(
               shape: BoxShape.circle,
-              color: AppColors.amber400,
+              color: AppColors.amber500,
             ),
-            child: const Icon(Icons.shopping_cart, color: AppColors.textPrimary, size: 24),
+            // FAB icon stays pure white for max contrast on amber bg in both themes.
+            child: Icon(Icons.shopping_cart, color: Colors.white, size: 24),
           ),
         );
       },
@@ -2576,49 +3212,9 @@ class _CartFab extends StatelessWidget {
   }
 }
 
-/// Full-screen checkout overlay with DragToDismiss.
-class _CheckoutFullScreen extends StatelessWidget {
-  final MarketListing listing;
-  final List<CartCheckoutItem>? cartItems;
-
-  const _CheckoutFullScreen({required this.listing, this.cartItems});
-
-  @override
-  Widget build(BuildContext context) {
-    final kb = MediaQuery.of(context).viewInsets.bottom;
-    return Material(
-      color: AppColors.background,
-      child: DragToDismiss(
-        onDismissed: () => Navigator.pop(context),
-        backgroundColor: AppColors.background,
-        child: SafeArea(
-          child: Padding(
-            padding: EdgeInsets.only(bottom: kb),
-            child: Column(children: [
-            Container(
-              height: 36,
-              color: AppColors.background,
-              child: Center(child: Container(
-                margin: const EdgeInsets.only(top: 10),
-                width: 40, height: 5,
-                decoration: BoxDecoration(
-                  color: AppColors.textSecondary,
-                  borderRadius: BorderRadius.circular(3),
-                ),
-              )),
-            ),
-            Expanded(
-              child: CheckoutSheet(
-                listing: listing,
-                cartItems: cartItems,
-              ),
-            ),
-          ]),
-          ),
-        ),
-      ),
-    );
-  }
-}
+// `_CheckoutFullScreen` was a manual wrapper providing DragToDismiss + drag
+// handle around the old `CheckoutSheet` Column. CheckoutSheet now self-wraps
+// in Scaffold + SafeArea + Stack + DragToDismiss + Positioned button (Card-
+// Preview pattern), so this wrapper is no longer needed and was removed.
 
 

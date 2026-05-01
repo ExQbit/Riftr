@@ -154,6 +154,18 @@ Test-Suite: `functions/test-scenarios/phase8_e2e_tests.js` — 46/46 Checks grue
 
 ---
 
+## 🔑 Dev-Konstanten (fuer Test-Skripte / Cross-Session)
+
+- **Founder Firebase-UID:** `DfAEtNC3rYcCIEuvODWwolNVHUA3`
+  (`eladiorubiohernandez@gmail.com`, displayName `ExQbit`).
+  Verwendung in z. B. `node test-scenarios/seed_test_disputes.js DfAEtNC3rYcCIEuvODWwolNVHUA3`.
+- **Firebase-Project:** `riftr-10527`
+- **Firestore-AppId:** `riftr-v1` (Prefix: `artifacts/riftr-v1/orders` etc.)
+- **Functions-Region:** `europe-west1`
+- **Application-Default-Credentials:** `~/.config/firebase/eladiorubiohernandez_gmail_com_application_default_credentials.json`
+
+---
+
 ## 🚀 PRE-LAUNCH LEGAL TRACK (Stand: 30.04.2026)
 
 ### 📊 KOMPAKT-OVERVIEW (TLDR fuer Cross-Session-Wiedereinstieg)
@@ -272,7 +284,7 @@ Test-Suite: `functions/test-scenarios/phase8_e2e_tests.js` — 46/46 Checks grue
 - [ ] § Refund-Policy — Neuversion mit Konsens + objektive Trigger
 - [ ] § Verkaeufer-Verantwortung — Wording aus Cardmarket-AGB als Inspiration: „As the seller, you have to pay all costs related to any mistake you make regarding the order"
 - [ ] DSA-Beschwerdeklauseln (Art. 16 Notice-and-Action, Art. 17 Begruendungspflicht, Art. 20 Beschwerdeweg)
-- [ ] Widerrufsbelehrung als Anhang (nur fuer Kaeufe von gewerblichen Verkaeufern, §§ 312g, 355 BGB) — Cardmarket-Widerruf als Vorlage in `Cardmarket_Reference/cm_Widerruf_Magic.md`
+- [⚠️] Widerrufsbelehrung als Anhang (nur fuer Kaeufe von gewerblichen Verkaeufern, §§ 312g, 355 BGB) — Cardmarket-Widerruf als Vorlage in `Cardmarket_Reference/cm_Widerruf_Magic.md`. **In-App-Implementation 01.05.2026 erledigt:** `lib/screens/legal_screen.dart` (`WiderrufsbelehrungScreen`) inline gespiegelt aus `Riftr_AGB_Anhang_1_Widerrufsbelehrung.md`, verlinkt aus Profil → Rechtliches und aus Order-Detail (Buyer-View bei `order.sellerIsCommercial`). Anwaltliche Gegenzeichnung steht noch aus (Annerton-Erstberatung).
 - [ ] Wash-Trading- / Sock-Puppet-Verbot
 - [ ] DAC7-Hinweis im Verkaeufer-Onboarding
 - [ ] Multi-Seller-Cart-Klausel (Rangverhaeltnis bei mehreren Verkaeufern)
@@ -358,10 +370,11 @@ Test-Suite: `functions/test-scenarios/phase8_e2e_tests.js` — 46/46 Checks grue
 - [ ] Bei "gewerblich": Pflichtfelder Steuer-IdNr (11-stellig DE Format-Check), USt-IdNr (Format-Check + optional VIES-API gegen EU-Datenbank), Adress-Plausibilitaet, Pflicht-Hinweis-Checkbox zu Gewerbe-/USt-/Buchfuehrungspflichten
 
 **Ticket 2 — Verkaeufer-Status-UI**
-- [ ] Privat/Gewerblich-Badge auf:
-      - Listing-Tile (in Listen-Views)
-      - Listing-Detail (Card Detail View Market Tab)
-      - Seller-Profile-Page
+- [⚠️] Privat/Gewerblich-Badge auf:
+      - [x] Listing-Tile (in Listen-Views) — `lib/widgets/market/seller_status_badge.dart` + Integration in `listing_tile.dart` (compact-mode) — 01.05.2026
+      - [x] Order-Detail (Buyer-View) — Dispute-Detail-Screen + Order-Detail-Screen `_orderSummaryCard` — 01.05.2026
+      - [ ] Listing-Detail (Card Detail View Market Tab) — noch offen
+      - [ ] Seller-Profile-Page — noch offen
 - [ ] Bei gewerblichen Verkaeufern: § 5 DDG / Art. 30 DSA-Pflichtinfos anzeigen (Firmierung, Adresse, USt-IdNr, etc.)
 
 **Ticket 3 — Privat-Limit-Backend**

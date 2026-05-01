@@ -6,7 +6,10 @@ import '../services/order_service.dart';
 import '../services/auth_service.dart';
 import '../theme/app_theme.dart';
 import '../theme/app_components.dart';
+import '../widgets/drag_to_dismiss.dart';
 import '../widgets/market/order_tile.dart';
+import '../widgets/market/seller_status_badge.dart';
+import '../widgets/riftr_drag_handle.dart';
 import '../widgets/riftr_toast.dart';
 
 class DisputeDetailScreen extends StatefulWidget {
@@ -77,67 +80,91 @@ class _DisputeDetailScreenState extends State<DisputeDetailScreen> {
 
     return Scaffold(
       backgroundColor: AppColors.background,
-      appBar: AppBar(
-        backgroundColor: AppColors.surface,
-        title: Text(
-          'Dispute Details',
-          style: AppTextStyles.h3.copyWith(fontWeight: FontWeight.w800),
-        ),
-        leading: IconButton(
-          icon: Icon(Icons.arrow_back, color: AppColors.textPrimary),
-          onPressed: () => Navigator.pop(context),
+      body: SafeArea(
+        top: true,
+        bottom: false,
+        child: DragToDismiss(
+          onDismissed: () => Navigator.of(context).pop(),
+          backgroundColor: AppColors.background,
+          child: Column(
+            children: [
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: AppSpacing.md),
+                child: RiftrDragHandle(
+                    style: RiftrDragHandleStyle.fullscreen),
+              ),
+              Padding(
+                padding: const EdgeInsets.symmetric(
+                    horizontal: AppSpacing.base),
+                child: Row(
+                  children: [
+                    Text(
+                      'Dispute Details',
+                      style: AppTextStyles.h3
+                          .copyWith(fontWeight: FontWeight.w800),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: AppSpacing.md),
+              Expanded(
+                child: _loading
+                    ? Center(
+                        child: CircularProgressIndicator(
+                            color: AppColors.amber500),
+                      )
+                    : ListView(
+                        padding: const EdgeInsets.all(AppSpacing.base),
+                        children: [
+                          // Status banner
+                          _statusBanner(),
+                          const SizedBox(height: AppSpacing.md),
+
+                          // Order summary
+                          _orderSummaryCard(),
+                          const SizedBox(height: AppSpacing.md),
+
+                          // Dispute info
+                          _disputeInfoCard(),
+                          const SizedBox(height: AppSpacing.md),
+
+                          // Proposal card (if proposed)
+                          if (isProposed) ...[
+                            _proposalCard(),
+                            const SizedBox(height: AppSpacing.md),
+                          ],
+
+                          // Timeline
+                          _timelineCard(),
+                          const SizedBox(height: AppSpacing.md),
+
+                          // Buyer-Eskalations-Card (Discogs-Modell,
+                          // 2026-04-30): Erscheint NUR fuer den Kaeufer und
+                          // nur wenn der Dispute mehr als 14 Tage offen
+                          // ist. Verweist auf die externen Wege
+                          // (Stripe-Chargeback, Schlichtung, Zivilrechtsweg)
+                          // — Riftr ist kein Schiedsgericht (siehe BACKLOG
+                          // Pre-Launch Legal Track / Riftr_ZAG_Gutachten.md).
+                          if (_shouldShowEscalation()) ...[
+                            _buyerEscalationCard(),
+                            const SizedBox(height: AppSpacing.md),
+                          ],
+
+                          // Actions
+                          if (isOpen && !isProposed) _openActions(),
+                          if (isOpen && isProposed) _proposedActions(),
+
+                          // Contact support (always)
+                          const SizedBox(height: AppSpacing.sm),
+                          _contactSupportButton(),
+                          const SizedBox(height: AppSpacing.lg),
+                        ],
+                      ),
+              ),
+            ],
+          ),
         ),
       ),
-      body: _loading
-          ? Center(
-              child: CircularProgressIndicator(color: AppColors.amber500),
-            )
-          : ListView(
-              padding: const EdgeInsets.all(AppSpacing.base),
-              children: [
-                // Status banner
-                _statusBanner(),
-                const SizedBox(height: AppSpacing.md),
-
-                // Order summary
-                _orderSummaryCard(),
-                const SizedBox(height: AppSpacing.md),
-
-                // Dispute info
-                _disputeInfoCard(),
-                const SizedBox(height: AppSpacing.md),
-
-                // Proposal card (if proposed)
-                if (isProposed) ...[
-                  _proposalCard(),
-                  const SizedBox(height: AppSpacing.md),
-                ],
-
-                // Timeline
-                _timelineCard(),
-                const SizedBox(height: AppSpacing.md),
-
-                // Buyer-Eskalations-Card (Discogs-Modell, 2026-04-30):
-                // Erscheint NUR fuer den Kaeufer und nur wenn der Dispute
-                // mehr als 14 Tage offen ist. Verweist auf die externen
-                // Wege (Stripe-Chargeback, Schlichtung, Zivilrechtsweg) —
-                // Riftr ist kein Schiedsgericht (siehe BACKLOG Pre-Launch
-                // Legal Track / Riftr_ZAG_Gutachten.md).
-                if (_shouldShowEscalation()) ...[
-                  _buyerEscalationCard(),
-                  const SizedBox(height: AppSpacing.md),
-                ],
-
-                // Actions
-                if (isOpen && !isProposed) _openActions(),
-                if (isOpen && isProposed) _proposedActions(),
-
-                // Contact support (always)
-                const SizedBox(height: AppSpacing.sm),
-                _contactSupportButton(),
-                const SizedBox(height: AppSpacing.lg),
-              ],
-            ),
     );
   }
 
@@ -239,11 +266,28 @@ class _DisputeDetailScreenState extends State<DisputeDetailScreen> {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text(
-                _isBuyer
-                    ? 'from ${order.sellerName ?? "Seller"}'
-                    : 'to ${order.buyerName ?? "Buyer"}',
-                style: AppTextStyles.tiny.copyWith(color: AppColors.textMuted),
+              Expanded(
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Flexible(
+                      child: Text(
+                        _isBuyer
+                            ? 'from ${order.sellerName ?? "Seller"}'
+                            : 'to ${order.buyerName ?? "Buyer"}',
+                        style: AppTextStyles.tiny.copyWith(color: AppColors.textMuted),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    if (_isBuyer) ...[
+                      const SizedBox(width: AppSpacing.xs),
+                      SellerStatusBadge(
+                        isCommercial: order.sellerIsCommercial,
+                        compact: true,
+                      ),
+                    ],
+                  ],
+                ),
               ),
               Text(
                 'Order ${order.id.substring(0, 8).toUpperCase()}',

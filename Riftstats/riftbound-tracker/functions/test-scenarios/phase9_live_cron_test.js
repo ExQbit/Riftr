@@ -80,6 +80,7 @@ async function main() {
   }
 
   // ── Test 2: autoResolveSellerSilence ──
+  // (mit disputeReopenedAt-Tiebreaker — KI-Anwalt-Wording-Pass Item 1, 01.05.2026)
   console.log(`\n${COLORS.cyan}━━━ Test 2: _runSellerSilenceResolver (live) ━━━${COLORS.reset}`);
   try {
     const result = await index._runSellerSilenceResolver();
@@ -90,6 +91,31 @@ async function main() {
       console.log(`  ${COLORS.dim}Erwarteter Output bei sauberer DB. Fuer echten Test: Test-Dispute seeden mit disputedAt 8d in past.${COLORS.reset}`);
     } else {
       console.log(`  ${COLORS.ok}Processed ${result.candidates} candidates: refunded=${result.refunded} skipped=${result.skipped} errors=${result.errors}${COLORS.reset}`);
+      console.log(`  ${COLORS.dim}Tiebreaker-Check: Test-5-Order (reopenedDaysAgo=2) MUSS skipped sein.${COLORS.reset}`);
+    }
+  } catch (e) {
+    console.log(`  ${COLORS.fail}✗${COLORS.reset} Cron threw: ${e.message}`);
+    console.error(e.stack);
+    process.exit(1);
+  }
+
+  // ── Test 3: autoResolveBuyerSilence (Item 1, 01.05.2026) ──
+  console.log(`\n${COLORS.cyan}━━━ Test 3: _runBuyerSilenceResolver (live) ━━━${COLORS.reset}`);
+  if (typeof index._runBuyerSilenceResolver !== "function") {
+    console.log(`  ${COLORS.fail}✗${COLORS.reset} _runBuyerSilenceResolver ist nicht exportiert.`);
+    console.log(`  ${COLORS.dim}Functions evtl. nicht deployed. Erst 'firebase deploy --only functions' laufen lassen.${COLORS.reset}`);
+    process.exit(1);
+  }
+  try {
+    const result = await index._runBuyerSilenceResolver();
+    console.log(`  ${COLORS.ok}✓${COLORS.reset} Cron executed without error`);
+    console.log(`  ${COLORS.dim}Result: ${JSON.stringify(result)}${COLORS.reset}`);
+    if (result.candidates === 0) {
+      console.log(`  ${COLORS.warn}⚠${COLORS.reset}  No candidates found — keine sellerProposed orders mit proposedAt >7d`);
+      console.log(`  ${COLORS.dim}Fuer echten Test: seed_test_disputes.js erstellt Test 4 (proposedAt 8d).${COLORS.reset}`);
+    } else {
+      console.log(`  ${COLORS.ok}Processed ${result.candidates} candidates: reopened=${result.reopened} skipped=${result.skipped}${COLORS.reset}`);
+      console.log(`  ${COLORS.dim}Erwartung mit Test-Daten: reopened=1 (Test 4 sellerProposed→open), 0 skipped.${COLORS.reset}`);
     }
   } catch (e) {
     console.log(`  ${COLORS.fail}✗${COLORS.reset} Cron threw: ${e.message}`);
@@ -98,9 +124,9 @@ async function main() {
   }
 
   console.log(`\n${COLORS.ok}━━━ Live-Cron-Tests completed successfully ━━━${COLORS.reset}`);
-  console.log(`${COLORS.dim}Beide Cron-Helper haben fehlerfrei durchgelaufen. Wenn deine DB`);
-  console.log(`saubere Test-Daten haette (paid >14d / disputed >7d), waeren sie`);
-  console.log(`automatisch resolved worden. Naechster Cron-Run: 04:30 + 05:00 Berlin.${COLORS.reset}`);
+  console.log(`${COLORS.dim}Drei Cron-Helper haben fehlerfrei durchgelaufen. Wenn deine DB`);
+  console.log(`saubere Test-Daten haette, waeren sie automatisch resolved worden.`);
+  console.log(`Naechster Production-Cron-Run: 04:30 / 05:00 / 05:30 Berlin.${COLORS.reset}`);
 
   // Async-Cleanup: einige Firebase-Connections koennen den Process offen halten
   process.exit(0);

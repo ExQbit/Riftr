@@ -2773,6 +2773,15 @@ exports.createPaymentIntent = onCall(
       sellerName: listingData[0].sellerName || null,
       buyerName,
       preReleaseDate: listingData[0].preReleaseDate || null,
+      // Discogs-Modell-Snapshot (2026-05-01): Verkaeufer-Status zur Order-Zeit
+      // einfrieren. Treibt: Reklamations-Hinweis-Dialog (Widerruf-Pfad bei
+      // gewerblichen Verkaeufern, AGB-Anhang 1) und Buyer-Eskalations-Card.
+      sellerIsCommercial: sellerProfileData.isCommercialSeller === true,
+      // Item 5 (2026-05-01): Verkaeufer-Email-Snapshot fuer Bestellbestaetigung.
+      // Pflichtangabe fuer Verbraucher-Kaeufer bei gewerblichen Verkaeufern,
+      // damit Widerrufserklaerung an den Verkaeufer adressiert werden kann
+      // (§ 312i BGB + Art. 246a EGBGB, AGB-Anhang-1 Abschnitt B).
+      sellerEmail: sellerProfileData.email || null,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
@@ -3106,6 +3115,8 @@ exports.processMultiSellerCart = onCall(
     const sellerStripeIds = new Map(); // sellerId -> stripeAccountId
     const sellerNames = new Map();
     const sellerAddresses = new Map();
+    const sellerIsCommercialMap = new Map(); // sellerId -> bool (Discogs-Modell)
+    const sellerEmailMap = new Map(); // sellerId -> email (Item 5, AGB-Anhang-1)
 
     for (const sellerId of sellerIds) {
       const sellerProfRef = db.collection("artifacts").doc(APP_ID)
@@ -3158,6 +3169,11 @@ exports.processMultiSellerCart = onCall(
           country: listingsBySeller.get(sellerId)[0].listing.sellerCountry || "",
         }),
       });
+      sellerIsCommercialMap.set(
+        sellerId,
+        sellerProfData.isCommercialSeller === true,
+      );
+      sellerEmailMap.set(sellerId, sellerProfData.email || null);
     }
 
     // 3. Buyer info
@@ -3523,6 +3539,10 @@ exports.processMultiSellerCart = onCall(
         buyerName,
         preReleaseDate: listingsBySeller.get(group.sellerId)[0].listing.preReleaseDate || null,
         multiSellerGroupSize: sellerCount,
+        // Discogs-Modell-Snapshot (2026-05-01): Verkaeufer-Status zur Order-
+        // Zeit einfrieren — siehe createPaymentIntent Single-Seller-Pfad.
+        sellerIsCommercial: sellerIsCommercialMap.get(group.sellerId) === true,
+        sellerEmail: sellerEmailMap.get(group.sellerId) || null,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
 
@@ -4018,7 +4038,22 @@ exports.openDispute = onCall(
     }
 
     const uid = request.auth.uid;
-    const { orderId, reason, description } = request.data;
+    const {
+      orderId,
+      reason,
+      description,
+      // Discogs-Modell + AGB-Anhang 1 (Widerrufsbelehrung) Audit-Felder
+      // (2026-05-01). Frontend sendet diese mit, wenn der Hinweis-Dialog
+      // bei wrong_card / not_arrived + gewerblichem Verkaeufer angezeigt wurde.
+      // Default: hinweisShown=false (= kein Hinweis erforderlich gewesen).
+      // Bei Auswahl `widerruf` ruft das Frontend einen separaten Code-Pfad
+      // auf (Anhang 1 Modal); openDispute wird in diesem Fall NICHT
+      // aufgerufen. Wenn openDispute aufgerufen wird, ist die Auswahl also
+      // immer 'reklamation' (oder 'no_choice_required').
+      reasonCodeChoice,
+      widerrufHinweisShownAt,
+      widerrufHinweisChosenAt,
+    } = request.data;
 
     if (!orderId || !reason) {
       throw new HttpsError("invalid-argument", "orderId and reason are required");
@@ -4032,6 +4067,24 @@ exports.openDispute = onCall(
     ];
     if (!validReasons.includes(reason)) {
       throw new HttpsError("invalid-argument", "Invalid dispute reason");
+    }
+
+    // Validierung der Audit-Felder (optional, default sicher)
+    const VALID_CHOICES = ["reklamation", "widerruf", "no_choice_required"];
+    if (reasonCodeChoice != null && !VALID_CHOICES.includes(reasonCodeChoice)) {
+      throw new HttpsError(
+        "invalid-argument",
+        `reasonCodeChoice must be one of: ${VALID_CHOICES.join(", ")}`,
+      );
+    }
+    if (reasonCodeChoice === "widerruf") {
+      // Defensiv: Wenn der Käufer den Widerruf-Pfad gewählt hat, sollte
+      // openDispute gar nicht aufgerufen werden. Frontend-Bug.
+      throw new HttpsError(
+        "failed-precondition",
+        "Buyer chose Widerruf-path — openDispute should not be called. " +
+        "Use the dedicated Widerruf-flow instead (Anhang 1).",
+      );
     }
 
     const orderRef = db.collection("artifacts").doc(APP_ID)
@@ -4087,9 +4140,16 @@ exports.openDispute = onCall(
       ...(safeDesc ? { disputeDescription: safeDesc } : {}),
       disputedAt: admin.firestore.FieldValue.serverTimestamp(),
       autoReleaseAt: null, // Pause auto-release
+      // Discogs-Modell-Audit (2026-05-01): Widerrufsrechts-Hinweis-Dialog-
+      // Auswahl. Wird im Streitfall als Beweis dafuer benoetigt, dass der
+      // Kaeufer aktiv den Reklamations-Pfad gewaehlt hat (UWG/UCPD-Schutz
+      // gegen Dark-Pattern-Vorwurf, AGB-Anhang 1 Abschnitt C).
+      reasonCodeChoice: reasonCodeChoice || "no_choice_required",
+      ...(widerrufHinweisShownAt ? { widerrufHinweisShownAt } : {}),
+      ...(widerrufHinweisChosenAt ? { widerrufHinweisChosenAt } : {}),
     });
 
-    console.log(`Dispute opened on order ${orderId}: ${reason}${safeDesc ? ` — ${safeDesc}` : ""}`);
+    console.log(`Dispute opened on order ${orderId}: ${reason}${safeDesc ? ` — ${safeDesc}` : ""} (choice=${reasonCodeChoice || "no_choice_required"})`);
 
     // Notify seller about dispute
     const dispSummary = orderItemsSummary(order.items);
@@ -4923,6 +4983,26 @@ async function _runSellerSilenceResolver() {
               (Date.now() - disputedAtMs) < 7 * 24 * 60 * 60 * 1000) {
             return null;
           }
+          // disputeReopenedAt-Tiebreaker (Off-by-Cron-Bug-Vermeidung,
+          // 2026-05-01): Falls die Reklamation nach einem zurueckgewiesenen
+          // Verkaeufer-Vorschlag durch _runBuyerSilenceResolver wieder auf
+          // "open" gesetzt wurde, MUESSEN auch seit diesem Reopen-Zeitpunkt
+          // 7 Tage Verkaeufer-Schweigen vergangen sein. Sonst greift der
+          // Auto-Refund unfair sofort, weil disputedAt aus dem Original-
+          // Reklamations-Zeitpunkt schon abgelaufen ist.
+          const reopenedAtRaw = data.disputeReopenedAt;
+          if (reopenedAtRaw) {
+            let reopenedAtMs = 0;
+            if (typeof reopenedAtRaw.toMillis === "function") {
+              reopenedAtMs = reopenedAtRaw.toMillis();
+            } else {
+              reopenedAtMs = new Date(reopenedAtRaw).getTime();
+            }
+            if (reopenedAtMs &&
+                (Date.now() - reopenedAtMs) < 7 * 24 * 60 * 60 * 1000) {
+              return null;
+            }
+          }
           // Markiere als "in progress" damit kein anderer Pfad gleichzeitig
           // refunded; finaler State wird nach Stripe-Call gesetzt.
           tx.update(doc.ref, {
@@ -5125,6 +5205,157 @@ exports.devTriggerSellerSilence = onCall(
     }
     console.log(`devTriggerSellerSilence invoked by admin=${request.auth.uid}`);
     const result = await _runSellerSilenceResolver();
+    return { success: true, ...result };
+  },
+);
+
+/**
+ * _runBuyerSilenceResolver — Cron-Helper, Discogs-Modell-Komponente.
+ *
+ * **Zweck (2026-05-01, KI-Anwalt-Wording-Pass Rev. 2):**
+ * Wenn der Verkaeufer einen Refund-Vorschlag unterbreitet hat
+ * (`disputeStatus: "sellerProposed"`) und der Kaeufer 7 Tage lang weder
+ * annimmt noch ablehnt, gilt der Vorschlag als abgelehnt. Die Reklamation
+ * kehrt in den offenen Status zurueck.
+ *
+ * **Kein Geld bewegt sich** — rein State-Flip. Der nachgelagerte
+ * `_runSellerSilenceResolver` greift erst, wenn auch seit dem Reopen-
+ * Zeitpunkt 7 Tage Verkaeufer-Schweigen vergangen sind (siehe dortigen
+ * `disputeReopenedAt`-Tiebreaker). Damit ist das Off-by-Cron-Risiko
+ * adressiert: Verkaeufer hat nach einem zurueckgewiesenen Vorschlag
+ * ehrliche 7 weitere Tage zur Reaktion.
+ *
+ * AGB-Anker: § X Streitbeilegung Abs. (2) lit. b) und Abs. (2) lit. c) (iii),
+ * § X Refund-Policy Abs. (2) lit. f).
+ *
+ * Schedule: 05:30 Berlin (30 Min nach autoResolveSellerSilence, damit
+ * sich die beiden Crons nicht ueberlappen).
+ */
+async function _runBuyerSilenceResolver() {
+    // proposedAt ist Firestore Timestamp (set via FieldValue.serverTimestamp()
+    // in proposeRefund). Date-Object statt ISO-String fuer Query.
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    const ordersRef = db.collection("artifacts").doc(APP_ID).collection("orders");
+
+    const snap = await ordersRef
+      .where("status", "==", "disputed")
+      .where("disputeStatus", "==", "sellerProposed")
+      .where("proposedAt", "<=", sevenDaysAgo)
+      .get();
+
+    if (snap.empty) {
+      console.log("autoResolveBuyerSilence: no expired refund proposals");
+      return { reopened: 0, skipped: 0, candidates: 0 };
+    }
+
+    let reopened = 0;
+    let skipped = 0;
+
+    for (const doc of snap.docs) {
+      // Race-Protection: Buyer koennte gerade respondToRefund triggern
+      // (= akzeptiert oder abgelehnt). TX-State-Flip mit re-check.
+      let order;
+      try {
+        order = await db.runTransaction(async (tx) => {
+          const fresh = await tx.get(doc.ref);
+          if (!fresh.exists) return null;
+          const data = fresh.data();
+          if (data.status !== "disputed" ||
+              data.disputeStatus !== "sellerProposed") {
+            return null;
+          }
+          // Doppelt-Sicher: proposedAt-Alter nochmal pruefen (Doc-Snapshot
+          // koennte stale sein nach langer Cron-Iteration).
+          const proposedAtRaw = data.proposedAt;
+          let proposedAtMs = 0;
+          if (proposedAtRaw && typeof proposedAtRaw.toMillis === "function") {
+            proposedAtMs = proposedAtRaw.toMillis();
+          } else if (proposedAtRaw) {
+            proposedAtMs = new Date(proposedAtRaw).getTime();
+          }
+          if (!proposedAtMs ||
+              (Date.now() - proposedAtMs) < 7 * 24 * 60 * 60 * 1000) {
+            return null;
+          }
+          // State-Flip: zurueck auf "open", proposedRefund-Felder cleared,
+          // disputeReopenedAt = jetzt (= Tiebreaker fuer SellerSilence-Cron)
+          tx.update(doc.ref, {
+            disputeStatus: "open",
+            disputeReopenedAt: admin.firestore.FieldValue.serverTimestamp(),
+            proposedRefundPercent: null,
+            proposedRefundAmount: null,
+            proposedAt: null,
+          });
+          return data;
+        });
+      } catch (txErr) {
+        console.error(
+          `autoResolveBuyerSilence ${doc.id} TX-flip failed: ${txErr.message}`,
+        );
+        continue;
+      }
+      if (!order) {
+        skipped++;
+        continue;
+      }
+
+      // Notifications: ehrlich, factual
+      sendNotification(
+        order.buyerId,
+        "Refund-Vorschlag abgelaufen",
+        `Du hast nicht innerhalb von 7 Tagen auf den Refund-Vorschlag reagiert. Die Reklamation ist wieder offen — der Verkaeufer kann einen neuen Vorschlag unterbreiten.`,
+        { type: "order", orderId: doc.id },
+      );
+      if (order.sellerId) {
+        sendNotification(
+          order.sellerId,
+          "Kaeufer hat nicht reagiert",
+          `Der Kaeufer hat deinen Refund-Vorschlag innerhalb von 7 Tagen weder angenommen noch abgelehnt. Die Reklamation ist wieder offen — du kannst einen neuen Vorschlag unterbreiten.`,
+          { type: "order", orderId: doc.id },
+        );
+      }
+
+      reopened++;
+    }
+
+    console.log(
+      `autoResolveBuyerSilence: reopened=${reopened} skipped=${skipped} of ${snap.size} candidates`,
+    );
+    return { reopened, skipped, candidates: snap.size };
+}
+
+exports._runBuyerSilenceResolver = _runBuyerSilenceResolver;
+
+exports.autoResolveBuyerSilence = onSchedule(
+  {
+    schedule: "30 5 * * *",
+    timeZone: "Europe/Berlin",
+    timeoutSeconds: 300,
+    region: "europe-west1",
+  },
+  async () => {
+    await _runBuyerSilenceResolver();
+  },
+);
+
+/**
+ * devTriggerBuyerSilence — Test-only HTTP-Trigger fuer
+ * `_runBuyerSilenceResolver`. Siehe `devTriggerStaleShipments`-Doc.
+ */
+exports.devTriggerBuyerSilence = onCall(
+  {
+    region: "europe-west1",
+    timeoutSeconds: 300,
+  },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Login required");
+    }
+    if (request.auth.token?.admin !== true) {
+      throw new HttpsError("permission-denied", "Admin only (dev-trigger)");
+    }
+    console.log(`devTriggerBuyerSilence invoked by admin=${request.auth.uid}`);
+    const result = await _runBuyerSilenceResolver();
     return { success: true, ...result };
   },
 );
@@ -8054,18 +8285,23 @@ exports.populateListingSellerStats = onDocumentCreated(
       const seller = sellerDoc.data();
       const sellerRating = (typeof seller.rating === "number") ? seller.rating : 0;
       const sellerSales = (typeof seller.totalSales === "number") ? seller.totalSales : 0;
+      // Discogs-Modell-Pflicht (2026-05-01): isCommercialSeller-Flag aufs
+      // Listing schreiben, damit das Frontend ohne extra Lookup das Verkaeufer-
+      // Status-Badge anzeigen kann (Verbraucher-Aufklaerung vor Bestellung,
+      // Anhang 1 Widerrufsbelehrung Abschnitt A).
+      const sellerIsCommercial = seller.isCommercialSeller === true;
 
-      if (sellerRating === 0 && sellerSales === 0) {
-        // Nichts zu tun — User ist tatsaechlich ein neuer Seller.
-        return;
+      const updateData = {
+        sellerIsCommercial,
+      };
+      if (!(sellerRating === 0 && sellerSales === 0)) {
+        updateData.sellerRating = sellerRating;
+        updateData.sellerSales = sellerSales;
       }
 
-      await snap.ref.update({
-        sellerRating,
-        sellerSales,
-      });
+      await snap.ref.update(updateData);
       console.log(
-        `populateListingSellerStats: ${snap.id} populated rating=${sellerRating}, sales=${sellerSales}`,
+        `populateListingSellerStats: ${snap.id} populated rating=${sellerRating}, sales=${sellerSales}, isCommercial=${sellerIsCommercial}`,
       );
     } catch (err) {
       console.error(

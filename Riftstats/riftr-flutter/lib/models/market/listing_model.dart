@@ -27,6 +27,11 @@ class MarketListing {
   final String? sellerCountry;
   final double sellerRating;
   final int sellerSales;
+  /// Discogs-Modell (2026-05-01): Snapshot des Verkäufer-Status zur
+  /// Listing-Erstellung. Treibt Badge-Anzeige + Reklamations-Hinweis-Dialog
+  /// (Widerruf-Pfad bei `§ 14 BGB`-Verkäufern). Quelle: `populateListing
+  /// SellerStats` Cloud Function aus `sellerProfile.isCommercialSeller`.
+  final bool sellerIsCommercial;
   final double price;
   final CardCondition condition;
   final int quantity;
@@ -48,6 +53,7 @@ class MarketListing {
     this.sellerCountry,
     this.sellerRating = 0,
     this.sellerSales = 0,
+    this.sellerIsCommercial = false,
     required this.price,
     required this.condition,
     this.quantity = 1,
@@ -158,6 +164,7 @@ class MarketListing {
       sellerCountry: d['sellerCountry'] as String?,
       sellerRating: (d['sellerRating'] as num?)?.toDouble() ?? 0,
       sellerSales: d['sellerSales'] as int? ?? 0,
+      sellerIsCommercial: d['sellerIsCommercial'] as bool? ?? false,
       price: (d['price'] as num?)?.toDouble() ?? 0,
       condition: CardCondition.values.firstWhere(
         (c) => c.name == d['condition'],

@@ -14,6 +14,7 @@ import '../widgets/riftr_drag_handle.dart';
 import '../widgets/market/checkout_sheet.dart';
 import '../widgets/market/condition_badge.dart';
 import 'admin_disputes_screen.dart';
+import 'legal_screen.dart';
 import '../services/auth_service.dart';
 import '../services/demo_service.dart';
 import '../services/match_service.dart';
@@ -377,6 +378,27 @@ class SocialScreenState extends State<SocialScreen> {
                   icon: _isDemo ? Icons.exit_to_app : Icons.logout,
                 )),
               ]),
+
+              // Rechtliches: AGB / Widerrufsbelehrung / Datenschutz.
+              // Pflicht-Einstieg fuer Anlage 1 zu Art. 246a § 1 Abs. 2 EGBGB
+              // (Widerrufsbelehrung muss eindeutig auffindbar sein).
+              const SizedBox(height: AppSpacing.sm),
+              RiftrButton(
+                label: 'Legal',
+                icon: Icons.gavel_outlined,
+                style: RiftrButtonStyle.secondary,
+                onPressed: () {
+                  Navigator.of(context).push(
+                    PageRouteBuilder(
+                      opaque: false,
+                      pageBuilder: (_, __, ___) => const LegalScreen(),
+                      transitionsBuilder: (_, anim, __, child) =>
+                          FadeTransition(opacity: anim, child: child),
+                      transitionDuration: const Duration(milliseconds: 200),
+                    ),
+                  );
+                },
+              ),
 
               // Admin-only: Mediation-Tools-Button (Phase 6.5).
               // Sichtbar nur fuer User mit Firebase-Auth-Custom-Claim
