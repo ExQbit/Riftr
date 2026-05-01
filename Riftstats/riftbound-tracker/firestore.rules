@@ -386,11 +386,16 @@ service cloud.firestore {
             && request.resource.data.keys().hasOnly([
               'displayName', 'email', 'country', 'address',
               'isCommercialSeller', 'updatedAt', 'memberSince',
+              // Verkaeufer-Status-Onboarding (BACKLOG Ticket 1, 2026-05-01):
+              // gewerbliche Verkaeufer-Pflichtfelder + Audit-Timestamp.
+              'vatId', 'legalEntityName', 'commercialDeclaredAt',
             ]);
           allow update: if isOwner(uid)
             && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
               'displayName', 'email', 'country', 'address',
               'isCommercialSeller', 'updatedAt',
+              // Verkaeufer-Status-Onboarding + Self-Reclassification.
+              'vatId', 'legalEntityName', 'commercialDeclaredAt',
             ]);
           allow delete: if false;
         }

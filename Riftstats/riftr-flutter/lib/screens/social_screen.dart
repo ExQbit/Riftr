@@ -15,6 +15,7 @@ import '../widgets/market/checkout_sheet.dart';
 import '../widgets/market/condition_badge.dart';
 import 'admin_disputes_screen.dart';
 import 'legal_screen.dart';
+import '../widgets/market/seller_reclassification_sheet.dart';
 import '../services/auth_service.dart';
 import '../services/demo_service.dart';
 import '../services/match_service.dart';
@@ -378,6 +379,27 @@ class SocialScreenState extends State<SocialScreen> {
                   icon: _isDemo ? Icons.exit_to_app : Icons.logout,
                 )),
               ]),
+
+              // Switch to commercial: nur sichtbar wenn ein SellerProfile
+              // existiert und der User aktuell als privat eingestuft ist.
+              // Self-Reclassification (BACKLOG Ticket 4) — keine stille
+              // Re-Klassifizierung durch Riftr (§ 308 Nr. 4 BGB).
+              if (!_isDemo &&
+                  SellerService.instance.profile != null &&
+                  SellerService.instance.profile!.isCommercialSeller ==
+                      false) ...[
+                const SizedBox(height: AppSpacing.sm),
+                RiftrButton(
+                  label: 'Switch to commercial seller',
+                  icon: Icons.business_outlined,
+                  style: RiftrButtonStyle.secondary,
+                  onPressed: () async {
+                    final ok = await SellerReclassificationSheet.show(
+                        context);
+                    if (ok == true && mounted) setState(() {});
+                  },
+                ),
+              ],
 
               // Rechtliches: AGB / Widerrufsbelehrung / Datenschutz.
               // Pflicht-Einstieg fuer Anlage 1 zu Art. 246a § 1 Abs. 2 EGBGB

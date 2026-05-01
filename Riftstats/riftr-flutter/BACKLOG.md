@@ -364,10 +364,10 @@ Test-Suite: `functions/test-scenarios/phase8_e2e_tests.js` — 46/46 Checks grue
 
 ### 🟦 BACKEND/APP-TRACK (vor Launch zwingend erforderlich)
 
-**Ticket 1 — Pflicht-Username + Verkaeufer-Status-Onboarding** (haengt zusammen)
-- [ ] Pflicht-Username-Schritt nach Email-Registrierung (Bestandsaltlast: Listings zeigen "Unknown", Orders "Buyer")
-- [ ] Status-Wahl bei Erstanmeldung als Verkaeufer: **privat** (Verbraucher § 13 BGB) oder **gewerblich** (Unternehmer § 14 BGB)
-- [ ] Bei "gewerblich": Pflichtfelder Steuer-IdNr (11-stellig DE Format-Check), USt-IdNr (Format-Check + optional VIES-API gegen EU-Datenbank), Adress-Plausibilitaet, Pflicht-Hinweis-Checkbox zu Gewerbe-/USt-/Buchfuehrungspflichten
+**Ticket 1 — Verkaeufer-Status-Onboarding**
+- [x] ~~Pflicht-Username-Schritt nach Email-Registrierung~~ — **bereits durch AuthGate erzwungen** (`main.dart:248-262`: User ohne `displayName + country` kommt nicht in AppShell, wird in OnboardingScreen oder SetupScreen umgelenkt). Veraltete BACKLOG-Notiz, vor AuthGate-Implementation geschrieben.
+- [ ] Status-Wahl beim Verkaeufer-Onboarding: **privat** (Verbraucher § 13 BGB) oder **gewerblich** (Unternehmer § 14 BGB) — Step 0 in `seller_onboarding_sheet.dart` erweitern
+- [ ] Bei "gewerblich": Pflichtfelder Steuer-IdNr (11-stellig DE Format-Check), USt-IdNr (Format-Check + optional VIES-API gegen EU-Datenbank), Firmierung, Adress-Plausibilitaet, Pflicht-Hinweis-Checkbox zu Gewerbe-/USt-/Buchfuehrungspflichten
 
 **Ticket 2 — Verkaeufer-Status-UI**
 - [⚠️] Privat/Gewerblich-Badge auf:
@@ -403,6 +403,7 @@ Test-Suite: `functions/test-scenarios/phase8_e2e_tests.js` — 46/46 Checks grue
 **Ticket 5 — Infrastruktur**
 - [ ] `support@getriftr.app` Email einrichten (in § Streitbeilegung referenziert; Forwarding aufs normale Postfach reicht initial)
 - [ ] `complaints@getriftr.app` fuer DSA-Beschwerden (kann gleicher Inbox sein)
+- [ ] **Resend.com Domain-Verifikation** (BLOCKER fuer Beta mit echten Tester-Emails): aktuell ist Resend im Test-Mode und schickt nur an `eladiorubiohernandez@gmail.com`. Andere Recipients werden mit 403 abgewiesen (siehe `sendVerificationCode` CF). Fix: 1) Domain `getriftr.app` bei resend.com/domains verifizieren, 2) DNS-Records (SPF, DKIM, DMARC) setzen, 3) `from`-Address in `functions/index.js:1514` von `Riftr <onboarding@resend.dev>` auf `Riftr <noreply@getriftr.app>` umstellen, 4) re-deploy.
 
 ### 🟦 COMPLIANCE-TRACK (parallel laufend)
 - [ ] **UG (haftungsbeschraenkt)** Gruendung Q2 2026, Sitz NRW — Stammkapital €1.000-5.000, Notar + HR-Eintrag (€1.500-2.000)
