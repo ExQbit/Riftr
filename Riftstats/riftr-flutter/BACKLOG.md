@@ -403,7 +403,7 @@ Test-Suite: `functions/test-scenarios/phase8_e2e_tests.js` — 46/46 Checks grue
 **Ticket 5 — Infrastruktur**
 - [ ] `support@getriftr.app` Email einrichten (in § Streitbeilegung referenziert; Forwarding aufs normale Postfach reicht initial)
 - [ ] `complaints@getriftr.app` fuer DSA-Beschwerden (kann gleicher Inbox sein)
-- [ ] **Resend.com Domain-Verifikation** (BLOCKER fuer Beta mit echten Tester-Emails): aktuell ist Resend im Test-Mode und schickt nur an `eladiorubiohernandez@gmail.com`. Andere Recipients werden mit 403 abgewiesen (siehe `sendVerificationCode` CF). Fix: 1) Domain `getriftr.app` bei resend.com/domains verifizieren, 2) DNS-Records (SPF, DKIM, DMARC) setzen, 3) `from`-Address in `functions/index.js:1514` von `Riftr <onboarding@resend.dev>` auf `Riftr <noreply@getriftr.app>` umstellen, 4) re-deploy.
+- [x] ~~**Resend.com Domain-Verifikation**~~ — **erledigt 2026-05-01** (Commit d753a33). `getriftr.app` ist bei resend.com/domains EU eu-west-1 Verified, `from`-Address in `sendVerificationCode` von `onboarding@resend.dev` auf `noreply@getriftr.app` umgestellt + deployed.
 
 ### 🟦 COMPLIANCE-TRACK (parallel laufend)
 - [ ] **UG (haftungsbeschraenkt)** Gruendung Q2 2026, Sitz NRW — Stammkapital €1.000-5.000, Notar + HR-Eintrag (€1.500-2.000)
