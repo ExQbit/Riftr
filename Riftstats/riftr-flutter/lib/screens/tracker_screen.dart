@@ -1498,7 +1498,7 @@ class _TrackerScreenState extends State<TrackerScreen> with TickerProviderStateM
                               mainAxisAlignment: MainAxisAlignment.center,
                               children: [
                                 _TapScaleButton(
-                                  hitPadding: const EdgeInsets.all(12),
+                                  hitPadding: const EdgeInsets.all(20),
                                   onTap: () {
                                     if (_oppScore > 0) {
                                       HapticFeedback.lightImpact();
@@ -1524,7 +1524,7 @@ class _TrackerScreenState extends State<TrackerScreen> with TickerProviderStateM
                                   ),
                                 ),
                                 _TapScaleButton(
-                                  hitPadding: const EdgeInsets.all(12),
+                                  hitPadding: const EdgeInsets.all(20),
                                   onTap: () {
                                     HapticFeedback.lightImpact();
                                     setState(() => _oppScore++);
@@ -1590,7 +1590,7 @@ class _TrackerScreenState extends State<TrackerScreen> with TickerProviderStateM
                             mainAxisAlignment: MainAxisAlignment.center,
                             children: [
                               _TapScaleButton(
-                                hitPadding: const EdgeInsets.all(12),
+                                hitPadding: const EdgeInsets.all(20),
                                 onTap: () {
                                   if (_myScore > 0) {
                                     HapticFeedback.lightImpact();
@@ -1616,7 +1616,7 @@ class _TrackerScreenState extends State<TrackerScreen> with TickerProviderStateM
                                 ),
                               ),
                               _TapScaleButton(
-                                hitPadding: const EdgeInsets.all(12),
+                                hitPadding: const EdgeInsets.all(20),
                                 onTap: () {
                                   HapticFeedback.lightImpact();
                                   setState(() => _myScore++);
