@@ -135,11 +135,17 @@ class OcrService {
       OcrExtraction? result = await _runExtractionWithStrategy(
           image, camera, _lastWorkingAltStrategy);
 
-      // Trigger alt rotations whenever primary didn't identify a card.
-      // What matters is: did we find a known card name or a CN? If not, try
-      // alts — regardless of how much garbled text was returned.
-      final primaryFailed = result == null ||
-          (result.namesFound.isEmpty && result.collectorNumber == null);
+      // If primary returned null, ML Kit found 0 blocks at this rotation
+      // (or buildInput failed). Empty buffer → alt rotations also find 0
+      // blocks, just at different orientations. Skip them to save ~150ms
+      // per empty-frame SCANNING tick. (Result null differs from result-
+      // with-empty-namesFound: the latter has text, just no card-match,
+      // and alts may help by reading the text differently.)
+      if (result == null) return null;
+
+      // Trigger alt rotations when we have text but no card identified
+      // (rotated content reads as garbled text → namesFound stays empty).
+      final primaryFailed = result.namesFound.isEmpty && result.collectorNumber == null;
       if (primaryFailed) {
         for (final strat in _altStrategies) {
           if (strat == _lastWorkingAltStrategy) continue;
@@ -327,6 +333,14 @@ class OcrService {
       }
 
       if (!tryFlip) return null;
+
+      // If the default-rotation grayscale found 0 text blocks, the camera is
+      // pointed at an empty/static scene (table, wall, blurred motion). Alt
+      // rotations rotate the same buffer — they can't conjure text from
+      // nothing. Skip the 3 alt OCR calls (~150ms saved per such frame).
+      // Saves significant CPU during the "user is positioning the card"
+      // phase where the classifier-stuck-fallback fires repeatedly.
+      if (!grayscaleSawBlocks) return null;
 
       // Alt rotations — physical pixel rotation since ML Kit's rotation
       // metadata isn't reliable on iOS for BGRA8888 (beta-test 2026-05-02).

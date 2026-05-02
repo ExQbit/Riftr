@@ -1238,12 +1238,33 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     bool nameAgrees = false;
     bool nameStronglyDisagrees = false;
     if (computeResult?.debugFullPixels != null && _cardNameClassifier.isReady) {
-      final nameResult = _cardNameClassifier.classify(
-        computeResult!.debugFullPixels!,
-        computeResult.debugFullW,
-        computeResult.debugFullH,
-      );
+      // Multi-orientation CNN: the trained crop region (top half artwork)
+      // is portrait-card-specific. For battlefields/upside-down/landscape-
+      // held cards, the artwork is at a different position in our crop.
+      // Try all 4 rotations of the card crop, pick the highest-confidence
+      // result. Battlefields and rotated cards now cross-validate cleanly.
+      // Cost: 4× CNN inference per accepted scan (~50ms × 4 = ~200ms).
+      // Card-Name CNN runs once at acceptance, so the cost is one-time.
+      final pixels = computeResult!.debugFullPixels!;
+      final w = computeResult.debugFullW;
+      final h = computeResult.debugFullH;
+      ({String name, double confidence})? nameResult;
+      String? bestRotation;
+      for (final deg in [0, 90, 180, 270]) {
+        final Uint8List p = deg == 0 ? pixels : _rotateGrayscale(pixels, w, h, deg);
+        final pw = (deg == 90 || deg == 270) ? h : w;
+        final ph = (deg == 90 || deg == 270) ? w : h;
+        final r = _cardNameClassifier.classify(p, pw, ph);
+        if (r != null && (nameResult == null || r.confidence > nameResult.confidence)) {
+          nameResult = r;
+          bestRotation = '$deg°';
+        }
+      }
       if (nameResult != null) {
+        if (_debugMode) {
+          debugPrint('TFLite cardName: best rotation=$bestRotation '
+              '(other rotations had lower confidence)');
+        }
         final agrees = nameResult.name.toLowerCase() == match.card.name.toLowerCase();
         // Boost: CNN strongly confirms the OCR pick.
         if (agrees && nameResult.confidence >= 0.80) nameAgrees = true;
@@ -1285,15 +1306,14 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     // Finish + Gem-Layout, pHash-Score koennte zufaellig hoch sein → wuerde
     // sonst Metal als Match liefern obwohl User nicht-Metal gescannt hat.
     //
-    // Skip for battlefields: landscape cards in portrait holders produce
-    // a rotated-content-in-portrait-bbox crop; reference hashes are
-    // landscape-oriented; comparing them gives meaningless distances. The
-    // existing confidence-gate already rejects low-confidence pHash picks
-    // (= no actual harm), but the compute is wasted. Battlefield variant
-    // detection falls cleanly to OCR-based paths (CN-suffix, badge OCR).
-    final skipPhashForBattlefield = match.card.type?.toLowerCase() == 'battlefield';
+    // pHash now covers battlefields too — the camera-side hash is computed
+    // at all 4 rotations (90°/180°/270° physical rotation of the card crop)
+    // and findBestVariant takes min(distance) across them. So a battlefield
+    // held in portrait holder (= content rotated 90°) matches the landscape
+    // reference hash when the right rotation is tried. Was previously
+    // skipped to avoid noise from landscape vs portrait crop mismatch.
     bool phashChangedVariant = false;
-    if (resolutionVariants.length > 1 && computeResult != null && !skipPhashForBattlefield) {
+    if (resolutionVariants.length > 1 && computeResult != null) {
       // Constrain pHash to variants matching the confirmed set+CN.
       final confirmedSet = _cumSetCode;
       final confirmedCN = _cumCN?.toString();
@@ -3158,6 +3178,37 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     if (await canLaunchUrl(uri)) {
       await launchUrl(uri, mode: LaunchMode.externalApplication);
     }
+  }
+
+  /// Rotate a grayscale (1 byte/pixel) buffer by [degrees] CW (90/180/270).
+  /// Used by multi-orientation CNN inference and could be reused elsewhere.
+  /// Output dimensions: 90/270 swap w↔h, 180 keeps them.
+  static Uint8List _rotateGrayscale(Uint8List src, int w, int h, int degrees) {
+    if (degrees == 0) return src;
+    final isQuarter = degrees == 90 || degrees == 270;
+    final ow = isQuarter ? h : w;
+    final dst = Uint8List(w * h);
+    for (int y = 0; y < h; y++) {
+      for (int x = 0; x < w; x++) {
+        final v = src[y * w + x];
+        final int dstIdx;
+        switch (degrees) {
+          case 90:
+            dstIdx = x * ow + (h - 1 - y);
+            break;
+          case 180:
+            dstIdx = (h - 1 - y) * ow + (w - 1 - x);
+            break;
+          case 270:
+            dstIdx = (w - 1 - x) * ow + y;
+            break;
+          default:
+            continue;
+        }
+        dst[dstIdx] = v;
+      }
+    }
+    return dst;
   }
 }
 

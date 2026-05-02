@@ -199,6 +199,42 @@ class PhashService {
     return hash;
   }
 
+  /// Rotate a grayscale buffer by [degrees] CW (90/180/270), then hash.
+  /// Used for multi-orientation matching: reference hashes are computed
+  /// at the card's natural orientation; camera-side we hash at all 4
+  /// rotations and pick the min-distance match. Handles upside-down
+  /// portrait + battlefield-in-portrait-holder scenarios in one go.
+  static int _computeHashFromRotatedPixels(
+    Uint8List pixels, int w, int h, int degrees,
+  ) {
+    if (degrees == 0) return _computeHashFromPixels(pixels, w, h);
+    final isQuarter = degrees == 90 || degrees == 270;
+    final ow = isQuarter ? h : w;
+    final oh = isQuarter ? w : h;
+    final rotated = Uint8List(ow * oh);
+    for (int y = 0; y < h; y++) {
+      for (int x = 0; x < w; x++) {
+        final v = pixels[y * w + x];
+        final int dstIdx;
+        switch (degrees) {
+          case 90:
+            dstIdx = x * ow + (h - 1 - y);
+            break;
+          case 180:
+            dstIdx = (h - 1 - y) * ow + (w - 1 - x);
+            break;
+          case 270:
+            dstIdx = (w - 1 - x) * ow + y;
+            break;
+          default:
+            continue;
+        }
+        rotated[dstIdx] = v;
+      }
+    }
+    return _computeHashFromPixels(rotated, ow, oh);
+  }
+
   /// Compute dual hash (full + gem crop) from a camera Y-plane.
   ///
   /// [yPlane] is the luminance plane from YUV420 camera image.
@@ -232,8 +268,22 @@ class PhashService {
       cardPixels.setRange(dstOffset, dstOffset + cw, yPlane, srcOffset);
     }
 
-    // Full hash
+    // Full hash at default orientation (= card upright).
     final fullHash = _computeHashFromPixels(cardPixels, cw, ch);
+
+    // Multi-orientation full hashes (camera-side): rotate the card pixels by
+    // 90°/180°/270° CW and hash each. Reference hashes are single-orientation
+    // (computed once from each card's reference image); at match time we
+    // pick min(distance) across the 4 camera rotations. Handles upside-down
+    // portrait + battlefield-in-portrait-holder + landscape-held battlefield
+    // in one mechanism — no per-orientation reference table needed.
+    // Cost: 3 extra DCT-pHash computes ≈ 6ms total on iPhone 12.
+    final fullRotations = <int>[
+      fullHash, // 0°
+      _computeHashFromRotatedPixels(cardPixels, cw, ch, 90),
+      _computeHashFromRotatedPixels(cardPixels, cw, ch, 180),
+      _computeHashFromRotatedPixels(cardPixels, cw, ch, 270),
+    ];
 
     // Gem crop hash — multi-position: center + 8 directions (±10px)
     // compensates for VNDetectRectanglesRequest boundary variance
@@ -281,7 +331,12 @@ class PhashService {
     }
 
     return PhashComputeResult(
-      hash: DualHash(full: fullHash, gem: centerGemHash!, gemProbes: gemProbes),
+      hash: DualHash(
+        full: fullHash,
+        fullRotations: fullRotations,
+        gem: centerGemHash!,
+        gemProbes: gemProbes,
+      ),
       cardRect: [cx, cy, cw, ch],
       debugFullPixels: debug ? cardPixels : null,
       debugFullW: cw, debugFullH: ch,
@@ -319,6 +374,12 @@ class PhashService {
     // Compute distances for ALL variants
     final comparisons = <PhashComparison>[];
     final probes = cameraHash.gemProbes.isNotEmpty ? cameraHash.gemProbes : [cameraHash.gem];
+    // Multi-orientation full hashes — min(distance) across rotations handles
+    // upside-down + landscape-battlefield orientations. Falls back to single
+    // hash if fullRotations isn't populated (= old DualHash from cache).
+    final fullProbes = cameraHash.fullRotations.isNotEmpty
+        ? cameraHash.fullRotations
+        : [cameraHash.full];
     for (final id in variantIds) {
       final ref = _lookup[id];
       if (ref == null) continue;
@@ -328,9 +389,15 @@ class PhashService {
         final d = hammingDistance(probe, ref.gem);
         if (d < bestGemDist) bestGemDist = d;
       }
+      // Best full distance across all rotations of camera hash
+      int bestFullDist = 64;
+      for (final fp in fullProbes) {
+        final d = hammingDistance(fp, ref.full);
+        if (d < bestFullDist) bestFullDist = d;
+      }
       comparisons.add(PhashComparison(
         cardId: id,
-        fullDist: hammingDistance(cameraHash.full, ref.full),
+        fullDist: bestFullDist,
         gemDist: bestGemDist,
       ));
     }
@@ -453,9 +520,20 @@ class PhashResult {
 /// Dual hash: full image + gem crop.
 class DualHash {
   final int full;
+  /// Camera-side hashes at 4 rotations of the card crop (0°/90°/180°/270°).
+  /// Reference hashes are single-orientation; matching takes min(distance)
+  /// across these to handle upside-down + landscape battlefield orientations
+  /// without requiring per-orientation reference tables. First entry equals
+  /// [full] for backward compatibility.
+  final List<int> fullRotations;
   final int gem; // center gem hash
   final List<int> gemProbes; // multi-position gem hashes (center + 4 offsets)
-  const DualHash({required this.full, required this.gem, this.gemProbes = const []});
+  const DualHash({
+    required this.full,
+    required this.gem,
+    this.gemProbes = const [],
+    this.fullRotations = const [],
+  });
 }
 
 /// Result from computeDualHash with optional debug pixels.
