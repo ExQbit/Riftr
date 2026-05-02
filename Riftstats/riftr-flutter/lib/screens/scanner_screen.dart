@@ -2251,15 +2251,20 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
         )),  // Padding, DraggableScrollableSheet builder
       ),  // StatefulBuilder
     ).then((_) {
-      // Resume scanning when sheet closes. Bump _scanCycleId to invalidate
-      // any cumulative SCANNING state from before — the user may have edited
-      // the previous match, and stale frames must not leak through.
+      // Resume scanning when sheet closes. Go to STABLE (not WAITING) so the
+      // scanner waits for motion before re-scanning — the card the user just
+      // edited is still in front of the camera, and re-entering WAITING would
+      // immediately re-scan it as a duplicate (beta-tester report 2026-05-02).
+      // STABLE + _justScanned = true uses the higher motion threshold (22%)
+      // before re-triggering a scan, so the user has to physically move the
+      // card before the next OCR pass starts.
       if (mounted && _controller != null) {
         _prevLuminance = null; // reset so motion detection starts fresh
         _lastCardPresentProb = 0.0;
         _scanCycleId++;
+        _justScanned = true; // require post-scan motion threshold (22%)
         _controller!.startImageStream(_onFrame);
-        _setState(ScanState.waiting);
+        _setState(ScanState.stable);
         _scanPaused = false;
       }
     });
@@ -2535,13 +2540,26 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
           // Tap to rescan hint (only in STABLE state, and not while
           // _acceptMatch is still running its variant-resolution chain
           // — the spinner already conveys "working on it").
+          // Pill-background for legibility (beta-tester feedback: plain
+          // textSecondary text was too subtle on the live camera preview
+          // where contrast varies with the scene).
           if (_state == ScanState.stable && _scannedCards.isNotEmpty && !_identifying)
             Positioned(
               bottom: MediaQuery.of(context).padding.bottom + 180,
               left: 0, right: 0,
               child: Center(
-                child: Text('Tap to scan again',
-                  style: AppTextStyles.small.copyWith(color: AppColors.textSecondary)),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: AppSpacing.md, vertical: AppSpacing.xs),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.55),
+                    borderRadius: BorderRadius.circular(AppRadius.pill),
+                  ),
+                  child: Text(
+                    'Tap to scan again',
+                    style: AppTextStyles.small.copyWith(color: Colors.white),
+                  ),
+                ),
               ),
             ),
 
