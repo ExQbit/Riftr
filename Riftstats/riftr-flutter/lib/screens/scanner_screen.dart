@@ -1237,7 +1237,20 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     // the final _addCard at function end can consume it.
     bool nameAgrees = false;
     bool nameStronglyDisagrees = false;
-    if (computeResult?.debugFullPixels != null && _cardNameClassifier.isReady) {
+    // Skip CNN cross-validation when an alt rotation strategy was used:
+    // OCR ran on a physically-rotated buffer, so its bounding boxes are
+    // in rotated coordinates. The card rect calculated from those boxes
+    // doesn't translate to the original yPlane that pHash crops from →
+    // computeResult.debugFullPixels contains the wrong pixels for CNN.
+    // Beta-test 2026-05-02: Power Nexus battlefield got "Dunebreaker"
+    // with conf=0.999 (= would falsely demote confidence high→medium).
+    // The matched card itself is correct — OCR did its job. CNN can't
+    // help here without a coordinate-translation rework. Default rotation
+    // case (= upright portrait) keeps the CNN cross-validation as before.
+    final usedAlternateRotation = _ocr.lastWorkingStrategy != 'default';
+    if (computeResult?.debugFullPixels != null &&
+        _cardNameClassifier.isReady &&
+        !usedAlternateRotation) {
       // Multi-orientation CNN: the trained crop region (top half artwork)
       // is portrait-card-specific. For battlefields/upside-down/landscape-
       // held cards, the artwork is at a different position in our crop.
@@ -2236,14 +2249,30 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
                 child: RiftrDragHandle(style: RiftrDragHandleStyle.sheet),
               ),
               // ── Header: card image + name + set info ──
+              // Battlefield reference images are landscape (wider than tall).
+                // Rotating 90° gives a portrait-oriented thumbnail consistent
+                // with how every other card displays here, so the user
+                // doesn't see a tiny squished preview.
               Row(children: [
                 ClipRRect(
                   borderRadius: BorderRadius.circular(AppRadius.rounded),
-                  child: CardImage(
-                    imageUrl: entry.card.imageUrl,
-                    fallbackText: entry.card.name,
-                    width: 80, height: 112, fit: BoxFit.cover,
-                  ),
+                  child: entry.card.type?.toLowerCase() == 'battlefield'
+                      ? SizedBox(
+                          width: 80, height: 112,
+                          child: RotatedBox(
+                            quarterTurns: 1,
+                            child: CardImage(
+                              imageUrl: entry.card.imageUrl,
+                              fallbackText: entry.card.name,
+                              fit: BoxFit.cover,
+                            ),
+                          ),
+                        )
+                      : CardImage(
+                          imageUrl: entry.card.imageUrl,
+                          fallbackText: entry.card.name,
+                          width: 80, height: 112, fit: BoxFit.cover,
+                        ),
                 ),
                 const SizedBox(width: AppSpacing.md),
                 Expanded(child: Column(
@@ -2270,8 +2299,26 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
                     contentPadding: EdgeInsets.zero,
                     leading: ClipRRect(
                       borderRadius: BorderRadius.circular(AppRadius.minimal),
-                      child: CardImage(imageUrl: card.imageUrl, fallbackText: card.name,
-                        width: 36, height: 50, fit: BoxFit.cover),
+                      // Same rotation treatment as the editor header — battle-
+                      // field reference images are landscape, rotate to portrait
+                      // for consistent display with non-battlefield variants.
+                      child: card.type?.toLowerCase() == 'battlefield'
+                          ? SizedBox(
+                              width: 36, height: 50,
+                              child: RotatedBox(
+                                quarterTurns: 1,
+                                child: CardImage(
+                                  imageUrl: card.imageUrl,
+                                  fallbackText: card.name,
+                                  fit: BoxFit.cover,
+                                ),
+                              ),
+                            )
+                          : CardImage(
+                              imageUrl: card.imageUrl,
+                              fallbackText: card.name,
+                              width: 36, height: 50, fit: BoxFit.cover,
+                            ),
                     ),
                     title: Text(card.displayName, style: AppTextStyles.bodySmall.copyWith(
                       fontWeight: isSelected ? FontWeight.w800 : FontWeight.w500,
