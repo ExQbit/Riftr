@@ -850,6 +850,53 @@ async function sendNotification(uid, title, body, data = {}) {
   }
 }
 
+/**
+ * Send a transactional email via Resend. Fire-and-forget — logs errors
+ * but never throws (caller must not depend on email delivery).
+ *
+ * Sister to sendNotification — call both when a user-facing event needs
+ * to reach them outside the app (push goes silent for users who haven't
+ * installed yet, email is the durable channel).
+ *
+ * Skips silently if `to` is empty, RESEND_API_KEY is unset, or the
+ * Resend HTTP call fails.
+ *
+ * @param {string} to - recipient email
+ * @param {string} subject - email subject
+ * @param {string} html - rendered HTML body
+ */
+async function _sendTransactionalEmail(to, subject, html) {
+  if (!to || !to.includes("@")) return;
+  const apiKey = process.env.RESEND_API_KEY || "";
+  if (!apiKey) {
+    console.warn(`_sendTransactionalEmail: RESEND_API_KEY not set — skipping email to ${to}`);
+    return;
+  }
+  try {
+    const r = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        from: "Riftr <noreply@getriftr.app>",
+        to: [to],
+        subject,
+        html,
+      }),
+    });
+    if (!r.ok) {
+      const errBody = await r.text();
+      console.error(`_sendTransactionalEmail Resend ${r.status}: ${errBody.substring(0, 200)}`);
+    }
+  } catch (err) {
+    console.error(`_sendTransactionalEmail failed: ${err.message}`);
+  }
+}
+
+exports._sendTransactionalEmail = _sendTransactionalEmail;
+
 // ── Core update logic ──
 
 async function updatePrices() {
@@ -3770,7 +3817,11 @@ exports.updateTrackingNumber = onCall(
  * Buyer confirms receipt. Finalizes order.
  */
 exports.confirmDelivery = onCall(
-  { region: "europe-west1", timeoutSeconds: 30, secrets: ["STRIPE_SECRET_KEY"] },
+  {
+    region: "europe-west1",
+    timeoutSeconds: 30,
+    secrets: ["STRIPE_SECRET_KEY", "RESEND_API_KEY"],
+  },
   async (request) => {
     if (!request.auth) {
       throw new HttpsError("unauthenticated", "Must be signed in");
@@ -4622,7 +4673,7 @@ exports.autoReleaseOrders = onSchedule(
     timeZone: "Europe/Berlin",
     timeoutSeconds: 120,
     region: "europe-west1",
-    secrets: ["STRIPE_SECRET_KEY"],
+    secrets: ["STRIPE_SECRET_KEY", "RESEND_API_KEY"],
   },
   async () => {
     const now = new Date().toISOString();
@@ -6133,8 +6184,20 @@ async function _incrementDac7Counter(sellerId, orderTotalPaid, orderId) {
       `Du hast dieses Jahr ${count} Verkaeufe (€${gross.toFixed(2)}). ` +
       `Ab ${DAC7_HARD_TX} Verkaeufen oder €${DAC7_HARD_EUR} musst du dich ` +
       `als gewerblicher Verkaeufer registrieren (DAC7).`,
-      { type: "dac7_soft", count, grossRevenue: gross },
+      // FCM data values must be strings — coerce numbers explicitly.
+      {
+        type: "dac7_soft",
+        count: String(count),
+        grossRevenue: String(gross),
+      },
     );
+    if (seller.email) {
+      _sendTransactionalEmail(
+        seller.email,
+        "Approaching the commercial seller threshold",
+        _dac7SoftEmailHtml(count, gross),
+      );
+    }
     await _writeDac7Audit(sellerId, "softThresholdReached", {
       yearKey, count, grossRevenue: gross, orderId,
     });
@@ -6157,10 +6220,18 @@ async function _incrementDac7Counter(sellerId, orderTotalPaid, orderId) {
       `werden deine Listings pausiert (§ 4 PStTG).`,
       {
         type: "dac7_hard",
-        count, grossRevenue: gross,
+        count: String(count),
+        grossRevenue: String(gross),
         deadline: deadline.toISOString(),
       },
     );
+    if (seller.email) {
+      _sendTransactionalEmail(
+        seller.email,
+        `Action required: ${DAC7_HARD_DEADLINE_DAYS} days until your Riftr listings auto-suspend`,
+        _dac7HardEmailHtml(count, gross, deadline.toISOString(), DAC7_HARD_DEADLINE_DAYS),
+      );
+    }
     await _writeDac7Audit(sellerId, "hardThresholdReached", {
       yearKey, count, grossRevenue: gross, orderId,
       deadline: deadline.toISOString(),
@@ -6237,6 +6308,89 @@ async function _writeDac7Audit(sellerId, eventType, payload) {
 exports._incrementDac7Counter = _incrementDac7Counter;
 exports._writeDac7Audit = _writeDac7Audit;
 
+// ─── DAC7 email templates ────────────────────────────────────────────
+//
+// Branded HTML in the same style as sendVerificationCode. Sent IN ADDITION
+// to the in-app push notification — email is the durable channel for
+// users who don't open the app daily and might miss the push.
+
+function _dac7EmailShell(title, bodyHtml) {
+  return `
+    <div style="font-family: -apple-system, sans-serif; max-width: 480px; margin: 0 auto; padding: 24px; color: #333;">
+      <h2 style="color: #d4a020; margin: 0 0 16px;">${title}</h2>
+      ${bodyHtml}
+      <p style="color: #999; font-size: 12px; margin-top: 32px; border-top: 1px solid #eee; padding-top: 16px;">
+        Riftr — get back to selling at <a href="https://getriftr.app" style="color: #d4a020;">getriftr.app</a>
+      </p>
+    </div>
+  `;
+}
+
+function _dac7SoftEmailHtml(count, gross) {
+  return _dac7EmailShell(
+    "Approaching the commercial seller threshold",
+    `
+      <p>You've made <strong>${count} sales</strong> on Riftr this year — gross volume <strong>€${gross.toFixed(2)}</strong>.</p>
+      <p>At <strong>30 sales or €1.800</strong> we'll need you to register as a commercial seller (DAC7 / § 4 PStTG). Until then, no action is required — this is just a heads-up so you can plan.</p>
+      <p>You can switch to commercial anytime in <em>Profile → Switch to commercial seller</em>.</p>
+    `,
+  );
+}
+
+function _dac7HardEmailHtml(count, gross, deadlineIso, daysLeft) {
+  return _dac7EmailShell(
+    `Action required: ${daysLeft} days until listings auto-suspend`,
+    `
+      <p>You've reached the DAC7 threshold for private sellers on Riftr (<strong>${count} sales / €${gross.toFixed(2)}</strong> this year).</p>
+      <p>To keep selling, please register as a commercial seller within the next <strong>${daysLeft} days</strong> (deadline ${deadlineIso.slice(0, 10)}). Your listings will be paused automatically afterwards until you do.</p>
+      <p>Open the Riftr app, go to <em>Profile → Switch to commercial seller</em>, and fill in your VAT ID + legal entity name. Your existing listings, ratings, and reviews stay.</p>
+      <p style="font-size: 13px; color: #666;">Why this exists: § 14 BGB and § 4 PStTG require sellers reaching this volume to declare themselves as entrepreneurs. We notify you ahead of time so you can keep operating without interruption.</p>
+    `,
+  );
+}
+
+function _dac7SuspendedEmailHtml() {
+  return _dac7EmailShell(
+    "Your listings are paused",
+    `
+      <p>The 14-day deadline to register as a commercial seller has passed without re-declaration, so your Riftr listings are now paused.</p>
+      <p>This isn't a strike against your account — it's the platform's required compliance step. You can resume selling immediately by switching to commercial in the Riftr app: <em>Profile → Switch to commercial seller</em>.</p>
+      <p>Existing buyers can still complete orders that were already placed. Only new listings are blocked.</p>
+    `,
+  );
+}
+
+function _commercialReDeclEmailHtml(legalEntityName, vatId, wasVolumeSuspended) {
+  const liftNote = wasVolumeSuspended
+    ? `<p><strong>Your listings are unpaused</strong> — you can sell again immediately.</p>`
+    : "";
+  return _dac7EmailShell(
+    "You're now a commercial seller on Riftr",
+    `
+      <p>Confirmed — your Riftr seller profile is switched to <strong>commercial (§ 14 BGB)</strong>.</p>
+      ${liftNote}
+      <p>Your declared data:</p>
+      <ul style="line-height: 1.8;">
+        <li>Legal entity: <strong>${legalEntityName || "(not provided)"}</strong></li>
+        <li>VAT ID: <strong>${vatId || "(not provided)"}</strong></li>
+      </ul>
+      <p>What changed for buyers:</p>
+      <ul style="line-height: 1.8;">
+        <li>Buyers get the statutory 14-day right of withdrawal (§ 312g BGB) on every purchase</li>
+        <li>Your imprint info (legal entity, VAT ID, address, email) is now publicly visible on your seller profile and order details, as required by § 5 DDG / Art. 30 DSA</li>
+      </ul>
+      <p>What you take on:</p>
+      <ul style="line-height: 1.8;">
+        <li>Trade registration (Gewerbeanmeldung) at your local authority — if you haven't yet</li>
+        <li>VAT filings (USt-Voranmeldung)</li>
+        <li>Bookkeeping in accordance with HGB / EStG</li>
+        <li>Ensuring your Stripe account reflects this status (individual → company) for accurate payouts</li>
+      </ul>
+      <p style="font-size: 13px; color: #666;">This email is your written confirmation of the status change. Keep it for your tax records. If you didn't request this, contact <a href="mailto:support@getriftr.app" style="color: #d4a020;">support@getriftr.app</a> immediately.</p>
+    `,
+  );
+}
+
 /**
  * Daily cron — find sellers whose hardThresholdReachedAt + 14 days has
  * passed without re-declaration, and flip volumeSuspended=true. Idempotent
@@ -6308,6 +6462,14 @@ async function _runEnforceVolumeSuspension() {
         { type: "dac7_suspension_applied" },
       );
 
+      if (seller.email) {
+        _sendTransactionalEmail(
+          seller.email,
+          "Your Riftr listings are paused",
+          _dac7SuspendedEmailHtml(),
+        );
+      }
+
       await _writeDac7Audit(userRef.id, "volumeSuspensionApplied", {
         deadlineWas: new Date(deadlineMs).toISOString(),
         appliedAt: new Date().toISOString(),
@@ -6350,6 +6512,7 @@ exports.enforceVolumeSuspension = onSchedule(
     region: "europe-west1",
     timeoutSeconds: 540,
     memory: "512MiB",
+    secrets: ["RESEND_API_KEY"],
   },
   async () => {
     await _runEnforceVolumeSuspension();
@@ -6357,7 +6520,11 @@ exports.enforceVolumeSuspension = onSchedule(
 );
 
 exports.devTriggerEnforceVolumeSuspension = onCall(
-  { region: "europe-west1", timeoutSeconds: 540 },
+  {
+    region: "europe-west1",
+    timeoutSeconds: 540,
+    secrets: ["RESEND_API_KEY"],
+  },
   async (request) => {
     if (!request.auth) {
       throw new HttpsError("unauthenticated", "Must be signed in");
@@ -8768,6 +8935,7 @@ exports.syncSellerProfileToPlayerMirror = onDocumentWritten(
     document: "artifacts/{appId}/users/{uid}/data/sellerProfile",
     region: "europe-west1",
     timeoutSeconds: 30,
+    secrets: ["RESEND_API_KEY"],
   },
   async (event) => {
     const uid = event.params.uid;
@@ -8811,6 +8979,21 @@ exports.syncSellerProfileToPlayerMirror = onDocumentWritten(
           });
           console.log(
             `syncSellerProfileToPlayerMirror: cleared DAC7 flags for ${uid} (re-declared commercial)`,
+          );
+        }
+
+        // Email confirmation of the reclass (BACKLOG Ticket 4 last bullet).
+        // Sent regardless of whether DAC7 cleanup applied — every
+        // reclass deserves a written record for tax/compliance purposes.
+        if (after.email) {
+          _sendTransactionalEmail(
+            after.email,
+            "You're now a commercial seller on Riftr",
+            _commercialReDeclEmailHtml(
+              after.legalEntityName,
+              after.vatId,
+              wasVolumeSuspended,
+            ),
           );
         }
       }
