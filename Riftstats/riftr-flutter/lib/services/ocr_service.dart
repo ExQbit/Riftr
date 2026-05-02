@@ -44,21 +44,21 @@ class OcrService {
   List<double>? _bestManaBox;
   int? _bestManaCost;
 
-  /// Last rotation that successfully matched a card. Defaults to rotation90deg
-  /// (= upright portrait on iPhones, where sensorOrientation=90). When a
-  /// non-default rotation succeeds (upside-down 180° or landscape battlefield
-  /// 0°/270°), this gets remembered so SCANNING refinement frames use the
-  /// same orientation. Reset via [resetStickyMana] when MOTION starts.
-  InputImageRotation _lastWorkingRotation = InputImageRotation.rotation90deg;
+  /// Identifier for the rotation/conversion strategy that most recently
+  /// succeeded. `null` means default (metadata sensorOrientation, no physical
+  /// rotation). Other values: "metadata-0deg", "physical-90cw", "physical-180"
+  /// — used by extractFrame to skip straight to the strategy that worked in
+  /// WAITING (cheaper than re-discovering each SCANNING frame). Reset on MOTION.
+  String? _lastWorkingAltStrategy;
 
   /// Reset sticky state when scanning a new card (sticky mana, last extraction,
-  /// and the remembered working rotation — a battlefield-detected 180° must not
-  /// carry over into scanning a portrait card next).
+  /// and the remembered alt-rotation strategy — battlefield-detected rotation
+  /// must not carry over into scanning a portrait card next).
   void resetStickyMana() {
     _bestManaBox = null;
     _bestManaCost = null;
     lastExtraction = null;
-    _lastWorkingRotation = InputImageRotation.rotation90deg;
+    _lastWorkingAltStrategy = null;
   }
 
   /// Run OCR on a raw BGRA image crop. Returns recognized text blocks.
@@ -123,30 +123,32 @@ class OcrService {
     if (_isProcessing) return null;
     _isProcessing = true;
     try {
-      // Use the rotation that succeeded most recently (default=portrait after
-      // resetStickyMana). Auto-discovers via alt-rotation fallback if nothing
-      // is recognized — covers MOTION→SCANNING path where there's no preceding
-      // WAITING phase to set up rotation (e.g., scanning a battlefield right
-      // after a portrait card).
-      OcrExtraction? result = await _runExtraction(image, camera, _lastWorkingRotation);
+      // Use the strategy that succeeded most recently (null = default
+      // sensorOrientation rotation, no physical work). Auto-discover via
+      // alt-rotation fallback if primary returns nothing matchable —
+      // covers MOTION→SCANNING path with no preceding WAITING phase
+      // (e.g., scanning a battlefield right after a portrait card).
+      OcrExtraction? result = await _runExtractionWithStrategy(
+          image, camera, _lastWorkingAltStrategy);
 
-      // If primary rotation found nothing useful, try alt rotations once.
-      // Card-text-emptiness is the trigger — handles landscape battlefields
-      // that the previous card's rotation can't read.
-      if (result == null ||
-          (result.namesFound.isEmpty &&
-           result.collectorNumber == null &&
-           result.rawTextLower.length < 20)) {
-        final defaultRot = _defaultRotation(camera);
-        for (final altRot in _altRotations(defaultRot)) {
-          if (altRot == _lastWorkingRotation) continue;
-          final altResult = await _runExtraction(image, camera, altRot);
+      // Trigger alt rotations whenever the primary didn't identify a card.
+      // Length-of-rawText is NOT a useful trigger here: an upside-down
+      // portrait card may produce 50+ chars of garbled-but-non-empty text
+      // that fools the length check (beta-test 2026-05-02 evidence).
+      // What matters: did we find a known card name or a CN? If not, try alts.
+      final primaryFailed = result == null ||
+          (result.namesFound.isEmpty && result.collectorNumber == null);
+      if (primaryFailed) {
+        const altStrategies = ['metadata-0deg', 'physical-90cw', 'physical-180'];
+        for (final strat in altStrategies) {
+          if (strat == _lastWorkingAltStrategy) continue;
+          final altResult = await _runExtractionWithStrategy(image, camera, strat);
           if (altResult != null &&
               (altResult.namesFound.isNotEmpty ||
                altResult.collectorNumber != null)) {
-            _lastWorkingRotation = altRot;
+            _lastWorkingAltStrategy = strat;
             if (debugMode) {
-              debugPrint('OCR extract: switched to rotation ${altRot.name} '
+              debugPrint('OCR extract: switched strategy to "$strat" '
                   '(found ${altResult.namesFound.length} names, cn=${altResult.collectorNumber})');
             }
             result = altResult;
@@ -164,21 +166,46 @@ class OcrService {
     }
   }
 
-  /// Run a single grayscale+color extraction pass at the given rotation.
-  Future<OcrExtraction?> _runExtraction(
+  /// Build the InputImage for a given strategy:
+  ///   null            → default (metadata sensorOrientation, no physical work)
+  ///   "metadata-0deg" → metadata rotation0deg, no physical work
+  ///   "physical-90cw" → physical 90° CW Y-plane rotation + metadata 0deg
+  ///   "physical-180"  → physical 180° Y-plane rotation + metadata 0deg
+  InputImage? _buildInputForStrategy(
     CameraImage image,
     CameraDescription camera,
-    InputImageRotation rotation,
+    String? strategy, {
+    bool grayscaleOnly = true,
+  }) {
+    switch (strategy) {
+      case null:
+        return _convertCameraImage(image, camera, grayscaleOnly: grayscaleOnly);
+      case 'metadata-0deg':
+        return _convertCameraImage(image, camera,
+            grayscaleOnly: grayscaleOnly,
+            rotation: InputImageRotation.rotation0deg);
+      case 'physical-90cw':
+        return _convertPhysicallyRotated(image, 90);
+      case 'physical-180':
+        return _convertPhysicallyRotated(image, 180);
+    }
+    return null;
+  }
+
+  /// Run a single grayscale+color extraction pass with the given strategy.
+  Future<OcrExtraction?> _runExtractionWithStrategy(
+    CameraImage image,
+    CameraDescription camera,
+    String? strategy,
   ) async {
-    final grayInput = _convertCameraImage(image, camera,
-        grayscaleOnly: true, rotation: rotation);
+    final grayInput = _buildInputForStrategy(image, camera, strategy);
     if (grayInput == null) return null;
     final recognized = await _textRecognizer.processImage(grayInput);
 
     OcrExtraction? result;
     if (recognized.blocks.isNotEmpty) {
       final allText = recognized.blocks.map((b) => b.text).join(' | ');
-      if (debugMode) debugPrint('OCR raw [${rotation.name}]: $allText');
+      if (debugMode) debugPrint('OCR raw [${strategy ?? "default"}]: $allText');
       final allTextLower = allText.toLowerCase();
       final allLines = <String>[];
       final blocks = recognized.blocks.toList()
@@ -191,14 +218,17 @@ class OcrService {
       result = _extract(allLines, allTextLower, recognized);
     }
 
-    // Color fallback if grayscale found no names — same rotation throughout
-    if (result != null && result.namesFound.isEmpty) {
-      final colorInput = _convertCameraImage(image, camera, rotation: rotation);
+    // Color fallback if grayscale found no names — only for the default
+    // strategy (alt strategies are already low-confidence; doing color on
+    // top would multiply cost). Plus the physical-rotation strategies
+    // already produce a BGRA buffer, no native YUV available.
+    if (strategy == null && result != null && result.namesFound.isEmpty) {
+      final colorInput = _convertCameraImage(image, camera);
       if (colorInput != null) {
         final colorRecognized = await _textRecognizer.processImage(colorInput);
         if (colorRecognized.blocks.isNotEmpty) {
           final colorText = colorRecognized.blocks.map((b) => b.text).join(' | ');
-          if (debugMode) debugPrint('OCR color fallback [${rotation.name}]: $colorText');
+          if (debugMode) debugPrint('OCR color fallback [default]: $colorText');
           final colorLower = colorText.toLowerCase();
           final colorLines = <String>[];
           for (final block in colorRecognized.blocks) {
@@ -245,19 +275,18 @@ class OcrService {
     _isProcessing = true;
 
     try {
-      final defaultRot = _defaultRotation(camera);
       bool grayscaleSawBlocks = false;
 
-      // Primary: grayscale at default rotation — ML Kit reads stylized
-      // card names better without color
-      final grayInput = _convertCameraImage(image, camera,
-          grayscaleOnly: true, rotation: defaultRot);
+      // Primary: grayscale at default rotation (= sensor orientation,
+      // works for upright portrait card on portrait phone — empirically
+      // confirmed via beta tests). No metadata override here.
+      final grayInput = _convertCameraImage(image, camera, grayscaleOnly: true);
       if (grayInput != null) {
         final grayRecognized = await _textRecognizer.processImage(grayInput);
         grayscaleSawBlocks = grayRecognized.blocks.isNotEmpty;
         final grayMatch = await _analyze(grayRecognized, minScore: 35);
         if (grayMatch != null) {
-          _lastWorkingRotation = defaultRot;
+          _lastWorkingAltStrategy = null;
           return grayMatch;
         }
       }
@@ -268,12 +297,12 @@ class OcrService {
       // helps when grayscale recognized blocks but couldn't score a match
       // (e.g., colored text/glow that grayscale's lower contrast missed).
       if (grayscaleSawBlocks) {
-        final inputImage = _convertCameraImage(image, camera, rotation: defaultRot);
+        final inputImage = _convertCameraImage(image, camera);
         if (inputImage != null) {
           final recognized = await _textRecognizer.processImage(inputImage);
           final match = await _analyze(recognized, minScore: 35);
           if (match != null) {
-            _lastWorkingRotation = defaultRot;
+            _lastWorkingAltStrategy = null;
             return match;
           }
         }
@@ -281,19 +310,34 @@ class OcrService {
 
       if (!tryFlip) return null;
 
-      // Alt rotations: 180° upside-down + 0°/270° landscape battlefields.
-      // Grayscale only (these are already low-confidence fallbacks) and lower
-      // minScore=25 since rotated reads are less complete.
-      for (final altRot in _altRotations(defaultRot)) {
-        final altInput = _convertCameraImage(image, camera,
-            grayscaleOnly: true, rotation: altRot);
+      // Alt rotations — hybrid metadata + physical fallback because empirical
+      // evidence (beta-test 2026-05-02) shows ML Kit's rotation metadata for
+      // BGRA8888 may not be honored by the iOS plugin. Order trades cost vs.
+      // expected hit-rate:
+      //   1. metadata rotation0deg (cheap, works if plugin honors metadata)
+      //      — battlefield held with content's natural-top on device's left
+      //   2. physical 90° CW + rotation0deg (one Y-plane copy + rotate)
+      //      — upside-down portrait card
+      //   3. physical 180° + rotation0deg
+      //      — battlefield held with content's natural-top on device's right
+      // All use grayscale + minScore=25 (lenient since these are low-conf paths).
+      final altAttempts = <(InputImage? Function(), String)>[
+        (() => _convertCameraImage(image, camera,
+            grayscaleOnly: true, rotation: InputImageRotation.rotation0deg), 'metadata-0deg'),
+        (() => _convertPhysicallyRotated(image, 90), 'physical-90cw'),
+        (() => _convertPhysicallyRotated(image, 180), 'physical-180'),
+      ];
+
+      for (final (builder, label) in altAttempts) {
+        final altInput = builder();
         if (altInput == null) continue;
         final altRecognized = await _textRecognizer.processImage(altInput);
         final altMatch = await _analyze(altRecognized, minScore: 25);
         if (altMatch != null) {
-          _lastWorkingRotation = altRot;
+          // Save which strategy worked so SCANNING extractFrame can reuse.
+          _lastWorkingAltStrategy = label;
           if (debugMode) {
-            debugPrint('OCR: matched at rotation ${altRot.name} (score=${altMatch.score})');
+            debugPrint('OCR: matched via "$label" (score=${altMatch.score})');
           }
           return altMatch;
         }
@@ -857,23 +901,67 @@ class OcrService {
     );
   }
 
-  /// Default rotation = camera sensor orientation (iOS rear: 90°).
-  InputImageRotation _defaultRotation(CameraDescription camera) {
-    return InputImageRotationValue.fromRawValue(camera.sensorOrientation)
-        ?? InputImageRotation.rotation90deg;
-  }
+  /// Physically rotate the camera Y-plane by [degrees] CW (90 or 180), emit
+  /// BGRA grayscale with rotation0deg metadata.
+  ///
+  /// Why physical rotation: empirical evidence (beta-test logs showing the
+  /// exact same OCR output at all 4 rotation metadata values) suggests
+  /// google_mlkit_text_recognition on iOS may not honor the rotation
+  /// metadata reliably for BGRA8888 input. Physical pixel rotation
+  /// guarantees the buffer is upright when ML Kit processes it, regardless
+  /// of metadata interpretation.
+  ///
+  /// Math: sensor mounts the camera 90° CW from device-portrait → buffer
+  /// content is rotated by `(90 + cardOrientation) % 360` CW from upright.
+  /// We pre-rotate physically so `_runMetadataRotation0` lands at upright:
+  ///   - degrees=90 (CW): handles upside-down portrait card
+  ///                     (buffer at 270° → +90 = 360 = 0)
+  ///   - degrees=180:    handles battlefield held with name on the right
+  ///                     (buffer at 180° → +180 = 360 = 0)
+  /// The "battlefield with name on the left" case is covered by metadata-
+  /// rotation0deg without physical work (buffer already at 0).
+  InputImage? _convertPhysicallyRotated(CameraImage image, int degrees) {
+    if (image.planes.isEmpty) return null;
+    if (degrees != 90 && degrees != 180) return null;
 
-  /// Alternative rotations to try when the default fails. Priority order:
-  /// 180° (upside-down — most common alternative) → 0° → 270° (landscape
-  /// battlefields in either orientation). The default itself is excluded.
-  Iterable<InputImageRotation> _altRotations(InputImageRotation defaultRot) {
-    const priority = [
-      InputImageRotation.rotation180deg, // upside-down portrait
-      InputImageRotation.rotation0deg,   // landscape battlefield CW
-      InputImageRotation.rotation270deg, // landscape battlefield CCW
-      InputImageRotation.rotation90deg,
-    ];
-    return priority.where((r) => r != defaultRot);
+    final yBytes = image.planes.first.bytes;
+    final stride = image.planes.first.bytesPerRow;
+    final w = image.width, h = image.height;
+
+    // Output dimensions: 90° swaps w↔h, 180° keeps them.
+    final ow = degrees == 90 ? h : w;
+    final oh = degrees == 90 ? w : h;
+
+    // Rotate + convert to BGRA in one pass.
+    final bgra = Uint8List(ow * oh * 4);
+    for (int y = 0; y < h; y++) {
+      final srcRow = y * stride;
+      for (int x = 0; x < w; x++) {
+        final v = yBytes[srcRow + x];
+        // 90° CW: source (x, y) → destination (h-1-y, x) in new coords.
+        // 180°:    source (x, y) → destination (w-1-x, h-1-y).
+        final int dstIdx;
+        if (degrees == 90) {
+          dstIdx = (x * ow + (h - 1 - y)) * 4;
+        } else {
+          dstIdx = ((h - 1 - y) * ow + (w - 1 - x)) * 4;
+        }
+        bgra[dstIdx] = v;
+        bgra[dstIdx + 1] = v;
+        bgra[dstIdx + 2] = v;
+        bgra[dstIdx + 3] = 255;
+      }
+    }
+
+    return InputImage.fromBytes(
+      bytes: bgra,
+      metadata: InputImageMetadata(
+        size: Size(ow.toDouble(), oh.toDouble()),
+        rotation: InputImageRotation.rotation0deg,
+        format: InputImageFormat.bgra8888,
+        bytesPerRow: ow * 4,
+      ),
+    );
   }
 
   void dispose() {
