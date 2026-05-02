@@ -1208,34 +1208,56 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
       }
     }
 
-    // ── TFLite Card Name Classifier (verification + debug) ──
+    // ── Card Name CNN as confidence cross-validator ──
+    // Was previously debug-log-only. Now actively boosts/reduces the
+    // displayed confidence so the user knows whether OCR + CNN agree.
+    // The 932 KB model wasn't earning its bundle weight before — this
+    // is OCR's only independent second opinion. Variant decisions
+    // stay with OCR (CNN doesn't know variants, only names), but the
+    // confidence-tier on the bottom-strip thumbnail is informed by
+    // both signals. Saved into nameAgrees/nameStronglyDisagrees so
+    // the final _addCard at function end can consume it.
+    bool nameAgrees = false;
+    bool nameStronglyDisagrees = false;
     if (computeResult?.debugFullPixels != null && _cardNameClassifier.isReady) {
       final nameResult = _cardNameClassifier.classify(
         computeResult!.debugFullPixels!,
         computeResult.debugFullW,
         computeResult.debugFullH,
       );
-      if (_debugMode) {
-        if (nameResult != null) {
-          final agrees = nameResult.name.toLowerCase() == match.card.name.toLowerCase();
+      if (nameResult != null) {
+        final agrees = nameResult.name.toLowerCase() == match.card.name.toLowerCase();
+        // Boost: CNN strongly confirms the OCR pick.
+        if (agrees && nameResult.confidence >= 0.80) nameAgrees = true;
+        // Demote: CNN strongly disagrees and points elsewhere — likely
+        // a wrong OCR identification. Threshold higher (0.85) since false-
+        // positive disagreements would needlessly downgrade good scans.
+        if (!agrees && nameResult.confidence >= 0.85) nameStronglyDisagrees = true;
+        if (_debugMode) {
           debugPrint('TFLite cardName: "${nameResult.name}" '
               '(conf=${nameResult.confidence.toStringAsFixed(3)}) '
               '${agrees ? "✓ agrees" : "✗ disagrees"} with OCR "${match.card.name}"');
-        } else {
-          debugPrint('TFLite cardName: below threshold');
         }
-        // Top-5 for debugging
-        final top5 = _cardNameClassifier.classifyTopN(
-          computeResult!.debugFullPixels!,
-          computeResult.debugFullW,
-          computeResult.debugFullH,
-          n: 5,
-        );
-        if (top5.isNotEmpty) {
-          debugPrint('TFLite cardName top5: ${top5.map((r) => '${r.name}(${r.confidence.toStringAsFixed(3)})').join(', ')}');
-        }
+      } else if (_debugMode) {
+        debugPrint('TFLite cardName: below threshold');
       }
     }
+    // Compute CNN-adjusted final confidence used by all _addCard exits below.
+    // High + agree → stays high. Low + agree → bumps to medium.
+    // High + disagree → drops to medium (encourage verification).
+    final ScanConfidence finalConfidence = nameAgrees
+        ? switch (match.confidence) {
+            ScanConfidence.low => ScanConfidence.medium,
+            ScanConfidence.medium => ScanConfidence.high,
+            ScanConfidence.high => ScanConfidence.high,
+          }
+        : nameStronglyDisagrees
+            ? switch (match.confidence) {
+                ScanConfidence.high => ScanConfidence.medium,
+                ScanConfidence.medium => ScanConfidence.low,
+                ScanConfidence.low => ScanConfidence.low,
+              }
+            : match.confidence;
 
     // ══════════════════════════════════════════════
     // ── pHash variant resolution (only for multi-variant cards) ──
@@ -1300,7 +1322,12 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
         .where((c) => c.id != resolvedCard.id)
         .toList();
 
-    _addCard(resolvedCard, resolvedAlts, confidence: match.confidence);
+    // Final pHash-fallthrough path uses CNN-adjusted confidence — this is
+    // the path with the LEAST signal (no CN-suffix, no badge-OCR-promo, no
+    // promo-CNN-trigger), so CNN cross-validation matters most here. Earlier
+    // exits (CN-suffix, badge-OCR, promo-CNN branches) keep raw match.confidence
+    // since those resolved via strong specific signals.
+    _addCard(resolvedCard, resolvedAlts, confidence: finalConfidence);
   }
 
   // ══════════════════════════════════════════════
