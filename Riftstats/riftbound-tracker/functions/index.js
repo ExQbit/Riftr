@@ -8896,6 +8896,11 @@ exports.populateListingSellerStats = onDocumentCreated(
         // fertig hat — der propagateSellerStripeChange Trigger updated
         // dann ALLE aktiven Listings dieses Sellers in einem Batch.
         sellerStripeReady: seller.stripeOnboarded === true,
+        // DAC7 Volume-Suspended-Snapshot (gap fix 2026-05-02): same idea
+        // as sellerStripeReady — buyers don't see listings of a DAC7-
+        // suspended seller. Cleared automatically by the trigger when
+        // the seller re-declares as commercial.
+        sellerVolumeSuspended: seller.volumeSuspended === true,
       };
       if (!(sellerRating === 0 && sellerSales === 0)) {
         updateData.sellerRating = sellerRating;
@@ -9005,16 +9010,24 @@ exports.syncSellerProfileToPlayerMirror = onDocumentWritten(
         }
       }
 
-      // Stripe-onboarded status transition (2026-05-02, S2 from
-      // Stripe-not-ready UX sprint): when the seller's stripeOnboarded
-      // flag changes, propagate the new ready-state to ALL of their
-      // active listings so the buyer-side query reflects reality.
-      //  - false → true: listings become discoverable
-      //  - true → false: listings get hidden again (account suspended,
-      //    capabilities revoked, etc.)
+      // Stripe-onboarded + DAC7-volumeSuspended status transitions
+      // (2026-05-02): when either flag changes on the seller, propagate
+      // the new value to ALL of their active listings so the buyer-side
+      // query reflects reality.
+      //  - stripeOnboarded false → true: listings become discoverable
+      //  - stripeOnboarded true → false: listings hidden (account
+      //    suspended, capabilities revoked, etc.)
+      //  - volumeSuspended false → true: listings hidden (DAC7 deadline
+      //    expired)
+      //  - volumeSuspended true → false: listings reappear (e.g. cleared
+      //    automatically by the reclass-to-commercial path above)
       const wasStripeReady = before.stripeOnboarded === true;
       const isStripeReady = after.stripeOnboarded === true;
-      if (wasStripeReady !== isStripeReady) {
+      const wasVolSuspended = before.volumeSuspended === true;
+      const isVolSuspended = after.volumeSuspended === true;
+      const stripeChanged = wasStripeReady !== isStripeReady;
+      const volChanged = wasVolSuspended !== isVolSuspended;
+      if (stripeChanged || volChanged) {
         // Single-field-query (sellerId only) + client-side status
         // filter, to avoid needing a composite index on listings.
         const listingsSnap = await db.collection("artifacts").doc(APP_ID)
@@ -9027,12 +9040,15 @@ exports.syncSellerProfileToPlayerMirror = onDocumentWritten(
         });
         if (propagable.length > 0) {
           const batch = db.batch();
+          const update = {};
+          if (stripeChanged) update.sellerStripeReady = isStripeReady;
+          if (volChanged) update.sellerVolumeSuspended = isVolSuspended;
           for (const doc of propagable) {
-            batch.update(doc.ref, { sellerStripeReady: isStripeReady });
+            batch.update(doc.ref, update);
           }
           await batch.commit();
           console.log(
-            `syncSellerProfileToPlayerMirror: propagated sellerStripeReady=${isStripeReady} to ${propagable.length} listings for ${uid}`,
+            `syncSellerProfileToPlayerMirror: propagated ${JSON.stringify(update)} to ${propagable.length} listings for ${uid}`,
           );
         }
       }

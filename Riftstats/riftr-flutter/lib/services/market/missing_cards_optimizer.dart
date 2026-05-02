@@ -712,10 +712,12 @@ class MissingCardsOptimizer {
 
   static bool _passesFilters(MarketListing l, SmartCartFilters f, String? uid) {
     if (l.status != 'active') return false;
-    // Stripe-Onboarding (2026-05-02): exclude listings whose seller
-    // hasn't completed Stripe-Connect-Onboarding — Smart Cart cannot
-    // auto-pick a listing that would fail at checkout.
+    // Stripe-Onboarding + DAC7 (2026-05-02): exclude listings whose
+    // seller can't accept payments right now. Smart Cart cannot
+    // auto-pick a listing that would fail at checkout, and shouldn't
+    // pick a DAC7-suspended seller's listings either.
     if (!l.sellerStripeReady) return false;
+    if (l.sellerVolumeSuspended) return false;
     if (uid != null && l.sellerId == uid) return false;
     if (l.availableQty <= 0) return false;
     // Condition: smaller enum index = better. Reject if worse than min.

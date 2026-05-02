@@ -49,6 +49,13 @@ class MarketListing {
   /// werden NICHT versteckt (sonst verschwinden alle bestehenden Listings
   /// bei Deploy).
   final bool sellerStripeReady;
+
+  /// DAC7-Volume-Suspended-Snapshot zur Listing-Zeit (2026-05-02 gap fix).
+  /// Buyer-Side-Listing-Query filtert `sellerVolumeSuspended == true` raus.
+  /// Propagated vom `syncSellerProfileToPlayerMirror`-Trigger bei jeder
+  /// volumeSuspended-Transition. Default false: legacy listings ohne dieses
+  /// Feld bleiben sichtbar.
+  final bool sellerVolumeSuspended;
   final double price;
   final CardCondition condition;
   final int quantity;
@@ -74,6 +81,7 @@ class MarketListing {
     this.sellerLegalEntityName,
     this.sellerVatId,
     this.sellerStripeReady = true,
+    this.sellerVolumeSuspended = false,
     required this.price,
     required this.condition,
     this.quantity = 1,
@@ -191,6 +199,8 @@ class MarketListing {
       // The CF write happens at populateListingSellerStats — once that
       // has run for a listing, the field is explicitly set.
       sellerStripeReady: d['sellerStripeReady'] as bool? ?? true,
+      // Default false (= not suspended) so legacy listings stay visible.
+      sellerVolumeSuspended: d['sellerVolumeSuspended'] as bool? ?? false,
       price: (d['price'] as num?)?.toDouble() ?? 0,
       condition: CardCondition.values.firstWhere(
         (c) => c.name == d['condition'],

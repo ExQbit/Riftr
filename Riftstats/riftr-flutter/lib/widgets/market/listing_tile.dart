@@ -126,17 +126,23 @@ class ListingTile extends StatelessWidget {
                       compact: true,
                     ),
                     const SizedBox(width: AppSpacing.sm),
-                    // "Setting up payouts" indicator — only renders when
-                    // the seller hasn't completed Stripe-Onboarding yet.
-                    // Listings in this state are hidden from buyer queries
-                    // (ListingService._visibleToBuyers), so this badge
-                    // typically only appears in the seller's own
-                    // myListings view as a heads-up that buyers can't
-                    // see + buy this listing yet.
+                    // "Setting up payouts" / "DAC7 paused" indicators —
+                    // only render in views that bypass the buyer-side
+                    // visibility filter (ListingService._visibleToBuyers),
+                    // typically the seller's own myListings. Lets the
+                    // seller understand WHY their listing is hidden from
+                    // buyers right now.
                     if (!listing.sellerStripeReady) ...[
                       RiftrBadge(
                         label: 'Setting up payouts',
                         type: RiftrBadgeType.warning,
+                      ),
+                      const SizedBox(width: AppSpacing.sm),
+                    ],
+                    if (listing.sellerVolumeSuspended) ...[
+                      RiftrBadge(
+                        label: 'DAC7 paused',
+                        type: RiftrBadgeType.error,
                       ),
                       const SizedBox(width: AppSpacing.sm),
                     ],

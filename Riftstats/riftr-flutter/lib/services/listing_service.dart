@@ -22,12 +22,15 @@ class ListingService extends ChangeNotifier {
   final Map<String, ({MarketListing listing, DateTime expiresAt})> _fresh = {};
 
   /// Buyer-side visibility: listing must be active AND its seller's
-  /// Stripe-Connect-Onboarding fertig. Sonst kann der Buyer nicht
-  /// kaufen → wir verstecken das Listing komplett (Cardmarket-Pattern).
-  /// `myListings` (owner-side) bypassed diesen Filter — Seller sieht
-  /// die eigenen Listings auch im "Setting-up-payouts"-Zustand.
+  /// Stripe-Connect-Onboarding fertig AND the seller is not DAC7-volume-
+  /// suspended. Sonst kann/darf der Buyer nicht kaufen → wir verstecken
+  /// das Listing komplett (Cardmarket-Pattern). `myListings` (owner-side)
+  /// bypassed diesen Filter — Seller sieht die eigenen Listings auch im
+  /// "Setting-up-payouts" oder "DAC7-suspended"-Zustand.
   bool _visibleToBuyers(MarketListing l) =>
-      l.status == 'active' && l.sellerStripeReady;
+      l.status == 'active' &&
+      l.sellerStripeReady &&
+      !l.sellerVolumeSuspended;
 
   List<MarketListing> get allActive =>
       _listings.where(_visibleToBuyers).toList();
