@@ -454,6 +454,8 @@ Test-Suite: `functions/test-scenarios/phase8_e2e_tests.js` — 46/46 Checks grue
 - [ ] Premium-Markenrechts-Bewertung Riot Games (erst wenn Riot reagiert; eigener Riot-Outreach via Email kostenlos vorab)
 - [ ] D&O- + Cyber-Versicherung
 - [ ] DSB falls erforderlich (ab bestimmter Mitarbeiter-/Datenmenge)
+- [ ] **Reverse-Reclassification** (gewerblich → privat). Aktuell nur einseitig privat→gewerblich. Falls jemand fälschlich gewerblich angemeldet ist, muss Riftr-Support manuell helfen. Eigener Sprint nötig — DAC7-Counter-Reset-Implikationen + Audit-Anforderungen.
+- [ ] **App-Bote-Mechanismus für Widerrufserklärung** (KI-Anwalt-Empfehlung Phase 2). Aktuell Phase-1: Widerruf-Modal zeigt Mailto-Button, Käufer schreibt selbst an Verkäufer. Phase-2: vollautomatisierte Botenstellungs-UI mit Versand-Log + Bounce-Handling, dokumentierte Weiterleitung als Beweismittel im Streitfall.
 
 ### 🟦 IMPLEMENTATION-NOTES (kritisch fuer Backend, NICHT in AGB)
 1. **Verguetung in Privat-Limits = brutto** (PStTG-Logik, siehe Ticket 3)
