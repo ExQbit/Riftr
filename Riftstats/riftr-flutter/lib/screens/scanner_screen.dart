@@ -35,6 +35,11 @@ class ScannedCardEntry {
   List<RiftCard> alternatives;
   int quantity;
   bool isFoil;
+  /// Match confidence at scan time. Used to color-code the bottom-strip
+  /// thumbnail so the user can see at a glance which scans need verification.
+  /// Persists through editor (changing variant doesn't change "how confident
+  /// the original detection was").
+  final ScanConfidence confidence;
 
   /// Whether foil is relevant for this card.
   /// Normal runes (OGN/SFD/OGS) have no foil. Promo runes (OGNX/SFDX) are foil.
@@ -58,6 +63,7 @@ class ScannedCardEntry {
     this.alternatives = const [],
     this.quantity = 1,
     bool? isFoil,
+    this.confidence = ScanConfidence.high,
   }) : isFoil = isFoil ?? _defaultFoil(card);
 
   static bool _defaultFoil(RiftCard card) {
@@ -180,6 +186,20 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
   /// processImage.then, extractFrame.then, _acceptMatch, _addCard) check
   /// this flag and bail out instead of calling _addCard mid-edit.
   bool _scanPaused = false;
+
+  /// When true, render the "tap to scan / hold steady" hint in WAITING.
+  /// Set by an 8-second timer started on WAITING entry — gives the user
+  /// guidance if auto-detection doesn't kick in (low-light, classifier
+  /// underestimates on this device, etc.). Reset on any state change.
+  bool _showWaitingHint = false;
+  Timer? _waitingHintTimer;
+
+  /// True while _acceptMatch is running its variant-resolution chain.
+  /// _acceptMatch can take 300-500ms (TFLite classifiers + pHash compute
+  /// in isolate) and during that time the state has already flipped to
+  /// STABLE — without a visible indicator the user sees a frozen frame
+  /// and might think the scan failed. Renders a subtle spinner overlay.
+  bool _identifying = false;
 
   // ── Multi-frame cumulative scoring ──
   int _scanCycleId = 0; // incremented each new scan cycle to invalidate stale callbacks
@@ -804,7 +824,22 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     if (_scanPaused) return; // user is editing — drop stale match
     _setState(ScanState.stable);
     HapticFeedback.mediumImpact();
+    // Show "identifying" spinner while async variant-resolution runs
+    // (TFLite classifiers + pHash compute() — typically 300-500ms).
+    // Cleared in finally so any early return still clears the spinner.
+    if (mounted) setState(() => _identifying = true);
 
+    try {
+      await _resolveAndAddCard(match);
+    } finally {
+      if (mounted) setState(() => _identifying = false);
+    }
+  }
+
+  /// The full variant-resolution chain. Extracted from _acceptMatch so the
+  /// _identifying spinner can be wrapped via try/finally without restructuring
+  /// every early-return inside.
+  Future<void> _resolveAndAddCard(OcrMatch match) async {
     var resolvedCard = match.card;
 
     final nameLower = match.card.name.toLowerCase();
@@ -859,7 +894,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
                 '${resolvedCard.setId}#${resolvedCard.collectorNumber} (suffix=$_cumCNSuffix)');
           }
           final resolvedAlts = allVariants.where((c) => c.id != resolvedCard.id).toList();
-          _addCard(resolvedCard, resolvedAlts);
+          _addCard(resolvedCard, resolvedAlts, confidence: match.confidence);
           return;
         }
       }
@@ -880,7 +915,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
                   '${resolvedCard.setId}#${resolvedCard.collectorNumber} (CHAMPION edition)');
             }
             final resolvedAlts = allVariants.where((c) => c.id != resolvedCard.id).toList();
-            _addCard(resolvedCard, resolvedAlts);
+            _addCard(resolvedCard, resolvedAlts, confidence: match.confidence);
             return;
           }
         }
@@ -892,7 +927,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
               '${resolvedCard.setId}#${resolvedCard.collectorNumber} (PROMO detected)');
         }
         final resolvedAlts = allVariants.where((c) => c.id != resolvedCard.id).toList();
-        _addCard(resolvedCard, resolvedAlts);
+        _addCard(resolvedCard, resolvedAlts, confidence: match.confidence);
         return;
       }
     }
@@ -1155,7 +1190,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
                   debugPrint('TFLite badge: resolved to ${resolvedCard.setId}#${resolvedCard.collectorNumber} (CHAMPION)');
                 }
                 final resolvedAlts = allVariants.where((c) => c.id != resolvedCard.id).toList();
-                _addCard(resolvedCard, resolvedAlts);
+                _addCard(resolvedCard, resolvedAlts, confidence: match.confidence);
                 return;
               }
             }
@@ -1166,7 +1201,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
               debugPrint('TFLite badge: resolved to ${resolvedCard.setId}#${resolvedCard.collectorNumber}');
             }
             final resolvedAlts = allVariants.where((c) => c.id != resolvedCard.id).toList();
-            _addCard(resolvedCard, resolvedAlts);
+            _addCard(resolvedCard, resolvedAlts, confidence: match.confidence);
             return;
           }
         }
@@ -1265,7 +1300,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
         .where((c) => c.id != resolvedCard.id)
         .toList();
 
-    _addCard(resolvedCard, resolvedAlts);
+    _addCard(resolvedCard, resolvedAlts, confidence: match.confidence);
   }
 
   // ══════════════════════════════════════════════
@@ -2041,13 +2076,18 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
 
   /// Add card to scanned list — every scan gets its own entry.
   /// Merging happens later in ScanResultsScreen.
-  void _addCard(RiftCard card, List<RiftCard> alternatives) {
+  void _addCard(RiftCard card, List<RiftCard> alternatives,
+      {ScanConfidence confidence = ScanConfidence.high}) {
     // Last-line defense — if user opened the editor sheet between OCR
     // dispatch and this call, drop the stale scan instead of duplicating.
     if (_scanPaused) return;
     _justScanned = true; // require higher motion threshold before next scan
     setState(() {
-      _scannedCards.add(ScannedCardEntry(card: card, alternatives: alternatives));
+      _scannedCards.add(ScannedCardEntry(
+        card: card,
+        alternatives: alternatives,
+        confidence: confidence,
+      ));
     });
   }
 
@@ -2207,6 +2247,21 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     // bauen wir den Stuck-Counter wieder von 0 auf.
     if (_state == ScanState.waiting && newState != ScanState.waiting) {
       _waitingStuckFrames = 0;
+      _waitingHintTimer?.cancel();
+      _waitingHintTimer = null;
+      if (_showWaitingHint) _showWaitingHint = false;
+    }
+    // Start the 8s WAITING hint timer when entering WAITING.
+    // Gives the user guidance if auto-detect doesn't fire (low-light,
+    // classifier underestimates) — they can tap the camera preview to
+    // force an OCR attempt.
+    if (newState == ScanState.waiting && _state != ScanState.waiting) {
+      _waitingHintTimer?.cancel();
+      _waitingHintTimer = Timer(const Duration(seconds: 8), () {
+        if (mounted && _state == ScanState.waiting) {
+          setState(() => _showWaitingHint = true);
+        }
+      });
     }
     // Clear native rects and waiting match when motion starts (new card)
     if (newState == ScanState.motion) {
@@ -2241,11 +2296,18 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     _state = newState;
   }
 
-  /// Tap-to-rescan: force a new OCR pass in STABLE state.
+  /// Tap-to-rescan: force OCR on next frame.
+  ///   STABLE → re-enter SCANNING for the next OCR cycle
+  ///   WAITING → trip the stuck-counter so the next frame bypasses
+  ///             the Card-Present-Classifier gate (same path that
+  ///             auto-fires after 3s, but on user demand).
   void _tapToRescan() {
     if (_state == ScanState.stable) {
       _setState(ScanState.scanning);
-      // The next frame will trigger OCR
+    } else if (_state == ScanState.waiting) {
+      // Force-OCR on next frame regardless of classifier prob.
+      _waitingStuckFrames = _waitingStuckThreshold;
+      HapticFeedback.lightImpact();
     }
   }
 
@@ -2318,6 +2380,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _settlingTimer?.cancel();
+    _waitingHintTimer?.cancel();
     _controller?.dispose();
     super.dispose();
   }
@@ -2443,14 +2506,78 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
             ),
           ),
 
-          // Tap to rescan hint (only in STABLE state)
-          if (_state == ScanState.stable && _scannedCards.isNotEmpty)
+          // Tap to rescan hint (only in STABLE state, and not while
+          // _acceptMatch is still running its variant-resolution chain
+          // — the spinner already conveys "working on it").
+          if (_state == ScanState.stable && _scannedCards.isNotEmpty && !_identifying)
             Positioned(
               bottom: MediaQuery.of(context).padding.bottom + 180,
               left: 0, right: 0,
               child: Center(
                 child: Text('Tap to scan again',
                   style: AppTextStyles.small.copyWith(color: AppColors.textSecondary)),
+              ),
+            ),
+
+          // "Identifying card..." spinner during _acceptMatch's async
+          // variant-resolution. Subtle pill at the same vertical position
+          // as the tap-to-rescan hint, to avoid layout shift when it
+          // disappears and the rescan hint takes its place.
+          if (_identifying)
+            Positioned(
+              bottom: MediaQuery.of(context).padding.bottom + 180,
+              left: 0, right: 0,
+              child: Center(
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: AppSpacing.md, vertical: AppSpacing.xs),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.55),
+                    borderRadius: BorderRadius.circular(AppRadius.pill),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      SizedBox(
+                        width: 12, height: 12,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: AppColors.amber400,
+                        ),
+                      ),
+                      const SizedBox(width: AppSpacing.sm),
+                      Text(
+                        'Identifying...',
+                        style: AppTextStyles.small.copyWith(color: Colors.white),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+
+          // WAITING hint after 8s of no auto-detection. Tells the user they
+          // can manually force a scan attempt by tapping the camera preview —
+          // covers low-light scenarios and devices where the Card-Present
+          // classifier underestimates (iPhone 13 mini-class issue, BACKLOG #86).
+          if (_showWaitingHint && _state == ScanState.waiting)
+            Positioned(
+              bottom: MediaQuery.of(context).padding.bottom + 180,
+              left: AppSpacing.md, right: AppSpacing.md,
+              child: Center(
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: AppSpacing.md, vertical: AppSpacing.sm),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.55),
+                    borderRadius: BorderRadius.circular(AppRadius.rounded),
+                  ),
+                  child: Text(
+                    'Hold card in frame — or tap to scan now',
+                    textAlign: TextAlign.center,
+                    style: AppTextStyles.small.copyWith(color: Colors.white),
+                  ),
+                ),
               ),
             ),
 
@@ -2683,25 +2810,44 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
                             child: Padding(
                             padding: const EdgeInsets.only(right: 6),
                             child: Stack(children: [
-                              ClipRRect(
-                                borderRadius: BorderRadius.circular(AppRadius.rounded),
-                                child: entry.card.type?.toLowerCase() == 'battlefield'
-                                    ? SizedBox(
-                                        width: 48, height: 67,
-                                        child: RotatedBox(
-                                          quarterTurns: 1,
-                                          child: CardImage(
-                                            imageUrl: entry.card.imageUrl,
-                                            fallbackText: entry.card.name,
-                                            fit: BoxFit.cover,
+                              // Wrap thumbnail in a colored Container that
+                              // acts as a confidence-frame. Border colors:
+                              //   high   → transparent (no border, default look)
+                              //   medium → amber (= "verify before adding")
+                              //   low    → red (= "probably wrong, check")
+                              // Border is 2px so the thumbnail stays readable.
+                              Container(
+                                decoration: BoxDecoration(
+                                  borderRadius: BorderRadius.circular(AppRadius.rounded),
+                                  border: Border.all(
+                                    color: switch (entry.confidence) {
+                                      ScanConfidence.high => Colors.transparent,
+                                      ScanConfidence.medium => AppColors.amber400,
+                                      ScanConfidence.low => AppColors.loss,
+                                    },
+                                    width: 2,
+                                  ),
+                                ),
+                                child: ClipRRect(
+                                  borderRadius: BorderRadius.circular(AppRadius.rounded - 2),
+                                  child: entry.card.type?.toLowerCase() == 'battlefield'
+                                      ? SizedBox(
+                                          width: 48, height: 67,
+                                          child: RotatedBox(
+                                            quarterTurns: 1,
+                                            child: CardImage(
+                                              imageUrl: entry.card.imageUrl,
+                                              fallbackText: entry.card.name,
+                                              fit: BoxFit.cover,
+                                            ),
                                           ),
+                                        )
+                                      : CardImage(
+                                          imageUrl: entry.card.imageUrl,
+                                          fallbackText: entry.card.name,
+                                          width: 48, height: 67, fit: BoxFit.cover,
                                         ),
-                                      )
-                                    : CardImage(
-                                        imageUrl: entry.card.imageUrl,
-                                        fallbackText: entry.card.name,
-                                        width: 48, height: 67, fit: BoxFit.cover,
-                                      ),
+                                ),
                               ),
                               if (entry.quantity > 1)
                                 Positioned(
