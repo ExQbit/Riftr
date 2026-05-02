@@ -169,6 +169,15 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
   static const _rectMotionLimit = 10.0; // collect native rects during hand trembles (card still visible)
   Timer? _settlingTimer;
 
+  /// True while a modal sheet (variant editor, results screen) is open.
+  /// stopImageStream() prevents NEW frames from entering _onFrame, but
+  /// already-dispatched OCR calls (50-200ms ML Kit latency) keep their
+  /// .then callbacks running and would otherwise add duplicate scans
+  /// while the user picks a variant. All async entry points (_onFrame,
+  /// processImage.then, extractFrame.then, _acceptMatch, _addCard) check
+  /// this flag and bail out instead of calling _addCard mid-edit.
+  bool _scanPaused = false;
+
   // ── Multi-frame cumulative scoring ──
   int _scanCycleId = 0; // incremented each new scan cycle to invalidate stale callbacks
   int _scanFrameCount = 0;
@@ -314,6 +323,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     }
     if (_frameCount % 3 != 0) return; // ~10 fps processing
     if (_controller == null) return;
+    if (_scanPaused) return; // user is editing — don't start new processing
     if (_processedFrames == 0) debugPrint('Scanner: First processed frame');
 
     _processedFrames++;
@@ -504,7 +514,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
         )));
       }
       _ocr.processImage(image, _controller!.description, tryFlip: tryFlip).then((match) {
-        if (match == null || !mounted) return;
+        if (match == null || !mounted || _scanPaused) return;
         _updateDebug(match);
 
         // Name or title required: reject matches without card text recognized
@@ -549,7 +559,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     // multi-card scans where each card may be a different orientation).
     final cycleAtStart = _scanCycleId;
     _ocr.extractFrame(image, _controller!.description).then((extraction) async {
-      if (!mounted || _state != ScanState.scanning || _scanCycleId != cycleAtStart) return;
+      if (!mounted || _state != ScanState.scanning || _scanCycleId != cycleAtStart || _scanPaused) return;
 
       _scanFrameCount++;
       _debugScanFrame = _scanFrameCount;
@@ -731,7 +741,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
 
       final lookup = CardLookupService.instance;
       final matches = await lookup.findBestMatches(cumExtraction);
-      if (!mounted || _state != ScanState.scanning || _scanCycleId != cycleAtStart) return;
+      if (!mounted || _state != ScanState.scanning || _scanCycleId != cycleAtStart || _scanPaused) return;
 
       final bestScore = matches.isNotEmpty ? matches.first.score : 0;
 
@@ -827,6 +837,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
   }
 
   void _acceptMatch(OcrMatch match) async {
+    if (_scanPaused) return; // user is editing — drop stale match
     _setState(ScanState.stable);
     _lastMatchedCardId = match.card.id;
     HapticFeedback.mediumImpact();
@@ -2068,6 +2079,9 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
   /// Add card to scanned list — every scan gets its own entry.
   /// Merging happens later in ScanResultsScreen.
   void _addCard(RiftCard card, List<RiftCard> alternatives) {
+    // Last-line defense — if user opened the editor sheet between OCR
+    // dispatch and this call, drop the stale scan instead of duplicating.
+    if (_scanPaused) return;
     _justScanned = true; // require higher motion threshold before next scan
     setState(() {
       _scannedCards.add(ScannedCardEntry(card: card, alternatives: alternatives));
@@ -2082,7 +2096,11 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     for (final c in [entry.card, ...entry.alternatives]) {
       if (seen.add(c.id)) allVariants.add(c);
     }
-    // Pause scanning while editing
+    // Pause scanning while editing. _scanPaused stops new processing
+    // immediately + drops any in-flight OCR results before they reach
+    // _addCard — without this, ML Kit's 50-200ms latency creates a window
+    // where a "stale" match still gets added behind the open sheet.
+    _scanPaused = true;
     _controller?.stopImageStream();
     showModalBottomSheet<void>(
       context: context,
@@ -2204,12 +2222,16 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
         )),  // Padding, DraggableScrollableSheet builder
       ),  // StatefulBuilder
     ).then((_) {
-      // Resume scanning when sheet closes
+      // Resume scanning when sheet closes. Bump _scanCycleId to invalidate
+      // any cumulative SCANNING state from before — the user may have edited
+      // the previous match, and stale frames must not leak through.
       if (mounted && _controller != null) {
         _prevLuminance = null; // reset so motion detection starts fresh
         _lastCardPresentProb = 0.0;
+        _scanCycleId++;
         _controller!.startImageStream(_onFrame);
         _setState(ScanState.waiting);
+        _scanPaused = false;
       }
     });
   }
@@ -2279,6 +2301,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
       Navigator.pop(context);
       return;
     }
+    _scanPaused = true;
     _controller?.stopImageStream();
 
     // Push ScanResults — it may return entries to continue scanning
@@ -2302,8 +2325,10 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
       });
       _prevLuminance = null;
       _lastCardPresentProb = 0.0;
+      _scanCycleId++;
       _setState(ScanState.waiting);
       _controller?.startImageStream(_onFrame);
+      _scanPaused = false;
     } else {
       // User finished or cancelled — close scanner
       if (mounted) Navigator.pop(context);
