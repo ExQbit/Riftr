@@ -114,6 +114,9 @@ class SocialScreenState extends State<SocialScreen> {
     FirestoreCollectionService.instance.addListener(_refresh);
     ListingService.instance.addListener(_refresh);
     CartService.instance.addListener(_refresh);
+    // DAC7-Banner + Switch-to-commercial-Button reagieren auf
+    // sellerProfile-Aenderungen (z.B. nach Reclass-Sheet).
+    SellerService.instance.addListener(_refresh);
     // Fetch profiles for followed users
     _fetchFollowingProfiles();
     // Async admin-claim evaluation
@@ -226,6 +229,7 @@ class SocialScreenState extends State<SocialScreen> {
     FirestoreCollectionService.instance.removeListener(_refresh);
     ListingService.instance.removeListener(_refresh);
     CartService.instance.removeListener(_refresh);
+    SellerService.instance.removeListener(_refresh);
     super.dispose();
   }
 
