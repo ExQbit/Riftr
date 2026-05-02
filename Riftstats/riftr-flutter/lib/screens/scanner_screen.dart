@@ -139,7 +139,6 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
   final List<ScannedCardEntry> _scannedCards = [];
   final _ocr = OcrService.instance;
   final _lookup = CardLookupService.instance;
-  String? _lastMatchedCardId;
   OcrMatch? _waitingMatch; // WAITING match with variants → deferred to SCANNING
 
   // ── pHash variant detection ──
@@ -155,7 +154,6 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
   int _lastYWidth = 0;
   int _lastYHeight = 0;
   int _lastYStride = 0;
-  final List<Future<PhashComputeResult>> _phashFrames = []; // collected during SCANNING
   final List<List<int>> _nativeRects = []; // native rect samples during SCANNING
 
   // ── Motion detection ──
@@ -491,28 +489,6 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
   void _runOcr(CameraImage image, {bool tryFlip = false}) {
     // WAITING state: full processImage with optional flip
     if (_state == ScanState.waiting) {
-      // Only one pHash frame for WAITING (first processed frame)
-      // TODO: Re-enable after OCR performance verified
-      if (false && _phashFrames.isEmpty && _lastYPlane != null && _phash.isReady) {
-        Uint8List ySnap;
-        if (_lastYStride == _lastYWidth) {
-          ySnap = Uint8List.fromList(_lastYPlane!);
-        } else {
-          ySnap = Uint8List(_lastYWidth * _lastYHeight);
-          for (int row = 0; row < _lastYHeight; row++) {
-            ySnap.setRange(row * _lastYWidth, row * _lastYWidth + _lastYWidth,
-                _lastYPlane!, row * _lastYStride);
-          }
-        }
-        final cardW = (_lastYWidth * 0.65).round();
-        final cardH = (cardW * 7 / 5).round();
-        final cardX = (_lastYWidth - cardW) ~/ 2;
-        final cardY = (_lastYHeight - cardH) ~/ 2;
-        _phashFrames.add(compute(computePhashIsolate, PhashPayload(
-          yPlane: ySnap, width: _lastYWidth, height: _lastYHeight,
-          cardRect: [cardX, cardY, cardW, cardH], debug: _debugMode,
-        )));
-      }
       _ocr.processImage(image, _controller!.description, tryFlip: tryFlip).then((match) {
         if (match == null || !mounted || _scanPaused) return;
         _updateDebug(match);
@@ -564,36 +540,10 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
       _scanFrameCount++;
       _debugScanFrame = _scanFrameCount;
 
-      // Native rect collection now runs in _onFrame for all states (line ~172).
-
-      // Launch pHash compute for this frame in background isolate
-      // TODO: Re-enable after OCR performance verified
-      if (false && _lastYPlane != null && _phash.isReady && _phashFrames.length < _maxScanFrames) {
-        // Strip stride and snapshot Y-plane
-        Uint8List ySnap;
-        if (_lastYStride == _lastYWidth) {
-          ySnap = Uint8List.fromList(_lastYPlane!);
-        } else {
-          ySnap = Uint8List(_lastYWidth * _lastYHeight);
-          for (int row = 0; row < _lastYHeight; row++) {
-            ySnap.setRange(
-              row * _lastYWidth, row * _lastYWidth + _lastYWidth,
-              _lastYPlane!, row * _lastYStride,
-            );
-          }
-        }
-        final cardW = (_lastYWidth * 0.65).round();
-        final cardH = (cardW * 7 / 5).round();
-        final cardX = (_lastYWidth - cardW) ~/ 2;
-        final cardY = (_lastYHeight - cardH) ~/ 2;
-        _phashFrames.add(compute(computePhashIsolate, PhashPayload(
-          yPlane: ySnap,
-          width: _lastYWidth,
-          height: _lastYHeight,
-          cardRect: [cardX, cardY, cardW, cardH],
-          debug: _debugMode, // save debug image for every frame
-        )));
-      }
+      // Native rects collected in _onFrame for all states. pHash compute
+      // happens once at acceptance (in _acceptMatch) when we have OCR-anchored
+      // card rect — per-frame pHash collection during SCANNING was tried but
+      // disabled (over-budget on CPU; OCR Grid + final compute is sufficient).
 
       // Debug: dump raw text at frame 10 (always, to diagnose OCR issues)
       if (_debugMode && _scanFrameCount == 10 && extraction != null) {
@@ -839,7 +789,6 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
   void _acceptMatch(OcrMatch match) async {
     if (_scanPaused) return; // user is editing — drop stale match
     _setState(ScanState.stable);
-    _lastMatchedCardId = match.card.id;
     HapticFeedback.mediumImpact();
 
     var resolvedCard = match.card;
@@ -2272,11 +2221,8 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
       _cumPromoDetected = false;
       _cumChampionDetected = false;
       _gridAnchors.clear();
-
-      // Reset cumulative pHash frames for new scan cycle.
-      // Native rects are NOT cleared — rects from SETTLING are valid
-      // (card is already still). Only MOTION clears them (new card).
-      _phashFrames.clear();
+      // Native rects are NOT cleared on SCANNING entry — rects from SETTLING
+      // are valid (card is already still). Only MOTION clears them (new card).
     }
     _state = newState;
   }

@@ -1,11 +1,7 @@
-import 'dart:async';
-import 'dart:io';
 import 'dart:typed_data';
-import 'dart:ui' as ui;
 import 'dart:ui' show Size;
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
-import 'package:path_provider/path_provider.dart';
 import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import '../models/card_model.dart';
 import '../models/card_fingerprint.dart';
@@ -778,86 +774,6 @@ class OcrService {
       cnBox: cnBox,
       promoDetected: promoDetected,
     );
-  }
-
-  // ══════════════════════════════════════════════
-  // ── OCR Debug: save input image with block boxes ──
-  // ══════════════════════════════════════════════
-
-  /// Save the camera Y-plane as grayscale PNG with all OCR block bounding boxes drawn.
-  void _saveOcrDebugImage(CameraImage image, RecognizedText recognized) async {
-    try {
-      final width = image.width;
-      final height = image.height;
-      final yPlane = image.planes.first.bytes;
-      final stride = image.planes.first.bytesPerRow;
-
-      // Build RGBA from Y-plane
-      final rgba = Uint8List(width * height * 4);
-      for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-          final v = yPlane[y * stride + x];
-          final idx = (y * width + x) * 4;
-          rgba[idx] = v; rgba[idx + 1] = v; rgba[idx + 2] = v; rgba[idx + 3] = 255;
-        }
-      }
-
-      // Draw each block's bounding box in different colors
-      final colors = [
-        [255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0],
-        [255, 0, 255], [0, 255, 255], [255, 128, 0], [128, 0, 255],
-      ];
-
-      for (int bi = 0; bi < recognized.blocks.length; bi++) {
-        final block = recognized.blocks[bi];
-        final r = block.boundingBox;
-        final color = colors[bi % colors.length];
-        final bx = r.left.round().clamp(0, width - 1);
-        final by = r.top.round().clamp(0, height - 1);
-        final bw = r.width.round().clamp(1, width - bx);
-        final bh = r.height.round().clamp(1, height - by);
-
-        // Draw border (2px)
-        for (int t = 0; t < 2; t++) {
-          for (int x = bx; x < bx + bw && x < width; x++) {
-            for (final yy in [by + t, by + bh - 1 - t]) {
-              if (yy >= 0 && yy < height) {
-                final idx = (yy * width + x) * 4;
-                rgba[idx] = color[0]; rgba[idx + 1] = color[1]; rgba[idx + 2] = color[2];
-              }
-            }
-          }
-          for (int y = by; y < by + bh && y < height; y++) {
-            for (final xx in [bx + t, bx + bw - 1 - t]) {
-              if (xx >= 0 && xx < width) {
-                final idx = (y * width + xx) * 4;
-                rgba[idx] = color[0]; rgba[idx + 1] = color[1]; rgba[idx + 2] = color[2];
-              }
-            }
-          }
-        }
-
-        debugPrint('OCR BLOCK[$bi]: "${block.text}" at (${bx},${by}) ${bw}x${bh}');
-      }
-
-      // Save as PNG
-      final completer = Completer<ui.Image>();
-      ui.decodeImageFromPixels(rgba, width, height, ui.PixelFormat.rgba8888, completer.complete);
-      final img = await completer.future;
-      final byteData = await img.toByteData(format: ui.ImageByteFormat.png);
-      if (byteData != null) {
-        final docsDir = await getApplicationDocumentsDirectory();
-        final dir = Directory('${docsDir.path}/phash_debug');
-        if (!dir.existsSync()) dir.createSync(recursive: true);
-        final ts = DateTime.now().millisecondsSinceEpoch;
-        final path = '${dir.path}/ocr_debug_${ts}.png';
-        await File(path).writeAsBytes(byteData.buffer.asUint8List());
-        debugPrint('OCR DEBUG IMAGE saved: $path (${recognized.blocks.length} blocks)');
-      }
-      img.dispose();
-    } catch (e) {
-      debugPrint('OCR debug image save failed: $e');
-    }
   }
 
   // ══════════════════════════════════════════════
