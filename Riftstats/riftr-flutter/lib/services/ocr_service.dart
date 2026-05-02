@@ -48,11 +48,21 @@ class OcrService {
   List<double>? _bestManaBox;
   int? _bestManaCost;
 
-  /// Reset sticky mana when scanning a new card
+  /// Last rotation that successfully matched a card. Defaults to rotation90deg
+  /// (= upright portrait on iPhones, where sensorOrientation=90). When a
+  /// non-default rotation succeeds (upside-down 180° or landscape battlefield
+  /// 0°/270°), this gets remembered so SCANNING refinement frames use the
+  /// same orientation. Reset via [resetStickyMana] when MOTION starts.
+  InputImageRotation _lastWorkingRotation = InputImageRotation.rotation90deg;
+
+  /// Reset sticky state when scanning a new card (sticky mana, last extraction,
+  /// and the remembered working rotation — a battlefield-detected 180° must not
+  /// carry over into scanning a portrait card next).
   void resetStickyMana() {
     _bestManaBox = null;
     _bestManaCost = null;
     lastExtraction = null;
+    _lastWorkingRotation = InputImageRotation.rotation90deg;
   }
 
   /// Run OCR on a raw BGRA image crop. Returns recognized text blocks.
@@ -109,114 +119,42 @@ class OcrService {
   );
 
   /// Extract data points from a camera frame without scoring.
-  /// Set [tryRotate90] to also try 90° CW for landscape battlefields.
-  /// Debug counter for saving OCR input images
-  int _ocrDebugFrameCount = 0;
+  /// Rotation handling is internal — uses [_lastWorkingRotation] (set by
+  /// processImage on WAITING match) and falls back to alt rotations when no
+  /// text is recognized (covers landscape battlefields after a portrait scan).
 
-  Future<OcrExtraction?> extractFrame(CameraImage image, CameraDescription camera, {bool tryRotate90 = false}) async {
+  Future<OcrExtraction?> extractFrame(CameraImage image, CameraDescription camera) async {
     if (_isProcessing) return null;
     _isProcessing = true;
     try {
-      // Primary: grayscale — ML Kit reads stylized card names better without color
-      final grayInput = _convertCameraImage(image, camera, grayscaleOnly: true);
-      if (grayInput == null) return null;
-      final recognized = await _textRecognizer.processImage(grayInput);
+      // Use the rotation that succeeded most recently (default=portrait after
+      // resetStickyMana). Auto-discovers via alt-rotation fallback if nothing
+      // is recognized — covers MOTION→SCANNING path where there's no preceding
+      // WAITING phase to set up rotation (e.g., scanning a battlefield right
+      // after a portrait card).
+      OcrExtraction? result = await _runExtraction(image, camera, _lastWorkingRotation);
 
-      OcrExtraction? result;
-      if (recognized.blocks.isNotEmpty) {
-        final allText = recognized.blocks.map((b) => b.text).join(' | ');
-        if (debugMode) debugPrint('OCR raw: $allText');
-        final allTextLower = allText.toLowerCase();
-        final allLines = <String>[];
-        final blocks = recognized.blocks.toList()
-          ..sort((a, b) => b.boundingBox.top.compareTo(a.boundingBox.top));
-        for (final block in blocks) {
-          for (final line in block.lines) {
-            allLines.add(line.text);
-          }
-        }
-        result = _extract(allLines, allTextLower, recognized);
-      }
-
-      // Fallback: color pass if grayscale found no names
-      if (result != null && result!.namesFound.isEmpty) {
-        final colorInput = _convertCameraImage(image, camera);
-        if (colorInput != null) {
-          final colorRecognized = await _textRecognizer.processImage(colorInput);
-          if (colorRecognized.blocks.isNotEmpty) {
-            final colorText = colorRecognized.blocks.map((b) => b.text).join(' | ');
-            if (debugMode) debugPrint('OCR color fallback: $colorText');
-            final colorLower = colorText.toLowerCase();
-            final colorLines = <String>[];
-            for (final block in colorRecognized.blocks) {
-              for (final line in block.lines) {
-                colorLines.add(line.text);
-              }
+      // If primary rotation found nothing useful, try alt rotations once.
+      // Card-text-emptiness is the trigger — handles landscape battlefields
+      // that the previous card's rotation can't read.
+      if (result == null ||
+          (result.namesFound.isEmpty &&
+           result.collectorNumber == null &&
+           result.rawTextLower.length < 20)) {
+        final defaultRot = _defaultRotation(camera);
+        for (final altRot in _altRotations(defaultRot)) {
+          if (altRot == _lastWorkingRotation) continue;
+          final altResult = await _runExtraction(image, camera, altRot);
+          if (altResult != null &&
+              (altResult.namesFound.isNotEmpty ||
+               altResult.collectorNumber != null)) {
+            _lastWorkingRotation = altRot;
+            if (debugMode) {
+              debugPrint('OCR extract: switched to rotation ${altRot.name} '
+                  '(found ${altResult.namesFound.length} names, cn=${altResult.collectorNumber})');
             }
-            final colorExtraction = _extract(colorLines, colorLower, colorRecognized);
-            if (colorExtraction.namesFound.isNotEmpty) {
-              // Merge color names into grayscale result
-              result = OcrExtraction(
-                setCode: result!.setCode ?? colorExtraction.setCode,
-                collectorNumber: result!.collectorNumber ?? colorExtraction.collectorNumber,
-                cnSuffix: result!.cnSuffix ?? colorExtraction.cnSuffix,
-                cnRaw: result!.cnRaw ?? colorExtraction.cnRaw,
-                cnHasSetPrefix: result!.cnHasSetPrefix || colorExtraction.cnHasSetPrefix,
-                namesFound: {...result!.namesFound, ...colorExtraction.namesFound},
-                keywordsFound: {...result!.keywordsFound, ...colorExtraction.keywordsFound},
-                typesFound: {...result!.typesFound, ...colorExtraction.typesFound},
-                regionsFound: {...result!.regionsFound, ...colorExtraction.regionsFound},
-                manaCost: result!.manaCost ?? colorExtraction.manaCost,
-                rawTextLower: '${result!.rawTextLower} ${colorExtraction.rawTextLower}',
-                fuzzyTextLower: '${result!.fuzzyTextLower} ${colorExtraction.fuzzyTextLower}',
-                softSetHint: result!.softSetHint ?? colorExtraction.softSetHint,
-                manaBox: result!.manaBox ?? colorExtraction.manaBox,
-                typeBox: result!.typeBox ?? colorExtraction.typeBox,
-                nameBox: result!.nameBox ?? colorExtraction.nameBox,
-                cnBox: result!.cnBox ?? colorExtraction.cnBox,
-                promoDetected: result!.promoDetected || colorExtraction.promoDetected,
-              );
-            }
-          }
-        }
-      }
-
-      // Try 90° CW for landscape battlefields
-      if (tryRotate90) {
-        final rot90 = _convertRotated90CW(image, camera);
-        if (rot90 != null) {
-          final rot90Recognized = await _textRecognizer.processImage(rot90);
-          if (rot90Recognized.blocks.isNotEmpty) {
-            final rotText = rot90Recognized.blocks.map((b) => b.text).join(' | ');
-            if (debugMode) debugPrint('OCR rot90: $rotText');
-            final rotLower = rotText.toLowerCase();
-            final rotLines = <String>[];
-            for (final block in rot90Recognized.blocks) {
-              for (final line in block.lines) {
-                rotLines.add(line.text);
-              }
-            }
-            final rotExtraction = _extract(rotLines, rotLower, rot90Recognized);
-            if (result == null) {
-              result = rotExtraction;
-            } else {
-              // Merge rot90 data INTO existing result
-              result = OcrExtraction(
-                setCode: result!.setCode ?? rotExtraction.setCode,
-                collectorNumber: result!.collectorNumber ?? rotExtraction.collectorNumber,
-                cnSuffix: result!.cnSuffix ?? rotExtraction.cnSuffix,
-                cnRaw: result!.cnRaw ?? rotExtraction.cnRaw,
-                cnHasSetPrefix: result!.cnHasSetPrefix || rotExtraction.cnHasSetPrefix,
-                namesFound: {...result!.namesFound, ...rotExtraction.namesFound},
-                keywordsFound: {...result!.keywordsFound, ...rotExtraction.keywordsFound},
-                typesFound: {...result!.typesFound, ...rotExtraction.typesFound},
-                regionsFound: {...result!.regionsFound, ...rotExtraction.regionsFound},
-                manaCost: result!.manaCost ?? rotExtraction.manaCost,
-                rawTextLower: '${result!.rawTextLower} ${rotExtraction.rawTextLower}',
-                fuzzyTextLower: '${result!.fuzzyTextLower} ${rotExtraction.fuzzyTextLower}',
-                softSetHint: result!.softSetHint ?? rotExtraction.softSetHint,
-              );
-            }
+            result = altResult;
+            break;
           }
         }
       }
@@ -230,45 +168,131 @@ class OcrService {
     }
   }
 
+  /// Run a single grayscale+color extraction pass at the given rotation.
+  Future<OcrExtraction?> _runExtraction(
+    CameraImage image,
+    CameraDescription camera,
+    InputImageRotation rotation,
+  ) async {
+    final grayInput = _convertCameraImage(image, camera,
+        grayscaleOnly: true, rotation: rotation);
+    if (grayInput == null) return null;
+    final recognized = await _textRecognizer.processImage(grayInput);
+
+    OcrExtraction? result;
+    if (recognized.blocks.isNotEmpty) {
+      final allText = recognized.blocks.map((b) => b.text).join(' | ');
+      if (debugMode) debugPrint('OCR raw [${rotation.name}]: $allText');
+      final allTextLower = allText.toLowerCase();
+      final allLines = <String>[];
+      final blocks = recognized.blocks.toList()
+        ..sort((a, b) => b.boundingBox.top.compareTo(a.boundingBox.top));
+      for (final block in blocks) {
+        for (final line in block.lines) {
+          allLines.add(line.text);
+        }
+      }
+      result = _extract(allLines, allTextLower, recognized);
+    }
+
+    // Color fallback if grayscale found no names — same rotation throughout
+    if (result != null && result.namesFound.isEmpty) {
+      final colorInput = _convertCameraImage(image, camera, rotation: rotation);
+      if (colorInput != null) {
+        final colorRecognized = await _textRecognizer.processImage(colorInput);
+        if (colorRecognized.blocks.isNotEmpty) {
+          final colorText = colorRecognized.blocks.map((b) => b.text).join(' | ');
+          if (debugMode) debugPrint('OCR color fallback [${rotation.name}]: $colorText');
+          final colorLower = colorText.toLowerCase();
+          final colorLines = <String>[];
+          for (final block in colorRecognized.blocks) {
+            for (final line in block.lines) {
+              colorLines.add(line.text);
+            }
+          }
+          final colorExtraction = _extract(colorLines, colorLower, colorRecognized);
+          if (colorExtraction.namesFound.isNotEmpty) {
+            result = OcrExtraction(
+              setCode: result.setCode ?? colorExtraction.setCode,
+              collectorNumber: result.collectorNumber ?? colorExtraction.collectorNumber,
+              cnSuffix: result.cnSuffix ?? colorExtraction.cnSuffix,
+              cnRaw: result.cnRaw ?? colorExtraction.cnRaw,
+              cnHasSetPrefix: result.cnHasSetPrefix || colorExtraction.cnHasSetPrefix,
+              namesFound: {...result.namesFound, ...colorExtraction.namesFound},
+              keywordsFound: {...result.keywordsFound, ...colorExtraction.keywordsFound},
+              typesFound: {...result.typesFound, ...colorExtraction.typesFound},
+              regionsFound: {...result.regionsFound, ...colorExtraction.regionsFound},
+              manaCost: result.manaCost ?? colorExtraction.manaCost,
+              rawTextLower: '${result.rawTextLower} ${colorExtraction.rawTextLower}',
+              fuzzyTextLower: '${result.fuzzyTextLower} ${colorExtraction.fuzzyTextLower}',
+              softSetHint: result.softSetHint ?? colorExtraction.softSetHint,
+              manaBox: result.manaBox ?? colorExtraction.manaBox,
+              typeBox: result.typeBox ?? colorExtraction.typeBox,
+              nameBox: result.nameBox ?? colorExtraction.nameBox,
+              cnBox: result.cnBox ?? colorExtraction.cnBox,
+              promoDetected: result.promoDetected || colorExtraction.promoDetected,
+            );
+          }
+        }
+      }
+    }
+
+    return result;
+  }
+
   /// Process a camera image. Returns best OcrMatch or null.
-  /// Set [tryFlip] to attempt 180° rotation on failure (slower, use sparingly).
+  /// Set [tryFlip] to attempt all 3 alternative rotations (180° upside-down +
+  /// 0°/270° landscape battlefields). Cheap — only metadata changes, no pixel
+  /// manipulation.
   Future<OcrMatch?> processImage(CameraImage image, CameraDescription camera, {bool tryFlip = false}) async {
     if (_isProcessing) return null;
     _isProcessing = true;
 
     try {
-      // Primary: grayscale — ML Kit reads stylized card names better without color
-      final grayInput = _convertCameraImage(image, camera, grayscaleOnly: true);
+      final defaultRot = _defaultRotation(camera);
+
+      // Primary: grayscale at default rotation — ML Kit reads stylized
+      // card names better without color
+      final grayInput = _convertCameraImage(image, camera,
+          grayscaleOnly: true, rotation: defaultRot);
       if (grayInput != null) {
         final grayRecognized = await _textRecognizer.processImage(grayInput);
         final grayMatch = await _analyze(grayRecognized, minScore: 35);
-        if (grayMatch != null) return grayMatch;
+        if (grayMatch != null) {
+          _lastWorkingRotation = defaultRot;
+          return grayMatch;
+        }
       }
 
-      // Fallback: color (native YUV) — in case grayscale misses something
-      final inputImage = _convertCameraImage(image, camera);
+      // Fallback: color (native YUV) at default rotation
+      final inputImage = _convertCameraImage(image, camera, rotation: defaultRot);
       if (inputImage != null) {
         final recognized = await _textRecognizer.processImage(inputImage);
         final match = await _analyze(recognized, minScore: 35);
-        if (match != null) return match;
+        if (match != null) {
+          _lastWorkingRotation = defaultRot;
+          return match;
+        }
       }
 
       if (!tryFlip) return null;
 
-      // Try 180° flip (upside-down cards)
-      final flipped = _convertCameraImageFlipped(image, camera);
-      if (flipped != null) {
-        final flippedRecognized = await _textRecognizer.processImage(flipped);
-        final flipMatch = await _analyze(flippedRecognized, minScore: 35);
-        if (flipMatch != null) return flipMatch;
-      }
-
-      // Try 90° CW (landscape battlefields) — physical pixel rotation
-      final rot90 = _convertRotated90CW(image, camera);
-      if (rot90 != null) {
-        final rot90Recognized = await _textRecognizer.processImage(rot90);
-        final rot90Match = await _analyze(rot90Recognized, minScore: 25);
-        if (rot90Match != null) return rot90Match;
+      // Alt rotations: 180° upside-down + 0°/270° landscape battlefields.
+      // Grayscale only (these are already low-confidence fallbacks) and lower
+      // minScore=25 since rotated reads are less complete.
+      for (final altRot in _altRotations(defaultRot)) {
+        final altInput = _convertCameraImage(image, camera,
+            grayscaleOnly: true, rotation: altRot);
+        if (altInput == null) continue;
+        final altRecognized = await _textRecognizer.processImage(altInput);
+        final altMatch = await _analyze(altRecognized, minScore: 25);
+        if (altMatch != null) {
+          _lastWorkingRotation = altRot;
+          if (debugMode) {
+            debugPrint('OCR: matched at rotation ${altRot.name} (score=${altMatch.score})');
+          }
+          return altMatch;
+        }
       }
 
       return null;
@@ -840,9 +864,19 @@ class OcrService {
   // ── Camera image conversion ──
   // ══════════════════════════════════════════════
 
-  InputImage? _convertCameraImage(CameraImage image, CameraDescription camera, {bool grayscaleOnly = false}) {
-    final rotation = InputImageRotationValue.fromRawValue(camera.sensorOrientation);
-    if (rotation == null) return null;
+  /// Convert a CameraImage to an ML Kit InputImage.
+  ///
+  /// [rotation] overrides the rotation metadata. If null, the camera's sensor
+  /// orientation is used (= upright portrait reading on iOS where sensor=90°).
+  /// Different rotation values reorient ML Kit's text recognition WITHOUT any
+  /// pixel manipulation — used to handle upside-down cards (180°) and
+  /// landscape battlefields held in portrait holders (0° / 270°).
+  InputImage? _convertCameraImage(CameraImage image, CameraDescription camera, {
+    bool grayscaleOnly = false,
+    InputImageRotation? rotation,
+  }) {
+    final rot = rotation ?? InputImageRotationValue.fromRawValue(camera.sensorOrientation);
+    if (rot == null) return null;
     if (image.planes.isEmpty) return null;
 
     if (grayscaleOnly) {
@@ -867,7 +901,7 @@ class OcrService {
         bytes: bgra,
         metadata: InputImageMetadata(
           size: Size(width.toDouble(), height.toDouble()),
-          rotation: rotation,
+          rotation: rot,
           format: InputImageFormat.bgra8888,
           bytesPerRow: width * 4,
         ),
@@ -892,115 +926,30 @@ class OcrService {
       bytes: bytes,
       metadata: InputImageMetadata(
         size: Size(image.width.toDouble(), image.height.toDouble()),
-        rotation: rotation,
+        rotation: rot,
         format: format,
         bytesPerRow: image.planes.first.bytesPerRow,
       ),
     );
   }
 
-  /// Physically rotate Y-plane 90° CW for landscape battlefield detection.
-  /// Transposes rows↔cols: pixel at (x,y) moves to (height-1-y, x).
-  InputImage? _convertRotated90CW(CameraImage image, CameraDescription camera) {
-    final rotation = InputImageRotationValue.fromRawValue(camera.sensorOrientation);
-    if (rotation == null) return null;
-    if (image.planes.isEmpty) return null;
-    final format = InputImageFormatValue.fromRawValue(image.format.raw);
-    if (format == null) return null;
-
-    final width = image.width;
-    final height = image.height;
-    final yPlane = image.planes.first;
-    final yBytes = yPlane.bytes;
-    final bytesPerRow = yPlane.bytesPerRow;
-
-    // After 90° CW: new dimensions are height × width
-    final newWidth = height;
-    final newHeight = width;
-    final rotated = Uint8List(newWidth * newHeight);
-
-    for (int y = 0; y < height; y++) {
-      final srcRow = y * bytesPerRow;
-      for (int x = 0; x < width; x++) {
-        // 90° CW: (x, y) → (height-1-y, x) in new image
-        // new image: row = x, col = height-1-y
-        final dstIdx = x * newWidth + (height - 1 - y);
-        if (srcRow + x < yBytes.length && dstIdx < rotated.length) {
-          rotated[dstIdx] = yBytes[srcRow + x];
-        }
-      }
-    }
-
-    // For multi-plane YUV: only Y is rotated, UV planes passed as-is
-    // ML Kit primarily uses Y for text recognition
-    final Uint8List allBytes;
-    if (image.planes.length > 1) {
-      final buffer = WriteBuffer();
-      buffer.putUint8List(rotated);
-      for (int i = 1; i < image.planes.length; i++) {
-        buffer.putUint8List(image.planes[i].bytes);
-      }
-      allBytes = buffer.done().buffer.asUint8List();
-    } else {
-      allBytes = rotated;
-    }
-
-    return InputImage.fromBytes(
-      bytes: allBytes,
-      metadata: InputImageMetadata(
-        size: Size(newWidth.toDouble(), newHeight.toDouble()),
-        rotation: rotation,
-        format: format,
-        bytesPerRow: newWidth,
-      ),
-    );
+  /// Default rotation = camera sensor orientation (iOS rear: 90°).
+  InputImageRotation _defaultRotation(CameraDescription camera) {
+    return InputImageRotationValue.fromRawValue(camera.sensorOrientation)
+        ?? InputImageRotation.rotation90deg;
   }
 
-  /// Pixel-level 180° flip for upside-down cards.
-  InputImage? _convertCameraImageFlipped(CameraImage image, CameraDescription camera) {
-    final rotation = InputImageRotationValue.fromRawValue(camera.sensorOrientation);
-    if (rotation == null) return null;
-    if (image.planes.isEmpty) return null;
-
-    final format = InputImageFormatValue.fromRawValue(image.format.raw);
-    if (format == null) return null;
-
-    final width = image.width;
-    final height = image.height;
-    final yPlane = image.planes.first;
-    final yBytes = yPlane.bytes;
-    final bytesPerRow = yPlane.bytesPerRow;
-
-    final flipped = Uint8List(yBytes.length);
-    for (int y = 0; y < height; y++) {
-      final srcRow = y * bytesPerRow;
-      final dstRow = (height - 1 - y) * bytesPerRow;
-      for (int x = 0; x < bytesPerRow; x++) {
-        flipped[dstRow + (bytesPerRow - 1 - x)] = yBytes[srcRow + x];
-      }
-    }
-
-    final Uint8List allBytes;
-    if (image.planes.length > 1) {
-      final buffer = WriteBuffer();
-      buffer.putUint8List(flipped);
-      for (int i = 1; i < image.planes.length; i++) {
-        buffer.putUint8List(image.planes[i].bytes);
-      }
-      allBytes = buffer.done().buffer.asUint8List();
-    } else {
-      allBytes = flipped;
-    }
-
-    return InputImage.fromBytes(
-      bytes: allBytes,
-      metadata: InputImageMetadata(
-        size: Size(width.toDouble(), height.toDouble()),
-        rotation: rotation,
-        format: format,
-        bytesPerRow: bytesPerRow,
-      ),
-    );
+  /// Alternative rotations to try when the default fails. Priority order:
+  /// 180° (upside-down — most common alternative) → 0° → 270° (landscape
+  /// battlefields in either orientation). The default itself is excluded.
+  Iterable<InputImageRotation> _altRotations(InputImageRotation defaultRot) {
+    const priority = [
+      InputImageRotation.rotation180deg, // upside-down portrait
+      InputImageRotation.rotation0deg,   // landscape battlefield CW
+      InputImageRotation.rotation270deg, // landscape battlefield CCW
+      InputImageRotation.rotation90deg,
+    ];
+    return priority.where((r) => r != defaultRot);
   }
 
   void dispose() {

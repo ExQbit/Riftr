@@ -543,11 +543,12 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
       return;
     }
 
-    // SCANNING state: extract only (no scoring per frame), accumulate
-    // Every 2nd scanning frame: also try 90° rotation for landscape battlefields
-    final tryRotate = _scanFrameCount % 2 == 0;
+    // SCANNING state: extract only (no scoring per frame), accumulate.
+    // Rotation handled inside OcrService via _lastWorkingRotation +
+    // alt-rotation auto-discovery (covers landscape battlefields and
+    // multi-card scans where each card may be a different orientation).
     final cycleAtStart = _scanCycleId;
-    _ocr.extractFrame(image, _controller!.description, tryRotate90: tryRotate).then((extraction) async {
+    _ocr.extractFrame(image, _controller!.description).then((extraction) async {
       if (!mounted || _state != ScanState.scanning || _scanCycleId != cycleAtStart) return;
 
       _scanFrameCount++;
