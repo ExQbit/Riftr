@@ -124,6 +124,15 @@ service cloud.firestore {
         allow read, write: if false; // Cloud Functions only
       }
 
+      // Scanner-event telemetry (Phase B 2026-05-02). One doc per UTC day
+      // with anonymized counter increments — no PII, no card IDs, no user
+      // IDs. Auth'd clients can write (via FieldValue.increment); read is
+      // CF/admin-only since the aggregation is for engineering, not users.
+      match /scanner_metrics/{dayId} {
+        allow read: if false;
+        allow write: if isAuth();
+      }
+
       // ── Meta Decks (tournament decks) ──
       match /meta_decks/{deckId} {
         allow read: if isAuth();

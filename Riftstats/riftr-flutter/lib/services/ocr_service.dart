@@ -46,10 +46,14 @@ class OcrService {
 
   /// Identifier for the rotation/conversion strategy that most recently
   /// succeeded. `null` means default (metadata sensorOrientation, no physical
-  /// rotation). Other values: "metadata-0deg", "physical-90cw", "physical-180"
+  /// rotation). Other values: "physical-180", "physical-90cw", "physical-270cw"
   /// — used by extractFrame to skip straight to the strategy that worked in
   /// WAITING (cheaper than re-discovering each SCANNING frame). Reset on MOTION.
   String? _lastWorkingAltStrategy;
+
+  /// Read-only accessor for telemetry. Returns 'default' when no alt strategy
+  /// was needed (= upright portrait, the most common case).
+  String get lastWorkingStrategy => _lastWorkingAltStrategy ?? 'default';
 
   /// Reset sticky state when scanning a new card (sticky mana, last extraction,
   /// and the remembered alt-rotation strategy — battlefield-detected rotation

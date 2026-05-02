@@ -22,6 +22,7 @@ import '../services/mana_classifier_service.dart';
 import '../services/card_present_classifier_service.dart';
 import '../services/card_name_classifier_service.dart';
 import '../services/training_frame_service.dart';
+import '../services/scan_telemetry_service.dart';
 import '../theme/app_theme.dart';
 import '../theme/app_components.dart';
 import '../widgets/card_image.dart';
@@ -199,6 +200,10 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
   /// STABLE — without a visible indicator the user sees a frozen frame
   /// and might think the scan failed. Renders a subtle spinner overlay.
   bool _identifying = false;
+
+  /// Timestamp set at start of _acceptMatch — used to compute the latency
+  /// from match-found to card-added (telemetry).
+  DateTime? _acceptMatchStartedAt;
 
   // ── Multi-frame cumulative scoring ──
   int _scanCycleId = 0; // incremented each new scan cycle to invalidate stale callbacks
@@ -802,6 +807,9 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
         } else {
           debugPrint('Scanner: No match after $_scanFrameCount frames (cumBest=$bestScore)');
           _debugOcr = 'no match (cum=$bestScore)';
+          // Telemetry — record the timeout with cumScore so we can see how
+          // often scans fail and how close they got to a match.
+          ScanTelemetryService.instance.recordScanTimeout(cumScore: bestScore);
           // Negative training data now comes from rect crops (automatic)
           _setState(ScanState.stable);
         }
@@ -823,6 +831,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     if (_scanPaused) return; // user is editing — drop stale match
     _setState(ScanState.stable);
     HapticFeedback.mediumImpact();
+    _acceptMatchStartedAt = DateTime.now(); // for telemetry latency
     // Show "identifying" spinner while async variant-resolution runs
     // (TFLite classifiers + pHash compute() — typically 300-500ms).
     // Cleared in finally so any early return still clears the spinner.
@@ -893,7 +902,8 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
                 '${resolvedCard.setId}#${resolvedCard.collectorNumber} (suffix=$_cumCNSuffix)');
           }
           final resolvedAlts = allVariants.where((c) => c.id != resolvedCard.id).toList();
-          _addCard(resolvedCard, resolvedAlts, confidence: match.confidence);
+          _addCard(resolvedCard, resolvedAlts,
+              confidence: match.confidence, variantPath: 'cn_suffix');
           return;
         }
       }
@@ -914,7 +924,8 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
                   '${resolvedCard.setId}#${resolvedCard.collectorNumber} (CHAMPION edition)');
             }
             final resolvedAlts = allVariants.where((c) => c.id != resolvedCard.id).toList();
-            _addCard(resolvedCard, resolvedAlts, confidence: match.confidence);
+            _addCard(resolvedCard, resolvedAlts,
+                confidence: match.confidence, variantPath: 'badge_ocr_champion');
             return;
           }
         }
@@ -926,7 +937,8 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
               '${resolvedCard.setId}#${resolvedCard.collectorNumber} (PROMO detected)');
         }
         final resolvedAlts = allVariants.where((c) => c.id != resolvedCard.id).toList();
-        _addCard(resolvedCard, resolvedAlts, confidence: match.confidence);
+        _addCard(resolvedCard, resolvedAlts,
+            confidence: match.confidence, variantPath: 'badge_ocr');
         return;
       }
     }
@@ -1194,7 +1206,8 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
                   debugPrint('TFLite badge: resolved to ${resolvedCard.setId}#${resolvedCard.collectorNumber} (CHAMPION)');
                 }
                 final resolvedAlts = allVariants.where((c) => c.id != resolvedCard.id).toList();
-                _addCard(resolvedCard, resolvedAlts, confidence: match.confidence);
+                _addCard(resolvedCard, resolvedAlts,
+                    confidence: match.confidence, variantPath: 'promo_cnn_champion');
                 return;
               }
             }
@@ -1205,7 +1218,8 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
               debugPrint('TFLite badge: resolved to ${resolvedCard.setId}#${resolvedCard.collectorNumber}');
             }
             final resolvedAlts = allVariants.where((c) => c.id != resolvedCard.id).toList();
-            _addCard(resolvedCard, resolvedAlts, confidence: match.confidence);
+            _addCard(resolvedCard, resolvedAlts,
+                confidence: match.confidence, variantPath: 'promo_cnn');
             return;
           }
         }
@@ -1278,6 +1292,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     // (= no actual harm), but the compute is wasted. Battlefield variant
     // detection falls cleanly to OCR-based paths (CN-suffix, badge OCR).
     final skipPhashForBattlefield = match.card.type?.toLowerCase() == 'battlefield';
+    bool phashChangedVariant = false;
     if (resolutionVariants.length > 1 && computeResult != null && !skipPhashForBattlefield) {
       // Constrain pHash to variants matching the confirmed set+CN.
       final confirmedSet = _cumSetCode;
@@ -1325,6 +1340,7 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
         if (r.bestId != null && r.bestId != match.card.id) {
           final bestCard = allVariants.firstWhere((c) => c.id == r.bestId, orElse: () => match.card);
           resolvedCard = bestCard;
+          phashChangedVariant = true;
         }
       }
     }
@@ -1339,7 +1355,9 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     // promo-CNN-trigger), so CNN cross-validation matters most here. Earlier
     // exits (CN-suffix, badge-OCR, promo-CNN branches) keep raw match.confidence
     // since those resolved via strong specific signals.
-    _addCard(resolvedCard, resolvedAlts, confidence: finalConfidence);
+    _addCard(resolvedCard, resolvedAlts,
+        confidence: finalConfidence,
+        variantPath: phashChangedVariant ? 'phash' : 'default');
   }
 
   // ══════════════════════════════════════════════
@@ -2129,7 +2147,8 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
   /// Add card to scanned list — every scan gets its own entry.
   /// Merging happens later in ScanResultsScreen.
   void _addCard(RiftCard card, List<RiftCard> alternatives,
-      {ScanConfidence confidence = ScanConfidence.high}) {
+      {ScanConfidence confidence = ScanConfidence.high,
+      String variantPath = 'default'}) {
     // Last-line defense — if user opened the editor sheet between OCR
     // dispatch and this call, drop the stale scan instead of duplicating.
     if (_scanPaused) return;
@@ -2141,6 +2160,22 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
         confidence: confidence,
       ));
     });
+
+    // Telemetry — fire-and-forget, no PII. Records strategy/confidence/
+    // type/variant-path/latency so we can data-drive future optimizations
+    // (e.g., "30% of scans use physical-180 → upside-down is common, worth
+    // optimizing" or "battlefield variant detection rarely picks promo →
+    // user mostly scans base, OCR fallback works").
+    final latencyMs = _acceptMatchStartedAt != null
+        ? DateTime.now().difference(_acceptMatchStartedAt!).inMilliseconds
+        : 0;
+    ScanTelemetryService.instance.recordScanSuccess(
+      strategy: _ocr.lastWorkingStrategy,
+      confidence: confidence.name,
+      cardType: card.type?.toLowerCase() ?? 'unknown',
+      variantPath: variantPath,
+      latencyMs: latencyMs,
+    );
   }
 
   /// Show bottom sheet to edit a scanned card entry (variant, foil, quantity).
@@ -2226,6 +2261,13 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
                       style: AppTextStyles.micro.copyWith(color: AppColors.textMuted)),
                     trailing: isSelected ? Icon(Icons.check, color: AppColors.amber400, size: 20) : null,
                     onTap: () {
+                      // Telemetry: actual variant change (skip if user
+                      // re-tapped the already-selected one).
+                      if (card.id != entry.card.id) {
+                        ScanTelemetryService.instance.recordVariantOverride(
+                          fromCardType: entry.card.type?.toLowerCase() ?? 'unknown',
+                        );
+                      }
                       setState(() {
                         entry.card = card;
                         entry.alternatives = allVariants.where((c) => c.id != card.id).toList();
