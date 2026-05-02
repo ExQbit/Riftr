@@ -40,6 +40,15 @@ class MarketListing {
   /// USt-IdNr des gewerblichen Verkäufers, snapshot zur Listing-Zeit.
   /// DSA Art. 30 / § 5 DDG Pflichtinfo. Nur für commercial sellers.
   final String? sellerVatId;
+
+  /// Stripe-Onboarding-Snapshot zur Listing-Zeit (2026-05-02). Buyer-Side-
+  /// Listing-Query filtert `sellerStripeReady == false` raus damit Käufer
+  /// keine Listings sieht die er nicht kaufen kann. Propagated vom
+  /// `syncSellerProfileToPlayerMirror`-Trigger sobald der Seller Stripe
+  /// fertig onboarded. Default true: legacy listings ohne dieses Feld
+  /// werden NICHT versteckt (sonst verschwinden alle bestehenden Listings
+  /// bei Deploy).
+  final bool sellerStripeReady;
   final double price;
   final CardCondition condition;
   final int quantity;
@@ -64,6 +73,7 @@ class MarketListing {
     this.sellerIsCommercial = false,
     this.sellerLegalEntityName,
     this.sellerVatId,
+    this.sellerStripeReady = true,
     required this.price,
     required this.condition,
     this.quantity = 1,
@@ -177,6 +187,10 @@ class MarketListing {
       sellerIsCommercial: d['sellerIsCommercial'] as bool? ?? false,
       sellerLegalEntityName: d['sellerLegalEntityName'] as String?,
       sellerVatId: d['sellerVatId'] as String?,
+      // Default true so legacy listings without this field stay visible.
+      // The CF write happens at populateListingSellerStats — once that
+      // has run for a listing, the field is explicitly set.
+      sellerStripeReady: d['sellerStripeReady'] as bool? ?? true,
       price: (d['price'] as num?)?.toDouble() ?? 0,
       condition: CardCondition.values.firstWhere(
         (c) => c.name == d['condition'],

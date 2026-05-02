@@ -8889,6 +8889,13 @@ exports.populateListingSellerStats = onDocumentCreated(
 
       const updateData = {
         sellerIsCommercial,
+        // Stripe-Onboarding-Snapshot (BACKLOG, 2026-05-02): Buyer-Side-
+        // Listing-Query filtert listings mit `sellerStripeReady === false`
+        // raus, damit Buyer keine Listings sieht die er nicht kaufen
+        // kann. Wird auf true gesetzt sobald der Seller Stripe-Onboarding
+        // fertig hat — der propagateSellerStripeChange Trigger updated
+        // dann ALLE aktiven Listings dieses Sellers in einem Batch.
+        sellerStripeReady: seller.stripeOnboarded === true,
       };
       if (!(sellerRating === 0 && sellerSales === 0)) {
         updateData.sellerRating = sellerRating;
@@ -8994,6 +9001,38 @@ exports.syncSellerProfileToPlayerMirror = onDocumentWritten(
               after.vatId,
               wasVolumeSuspended,
             ),
+          );
+        }
+      }
+
+      // Stripe-onboarded status transition (2026-05-02, S2 from
+      // Stripe-not-ready UX sprint): when the seller's stripeOnboarded
+      // flag changes, propagate the new ready-state to ALL of their
+      // active listings so the buyer-side query reflects reality.
+      //  - false → true: listings become discoverable
+      //  - true → false: listings get hidden again (account suspended,
+      //    capabilities revoked, etc.)
+      const wasStripeReady = before.stripeOnboarded === true;
+      const isStripeReady = after.stripeOnboarded === true;
+      if (wasStripeReady !== isStripeReady) {
+        // Single-field-query (sellerId only) + client-side status
+        // filter, to avoid needing a composite index on listings.
+        const listingsSnap = await db.collection("artifacts").doc(APP_ID)
+          .collection("listings")
+          .where("sellerId", "==", uid)
+          .get();
+        const propagable = listingsSnap.docs.filter((d) => {
+          const s = d.data().status;
+          return s === "active" || s === "reserved";
+        });
+        if (propagable.length > 0) {
+          const batch = db.batch();
+          for (const doc of propagable) {
+            batch.update(doc.ref, { sellerStripeReady: isStripeReady });
+          }
+          await batch.commit();
+          console.log(
+            `syncSellerProfileToPlayerMirror: propagated sellerStripeReady=${isStripeReady} to ${propagable.length} listings for ${uid}`,
           );
         }
       }

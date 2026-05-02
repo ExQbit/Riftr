@@ -21,11 +21,19 @@ class ListingService extends ChangeNotifier {
   /// The snapshot stream won't overwrite these until the protection expires.
   final Map<String, ({MarketListing listing, DateTime expiresAt})> _fresh = {};
 
+  /// Buyer-side visibility: listing must be active AND its seller's
+  /// Stripe-Connect-Onboarding fertig. Sonst kann der Buyer nicht
+  /// kaufen → wir verstecken das Listing komplett (Cardmarket-Pattern).
+  /// `myListings` (owner-side) bypassed diesen Filter — Seller sieht
+  /// die eigenen Listings auch im "Setting-up-payouts"-Zustand.
+  bool _visibleToBuyers(MarketListing l) =>
+      l.status == 'active' && l.sellerStripeReady;
+
   List<MarketListing> get allActive =>
-      _listings.where((l) => l.status == 'active').toList();
+      _listings.where(_visibleToBuyers).toList();
 
   List<MarketListing> getListings(String cardId) =>
-      _listings.where((l) => l.cardId == cardId && l.status == 'active').toList()
+      _listings.where((l) => l.cardId == cardId && _visibleToBuyers(l)).toList()
         ..sort((a, b) => a.price.compareTo(b.price));
 
   /// Active listings for the given card AND all game-equivalent reprints
@@ -46,13 +54,13 @@ class ListingService extends ChangeNotifier {
       acceptCheaperArt: acceptCheaperArt,
     ).toSet();
     return _listings
-        .where((l) => equivalents.contains(l.cardId) && l.status == 'active')
+        .where((l) => equivalents.contains(l.cardId) && _visibleToBuyers(l))
         .toList()
       ..sort((a, b) => a.price.compareTo(b.price));
   }
 
   int getListingCount(String cardId) =>
-      _listings.where((l) => l.cardId == cardId && l.status == 'active').length;
+      _listings.where((l) => l.cardId == cardId && _visibleToBuyers(l)).length;
 
   /// Active listing count across equivalent cards (cross-set).
   int getListingCountForGameplayCard(
@@ -64,7 +72,7 @@ class ListingService extends ChangeNotifier {
       acceptCheaperArt: acceptCheaperArt,
     ).toSet();
     return _listings
-        .where((l) => equivalents.contains(l.cardId) && l.status == 'active')
+        .where((l) => equivalents.contains(l.cardId) && _visibleToBuyers(l))
         .length;
   }
 

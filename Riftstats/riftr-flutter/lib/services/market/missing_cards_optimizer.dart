@@ -712,6 +712,10 @@ class MissingCardsOptimizer {
 
   static bool _passesFilters(MarketListing l, SmartCartFilters f, String? uid) {
     if (l.status != 'active') return false;
+    // Stripe-Onboarding (2026-05-02): exclude listings whose seller
+    // hasn't completed Stripe-Connect-Onboarding — Smart Cart cannot
+    // auto-pick a listing that would fail at checkout.
+    if (!l.sellerStripeReady) return false;
     if (uid != null && l.sellerId == uid) return false;
     if (l.availableQty <= 0) return false;
     // Condition: smaller enum index = better. Reject if worse than min.

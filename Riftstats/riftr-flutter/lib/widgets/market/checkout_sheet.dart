@@ -382,6 +382,15 @@ class _CheckoutSheetState extends State<CheckoutSheet> {
         String msg = 'Purchase failed';
         if (e is FirebaseFunctionsException) {
           msg = e.message ?? msg;
+          // Map technical Stripe-not-onboarded message to a friendly
+          // sentence — the CF returns the raw flag values which are
+          // confusing for buyers. The real fix (S2-S5) hides such
+          // listings from buyer queries entirely.
+          if (msg.contains('Stripe account is not fully onboarded') ||
+              msg.contains('charges_enabled=false')) {
+            msg = 'This seller is still setting up payouts. '
+                'Please try again later.';
+          }
           if (e.code == 'unknown') {
             msg = 'No internet connection. Please check your network and try again.';
           }
@@ -646,15 +655,9 @@ class _CheckoutSheetState extends State<CheckoutSheet> {
             ),
             const SizedBox(height: AppSpacing.sm),
 
-            // Error message
-            if (_error != null)
-              Padding(
-                padding: const EdgeInsets.only(bottom: AppSpacing.sm),
-                child: Text(
-                  _error!,
-                  style: AppTextStyles.bodySmall.copyWith(color: AppColors.loss),
-                ),
-              ),
+            // Error message rendered ONLY by the Positioned overlay above
+            // the Pay button (line ~717). Avoid the in-scroll duplicate
+            // we used to have here — same _error showed up twice.
 
           ],
         ),
