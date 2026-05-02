@@ -131,16 +131,13 @@ class OcrService {
       OcrExtraction? result = await _runExtractionWithStrategy(
           image, camera, _lastWorkingAltStrategy);
 
-      // Trigger alt rotations whenever the primary didn't identify a card.
-      // Length-of-rawText is NOT a useful trigger here: an upside-down
-      // portrait card may produce 50+ chars of garbled-but-non-empty text
-      // that fools the length check (beta-test 2026-05-02 evidence).
-      // What matters: did we find a known card name or a CN? If not, try alts.
+      // Trigger alt rotations whenever primary didn't identify a card.
+      // What matters is: did we find a known card name or a CN? If not, try
+      // alts — regardless of how much garbled text was returned.
       final primaryFailed = result == null ||
           (result.namesFound.isEmpty && result.collectorNumber == null);
       if (primaryFailed) {
-        const altStrategies = ['metadata-0deg', 'physical-90cw', 'physical-180'];
-        for (final strat in altStrategies) {
+        for (final strat in _altStrategies) {
           if (strat == _lastWorkingAltStrategy) continue;
           final altResult = await _runExtractionWithStrategy(image, camera, strat);
           if (altResult != null &&
@@ -167,10 +164,10 @@ class OcrService {
   }
 
   /// Build the InputImage for a given strategy:
-  ///   null            → default (metadata sensorOrientation, no physical work)
-  ///   "metadata-0deg" → metadata rotation0deg, no physical work
-  ///   "physical-90cw" → physical 90° CW Y-plane rotation + metadata 0deg
-  ///   "physical-180"  → physical 180° Y-plane rotation + metadata 0deg
+  ///   null             → default (metadata sensorOrientation, no physical work)
+  ///   "physical-180"   → 180° Y-plane rotation (upside-down portrait)
+  ///   "physical-90cw"  → 90° CW Y-plane rotation (battlefield direction A)
+  ///   "physical-270cw" → 270° CW = 90° CCW Y-plane rotation (battlefield direction B)
   InputImage? _buildInputForStrategy(
     CameraImage image,
     CameraDescription camera,
@@ -180,17 +177,25 @@ class OcrService {
     switch (strategy) {
       case null:
         return _convertCameraImage(image, camera, grayscaleOnly: grayscaleOnly);
-      case 'metadata-0deg':
-        return _convertCameraImage(image, camera,
-            grayscaleOnly: grayscaleOnly,
-            rotation: InputImageRotation.rotation0deg);
-      case 'physical-90cw':
-        return _convertPhysicallyRotated(image, 90);
       case 'physical-180':
         return _convertPhysicallyRotated(image, 180);
+      case 'physical-90cw':
+        return _convertPhysicallyRotated(image, 90);
+      case 'physical-270cw':
+        return _convertPhysicallyRotated(image, 270);
     }
     return null;
   }
+
+  /// Alt-rotation strategies, in priority order. Empirically confirmed
+  /// (beta-test 2026-05-02): physical-180 handles upside-down portrait.
+  /// physical-90cw / physical-270cw cover the two ways a battlefield card
+  /// can be inserted into a portrait holder.
+  static const _altStrategies = [
+    'physical-180',
+    'physical-90cw',
+    'physical-270cw',
+  ];
 
   /// Run a single grayscale+color extraction pass with the given strategy.
   Future<OcrExtraction?> _runExtractionWithStrategy(
@@ -199,8 +204,17 @@ class OcrService {
     String? strategy,
   ) async {
     final grayInput = _buildInputForStrategy(image, camera, strategy);
-    if (grayInput == null) return null;
+    if (grayInput == null) {
+      if (debugMode) {
+        debugPrint('OCR extract: ${strategy ?? "default"} → null input (skip)');
+      }
+      return null;
+    }
     final recognized = await _textRecognizer.processImage(grayInput);
+    if (debugMode) {
+      debugPrint(
+          'OCR extract: ${strategy ?? "default"} → ${recognized.blocks.length} blocks');
+    }
 
     OcrExtraction? result;
     if (recognized.blocks.isNotEmpty) {
@@ -310,34 +324,27 @@ class OcrService {
 
       if (!tryFlip) return null;
 
-      // Alt rotations — hybrid metadata + physical fallback because empirical
-      // evidence (beta-test 2026-05-02) shows ML Kit's rotation metadata for
-      // BGRA8888 may not be honored by the iOS plugin. Order trades cost vs.
-      // expected hit-rate:
-      //   1. metadata rotation0deg (cheap, works if plugin honors metadata)
-      //      — battlefield held with content's natural-top on device's left
-      //   2. physical 90° CW + rotation0deg (one Y-plane copy + rotate)
-      //      — upside-down portrait card
-      //   3. physical 180° + rotation0deg
-      //      — battlefield held with content's natural-top on device's right
-      // All use grayscale + minScore=25 (lenient since these are low-conf paths).
-      final altAttempts = <(InputImage? Function(), String)>[
-        (() => _convertCameraImage(image, camera,
-            grayscaleOnly: true, rotation: InputImageRotation.rotation0deg), 'metadata-0deg'),
-        (() => _convertPhysicallyRotated(image, 90), 'physical-90cw'),
-        (() => _convertPhysicallyRotated(image, 180), 'physical-180'),
-      ];
-
-      for (final (builder, label) in altAttempts) {
-        final altInput = builder();
-        if (altInput == null) continue;
+      // Alt rotations — physical pixel rotation since ML Kit's rotation
+      // metadata isn't reliable on iOS for BGRA8888 (beta-test 2026-05-02).
+      // Order: physical-180 (upside-down portrait, confirmed working) →
+      // physical-90cw + physical-270cw (battlefield in either direction).
+      // Debug logs every attempt regardless of outcome so failures are
+      // diagnosable in beta-tester logs.
+      for (final strategy in _altStrategies) {
+        final altInput = _buildInputForStrategy(image, camera, strategy);
+        if (altInput == null) {
+          if (debugMode) debugPrint('OCR alt: $strategy → null input (skip)');
+          continue;
+        }
         final altRecognized = await _textRecognizer.processImage(altInput);
+        if (debugMode) {
+          debugPrint('OCR alt: $strategy → ${altRecognized.blocks.length} blocks');
+        }
         final altMatch = await _analyze(altRecognized, minScore: 25);
         if (altMatch != null) {
-          // Save which strategy worked so SCANNING extractFrame can reuse.
-          _lastWorkingAltStrategy = label;
+          _lastWorkingAltStrategy = strategy;
           if (debugMode) {
-            debugPrint('OCR: matched via "$label" (score=${altMatch.score})');
+            debugPrint('OCR: matched via "$strategy" (score=${altMatch.score})');
           }
           return altMatch;
         }
@@ -901,36 +908,30 @@ class OcrService {
     );
   }
 
-  /// Physically rotate the camera Y-plane by [degrees] CW (90 or 180), emit
-  /// BGRA grayscale with rotation0deg metadata.
+  /// Physically rotate the camera Y-plane by [degrees] CW (90, 180, or 270),
+  /// emit BGRA grayscale with rotation0deg metadata.
   ///
-  /// Why physical rotation: empirical evidence (beta-test logs showing the
-  /// exact same OCR output at all 4 rotation metadata values) suggests
-  /// google_mlkit_text_recognition on iOS may not honor the rotation
-  /// metadata reliably for BGRA8888 input. Physical pixel rotation
-  /// guarantees the buffer is upright when ML Kit processes it, regardless
-  /// of metadata interpretation.
+  /// Why physical rotation: ML Kit's rotation metadata isn't reliable on iOS
+  /// for BGRA8888 (beta-test 2026-05-02 evidence). Physical pixel rotation
+  /// guarantees the buffer is at the chosen orientation regardless of
+  /// metadata interpretation.
   ///
-  /// Math: sensor mounts the camera 90° CW from device-portrait → buffer
-  /// content is rotated by `(90 + cardOrientation) % 360` CW from upright.
-  /// We pre-rotate physically so `_runMetadataRotation0` lands at upright:
-  ///   - degrees=90 (CW): handles upside-down portrait card
-  ///                     (buffer at 270° → +90 = 360 = 0)
-  ///   - degrees=180:    handles battlefield held with name on the right
-  ///                     (buffer at 180° → +180 = 360 = 0)
-  /// The "battlefield with name on the left" case is covered by metadata-
-  /// rotation0deg without physical work (buffer already at 0).
+  /// Empirical mapping (from beta-test logs):
+  ///   - degrees=180: handles upside-down portrait card (Test 3 confirmed)
+  ///   - degrees=90 (CW):  one battlefield-in-portrait-holder direction
+  ///   - degrees=270 (CW = 90° CCW): the other battlefield direction
   InputImage? _convertPhysicallyRotated(CameraImage image, int degrees) {
     if (image.planes.isEmpty) return null;
-    if (degrees != 90 && degrees != 180) return null;
+    if (degrees != 90 && degrees != 180 && degrees != 270) return null;
 
     final yBytes = image.planes.first.bytes;
     final stride = image.planes.first.bytesPerRow;
     final w = image.width, h = image.height;
 
-    // Output dimensions: 90° swaps w↔h, 180° keeps them.
-    final ow = degrees == 90 ? h : w;
-    final oh = degrees == 90 ? w : h;
+    // Output dimensions: 90°/270° swap w↔h, 180° keeps them.
+    final isQuarter = degrees == 90 || degrees == 270;
+    final ow = isQuarter ? h : w;
+    final oh = isQuarter ? w : h;
 
     // Rotate + convert to BGRA in one pass.
     final bgra = Uint8List(ow * oh * 4);
@@ -938,13 +939,23 @@ class OcrService {
       final srcRow = y * stride;
       for (int x = 0; x < w; x++) {
         final v = yBytes[srcRow + x];
-        // 90° CW: source (x, y) → destination (h-1-y, x) in new coords.
-        // 180°:    source (x, y) → destination (w-1-x, h-1-y).
+        // Rotation maps source (x, y) → destination (col, row) in new buffer:
+        //   90° CW : (x, y) → (h-1-y, x)
+        //   180°    : (x, y) → (w-1-x, h-1-y)
+        //   270° CW : (x, y) → (y, w-1-x)   (= 90° CCW)
         final int dstIdx;
-        if (degrees == 90) {
-          dstIdx = (x * ow + (h - 1 - y)) * 4;
-        } else {
-          dstIdx = ((h - 1 - y) * ow + (w - 1 - x)) * 4;
+        switch (degrees) {
+          case 90:
+            dstIdx = (x * ow + (h - 1 - y)) * 4;
+            break;
+          case 180:
+            dstIdx = ((h - 1 - y) * ow + (w - 1 - x)) * 4;
+            break;
+          case 270:
+            dstIdx = ((w - 1 - x) * ow + y) * 4;
+            break;
+          default:
+            continue;
         }
         bgra[dstIdx] = v;
         bgra[dstIdx + 1] = v;
