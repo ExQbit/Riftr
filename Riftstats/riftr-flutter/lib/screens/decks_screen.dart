@@ -2099,10 +2099,22 @@ class _MetaDeckViewerState extends State<_MetaDeckViewer> with SingleTickerProvi
     super.initState();
     _fabAnim = AnimationController(vsync: this, duration: const Duration(milliseconds: 400));
     _load();
+    // Listen to collection changes so the "missing X cards" badge
+    // updates after the user adds cards via scanner / market / manual
+    // edit. Mirrors the listener pattern in _DeckEditorState — the
+    // viewer was missing this hook, so beta testers saw a stale
+    // missing-count after scanning their physical deck.
+    FirestoreCollectionService.instance.addListener(_refresh);
   }
 
+  void _refresh() { if (mounted) setState(() {}); }
+
   @override
-  void dispose() { _fabAnim.dispose(); super.dispose(); }
+  void dispose() {
+    FirestoreCollectionService.instance.removeListener(_refresh);
+    _fabAnim.dispose();
+    super.dispose();
+  }
 
   Future<void> _load() async {
     await CardService.loadCards();
