@@ -81,6 +81,20 @@ class ScanTelemetryService {
     });
   }
 
+  /// Record TFLite delegate initialization outcome. Lets us see the real-
+  /// world delegate success rate across beta-tester devices: how often
+  /// Core ML works on iPhones, NNAPI works on Android, where the CPU
+  /// fallback fires (= delegate init failed, model still loads but slower).
+  ///
+  /// [modelName] = e.g. 'card_name'; [path] = 'coreml' | 'nnapi' | 'cpu' |
+  /// 'cpu_fallback'.
+  void recordDelegateInit({required String modelName, required String path}) {
+    _writeUpdate({
+      'date': _todayKey(),
+      'delegate_${modelName}_$path': FieldValue.increment(1),
+    });
+  }
+
   String _latencyBucket(int ms) {
     if (ms < 500) return 'lt500';
     if (ms < 1000) return '500-1000';
