@@ -1131,13 +1131,18 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     }
 
     // ── TFLite Promo Badge Classifier ──
-    // Skip for runes — they have a completely different layout, the badge region
-    // at 38%X/88%Y captures unrelated content and causes false positives.
-    // Rune promos are still detected via badge OCR ("PROMO" text).
-    // Skip for runes — check both OCR-detected type AND the matched card's type
-    // (OCR might not have read "RUNE" in every scan session)
+    // Skip for runes AND battlefields — both have non-portrait layouts, so
+    // the badge region at 38%X/88%Y (defined for portrait cards) captures
+    // unrelated content and produces false positives.
+    //   - Runes: different artwork layout
+    //   - Battlefields: landscape; in portrait-holder the bbox contains
+    //     90°-rotated content, badge region misses the actual badge
+    // Promo variants for these card types are still detected via badge OCR
+    // ("PROMO" text) and CN-suffix when available.
     final skipPromoCnn = _cumTypes.contains('rune') ||
-        match.card.type?.toLowerCase() == 'rune';
+        _cumTypes.contains('battlefield') ||
+        match.card.type?.toLowerCase() == 'rune' ||
+        match.card.type?.toLowerCase() == 'battlefield';
     // Metal excluded (User-Request 2026-04-29) — never auto-pick metal as promo variant
     final promoIds = resolutionVariants.where((c) => c.isPromo).map((c) => c.id).toSet();
     if (!skipPromoCnn && promoIds.isNotEmpty && computeResult?.debugFullPixels != null && _promoClassifier.isReady) {
@@ -1265,7 +1270,15 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     // auf Metal switchen (User-Request 2026-04-29). Metal hat anderen Foil-
     // Finish + Gem-Layout, pHash-Score koennte zufaellig hoch sein → wuerde
     // sonst Metal als Match liefern obwohl User nicht-Metal gescannt hat.
-    if (resolutionVariants.length > 1 && computeResult != null) {
+    //
+    // Skip for battlefields: landscape cards in portrait holders produce
+    // a rotated-content-in-portrait-bbox crop; reference hashes are
+    // landscape-oriented; comparing them gives meaningless distances. The
+    // existing confidence-gate already rejects low-confidence pHash picks
+    // (= no actual harm), but the compute is wasted. Battlefield variant
+    // detection falls cleanly to OCR-based paths (CN-suffix, badge OCR).
+    final skipPhashForBattlefield = match.card.type?.toLowerCase() == 'battlefield';
+    if (resolutionVariants.length > 1 && computeResult != null && !skipPhashForBattlefield) {
       // Constrain pHash to variants matching the confirmed set+CN.
       final confirmedSet = _cumSetCode;
       final confirmedCN = _cumCN?.toString();
@@ -1777,21 +1790,34 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
 
     final candidates = <({List<int> rect, double score, int idx})>[];
 
+    // Accept both portrait (0.68-0.75) AND landscape (1.33-1.47) ratios.
+    // Landscape ratio = 1/0.716 ≈ 1.40 — covers users who hold a battlefield
+    // landscape-physically without a portrait holder. Battlefields held in
+    // portrait holders still come through as portrait-ratio rects (the
+    // bounding box is portrait even though card content is rotated 90°);
+    // those are handled by the existing portrait branch.
     for (int i = 0; i < _nativeRects.length; i++) {
       final r = _nativeRects[i];
       final rw = r[2].toDouble(), rh = r[3].toDouble();
       if (rw <= 0 || rh <= 0) continue;
 
       final ratio = rw / rh;
-      if (ratio < 0.68 || ratio > 0.75) continue; // hard ratio filter
-      if (rw < minWidth) continue; // hard min width
+      final isPortrait = ratio >= 0.68 && ratio <= 0.75;
+      final isLandscape = ratio >= 1.33 && ratio <= 1.47;
+      if (!isPortrait && !isLandscape) continue;
+      if (rw < minWidth && rh < minWidth) continue; // hard min size (either dim)
       final cx = r[0] + rw / 2, cy = r[1] + rh / 2;
       if (cx < centerXMin || cx > centerXMax || cy < centerYMin || cy > centerYMax) continue;
 
       // ── Step 2: Score = ratio 70% + size 30% ──
-      final ratioErr = (ratio - _idealRatio).abs() / _idealRatio;
+      // For battlefields prefer landscape ratio (1/0.716 ≈ 1.40).
+      // For all other cards prefer portrait ratio (0.716).
+      final isBattlefield = ct == 'battlefield';
+      final targetRatio = isBattlefield ? (1.0 / _idealRatio) : _idealRatio;
+      final ratioErr = (ratio - targetRatio).abs() / targetRatio;
       final ratioScore = (1.0 - ratioErr * 5.0).clamp(0.0, 1.0);
-      final sizeScore = (rw / fw).clamp(0.0, 1.0); // bigger = better
+      final maxDim = rw > rh ? rw : rh;
+      final sizeScore = (maxDim / fw).clamp(0.0, 1.0); // bigger = better
       final score = ratioScore * 0.70 + sizeScore * 0.30;
 
       candidates.add((rect: r, score: score, idx: i));
