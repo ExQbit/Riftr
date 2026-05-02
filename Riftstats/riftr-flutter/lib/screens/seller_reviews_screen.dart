@@ -8,6 +8,7 @@ import '../services/firestore_service.dart';
 import '../widgets/drag_to_dismiss.dart';
 import '../widgets/gold_header.dart';
 import '../widgets/market/seller_imprint_card.dart';
+import '../widgets/market/seller_status_badge.dart';
 import '../widgets/riftr_drag_handle.dart';
 
 class SellerReviewsScreen extends StatefulWidget {
@@ -112,6 +113,19 @@ class _SellerReviewsScreenState extends State<SellerReviewsScreen> {
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
                             ),
+                            // Verkaeufer-Status (BACKLOG Ticket 2 Polish):
+                            // Visuelles Signal ueber Privat/Commercial direkt
+                            // im Profil-Header. Imprint-Card weiter unten
+                            // gibt dann die DSA-Pflichtinfos bei Commercial.
+                            if (profileData != null) ...[
+                              const SizedBox(height: AppSpacing.sm),
+                              SellerStatusBadge(
+                                isCommercial:
+                                    profileData['isCommercialSeller']
+                                            as bool? ??
+                                        false,
+                              ),
+                            ],
                             const SizedBox(height: AppSpacing.md),
                             Row(
                               mainAxisAlignment: MainAxisAlignment.center,
