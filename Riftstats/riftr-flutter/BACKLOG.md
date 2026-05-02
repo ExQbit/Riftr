@@ -474,7 +474,7 @@ Test-Suite: `functions/test-scenarios/phase8_e2e_tests.js` — 46/46 Checks grue
 ## KRITISCH (Marktplatz-Kernfunktionalität)
 
 ### Chart / Portfolio
-1. ⚠️ **Portfolio Chart plottet v statt p** — Chart muss `p` (Performance/Kursgewinne) plotten, NICHT `v` (totalValue). Karten hinzufügen darf Linie nicht bewegen. `performanceHistory` existiert, aber Fallback-Logik (p → v für Legacy-Snapshots) fehlt noch.
+1. ✅ ~~**Portfolio Chart plottet v statt p**~~ — **erledigt** (verifiziert 2026-05-02). `market_screen.dart:887-889` plottet `performanceHistory` mit `valueHistory` als Legacy-Fallback. Range-Performance-Calculation Zeile 896-905 nutzt ebenfalls `performanceHistory` für `perfAbs = endPerf - startPerf` → ignoriert Buy/Sell-Sprünge korrekt.
 
 ### Wallet / Checkout (OBSOLET nach Payment-Architektur-Migration)
 2. ✅ **Wallet-Code entfernt** — Auflade-Custom-Betrag, Stripe-Sheet-Design-Bug etc. mit Phase 2 weggefallen. Siehe Payment-Track oben.
@@ -1165,7 +1165,7 @@ Test-Suite: `functions/test-scenarios/phase8_e2e_tests.js` — 46/46 Checks grue
 
 ## PRIORITÄTEN-REIHENFOLGE
 
-1. Portfolio Chart Bug fixen (plottet v statt p) — #1
+1. ~~Portfolio Chart Bug fixen (plottet v statt p) — #1~~ ✅ erledigt (2026-05-02)
 2. Intelligenter Deck-Kauf — #9
 3. Push Deep Linking — #10
 4. Order-Detail Screen überarbeiten — #5
