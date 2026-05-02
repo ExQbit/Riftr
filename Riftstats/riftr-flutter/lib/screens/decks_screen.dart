@@ -2423,7 +2423,12 @@ class _MetaDeckViewerState extends State<_MetaDeckViewer> with SingleTickerProvi
   int _getQty(String key) {
     final card = CardService.getLookup()[key];
     final resolvedId = card?.id ?? key;
-    return FirestoreCollectionService.instance.getQuantity(resolvedId);
+    // getTotalQuantity = regular + foil. Decks don't distinguish foil
+    // for ownership purposes — a foil rare satisfies the deck slot
+    // just as well as a non-foil. Scanner defaults rare+ to foil
+    // (see scanner_screen.dart `_defaultFoil`), so without this the
+    // missing-count would never drop for rare/epic cards.
+    return FirestoreCollectionService.instance.getTotalQuantity(resolvedId);
   }
 
   double? _getCardMinPrice(String key) {
@@ -2777,7 +2782,14 @@ class _DeckEditorState extends State<_DeckEditor> with SingleTickerProviderState
   int _getQty(String key) {
     final card = CardService.getLookup()[key];
     final resolvedId = card?.id ?? key;
-    return _isDemo ? _demo.getQuantity(resolvedId) : _collection.getQuantity(resolvedId);
+    // getTotalQuantity = regular + foil. Decks don't distinguish foil
+    // for ownership purposes — a foil rare satisfies the deck slot
+    // just as well as a non-foil. Scanner defaults rare+ to foil
+    // (see scanner_screen.dart `_defaultFoil`), so without this the
+    // missing-count would never drop for rare/epic cards.
+    return _isDemo
+        ? _demo.getTotalQuantity(resolvedId)
+        : _collection.getTotalQuantity(resolvedId);
   }
 
   /// Compute collection badge: {totalNeeded, totalOwned, missing} + cost data
