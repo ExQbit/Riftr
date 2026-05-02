@@ -246,6 +246,7 @@ class OcrService {
 
     try {
       final defaultRot = _defaultRotation(camera);
+      bool grayscaleSawBlocks = false;
 
       // Primary: grayscale at default rotation — ML Kit reads stylized
       // card names better without color
@@ -253,6 +254,7 @@ class OcrService {
           grayscaleOnly: true, rotation: defaultRot);
       if (grayInput != null) {
         final grayRecognized = await _textRecognizer.processImage(grayInput);
+        grayscaleSawBlocks = grayRecognized.blocks.isNotEmpty;
         final grayMatch = await _analyze(grayRecognized, minScore: 35);
         if (grayMatch != null) {
           _lastWorkingRotation = defaultRot;
@@ -260,14 +262,20 @@ class OcrService {
         }
       }
 
-      // Fallback: color (native YUV) at default rotation
-      final inputImage = _convertCameraImage(image, camera, rotation: defaultRot);
-      if (inputImage != null) {
-        final recognized = await _textRecognizer.processImage(inputImage);
-        final match = await _analyze(recognized, minScore: 35);
-        if (match != null) {
-          _lastWorkingRotation = defaultRot;
-          return match;
+      // Fallback: color (native YUV) — skip when grayscale found NO text
+      // blocks at all. Camera at empty space → both fail; running color
+      // adds ~3× cost (3-plane YUV vs 1-plane Y) for no gain. Color only
+      // helps when grayscale recognized blocks but couldn't score a match
+      // (e.g., colored text/glow that grayscale's lower contrast missed).
+      if (grayscaleSawBlocks) {
+        final inputImage = _convertCameraImage(image, camera, rotation: defaultRot);
+        if (inputImage != null) {
+          final recognized = await _textRecognizer.processImage(inputImage);
+          final match = await _analyze(recognized, minScore: 35);
+          if (match != null) {
+            _lastWorkingRotation = defaultRot;
+            return match;
+          }
         }
       }
 

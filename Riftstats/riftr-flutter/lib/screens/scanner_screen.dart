@@ -150,7 +150,12 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
   final _cardPresentClassifier = CardPresentClassifierService.instance;
   final _cardNameClassifier = CardNameClassifierService.instance;
   final _trainingFrames = TrainingFrameService.instance;
-  Uint8List? _lastYPlane;  // updated every frame (for motion detection)
+  /// Persistent Y-plane buffer reused every frame (memcpy via setRange).
+  /// Pre-fix this was `Uint8List.fromList(luma)` per frame — at 1080p × 10fps
+  /// that's ~20 MB/s of GC pressure. The buffer is shared by all consumers,
+  /// but every async consumer (ML Kit OCR, pHash compute() isolate, training
+  /// frame save) already copies before async work, so in-place reuse is safe.
+  Uint8List? _lastYPlane;
   int _lastYWidth = 0;
   int _lastYHeight = 0;
   int _lastYStride = 0;
@@ -331,16 +336,25 @@ class _ScannerScreenState extends State<ScannerScreen> with WidgetsBindingObserv
     final width = image.width;
     final height = image.height;
 
-    // Keep raw Y-plane reference for pHash (stride-stripped on demand in _acceptMatch)
-    _lastYPlane = Uint8List.fromList(luma);
+    // Reuse buffer across frames — allocate once, memcpy per frame.
+    // Reallocate if camera dims change (rare; e.g., orientation toggle).
+    if (_lastYPlane == null || _lastYPlane!.length != luma.length) {
+      _lastYPlane = Uint8List(luma.length);
+    }
+    _lastYPlane!.setRange(0, luma.length, luma);
     _lastYWidth = width;
     _lastYHeight = height;
     _lastYStride = image.planes.first.bytesPerRow;
 
-    // ── Collect native rects every frame (full frame, no crop) ──
-    // Collect when not in active movement (MOTION > 10%)
+    // ── Collect native rects (throttled to every 3rd processed frame) ──
+    // Vision-API isn't free; 30 rects is the cap and we process at ~10 fps,
+    // so collecting every frame gives 30 rects in 3s — overkill. Every 3rd
+    // frame still fills the cap in ~9s, well within typical scan duration,
+    // and frees CPU/GPU for OCR + classifiers in the other 2/3 of frames.
+    // Skip during active MOTION (>10%) since rects from a moving card are
+    // junk anyway.
     final canCollect = _state != ScanState.motion || _motionPercent < _rectMotionLimit;
-    if (_nativeRects.length < 30 && canCollect) {
+    if (_processedFrames % 3 == 0 && _nativeRects.length < 30 && canCollect) {
       // Strip stride padding and send full frame to Vision
       final stripped = Uint8List(width * height);
       final stride = image.planes.first.bytesPerRow;
